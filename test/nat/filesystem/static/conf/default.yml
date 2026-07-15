@@ -1,0 +1,30 @@
+debug: true
+pprof: false
+dev: false
+
+conn:
+  tcp: ":8080"
+  host: "lxt1045.com"
+  enable-tls: true
+  read-concurrency: 1
+  write-concurrency: 1
+  read-window: 21 # 1 << 21
+  write-window: 19 # 1 << 19
+  tls:
+    ca-cert: "static/ca/root-cert.pem" #CA root certificate file path. Not empty enable bidirectional authentication.
+    server-cert: "static/ca/server-cert.pem" #Server certificate file path
+    server-key: "static/ca/server-key.pem" #server rsa private key file path
+    client-cert: "static/ca/client-cert.pem" #Server certificate file path
+    client-key: "static/ca/client-key.pem" #server rsa private key file path
+
+client-conn:
+  read-concurrency: 1
+  write-concurrency: 1
+  read-window: 20 # 1 << 20
+  write-window: 21 # 1 << 21
+  addr: "127.0.0.1:8080"
+  host: lxt1045.com
+  tls:
+    ca-cert: "static/ca/root-cert.pem"
+    client-cert: "static/ca/client-cert.pem"
+    client-key: "static/ca/client-key.pem"

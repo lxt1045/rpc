@@ -1,0 +1,92 @@
+
+syntax = "proto3";
+
+package pb;
+
+option go_package = "./;pb";
+
+// package pb;
+option java_package = "pb";
+
+message Err {
+  int64 code = 1;
+  string msg = 2;
+}
+
+message CloseReq {}
+
+message CloseRsp {
+  Err err = 1;
+}
+
+message LatencyReq {
+  int64 ts = 1;
+}
+
+message LatencyRsp {
+  int64 ts = 1;
+}
+
+message AuthReq {
+  string name = 1;
+}
+
+message AuthRsp {
+  enum STATUS {
+    Succ = 0;
+    Fail = 1;
+  }
+  STATUS status = 1;
+  Err err = 2;
+}
+
+enum Network {
+  TCP = 0;
+  UDP = 1;
+}
+message ClientInfo {
+  string name = 1;
+  string addr = 2;
+  Network network = 3;
+}
+
+message ClientsReq {
+  string my_name = 1;
+  repeated string names = 2;
+}
+
+message ClientsRsp {
+  repeated ClientInfo clients = 1;
+}
+
+message ConnToReq {
+  ClientInfo client = 1;
+  int64 timestamp = 2;
+  int32 frequency = 3;  // 每秒执行多少次连接（并发）
+}
+
+message ConnToRsp {
+  enum STATUS {
+    Succ = 0;
+    Fail = 1;
+  }
+  ClientInfo client = 1;
+  int64 timestamp = 2;
+  STATUS status = 3;
+  Err err = 4;
+}
+
+// 定义服务
+service Service {
+  rpc Close(CloseReq) returns (CloseRsp) {}
+  rpc Latency(LatencyReq) returns (LatencyRsp) {}
+  rpc Auth(AuthReq) returns (AuthRsp) {}
+  rpc Clients(ClientsReq) returns (ClientsRsp) {}
+  rpc ConnTo(ConnToReq) returns (ConnToRsp) {}
+}
+
+service Client {
+  rpc Close(CloseReq) returns (CloseRsp) {}
+  rpc Latency(LatencyReq) returns (LatencyRsp) {}
+  rpc ConnTo(ConnToReq) returns (ConnToRsp) {}
+}

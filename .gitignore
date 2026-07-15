@@ -30,3 +30,9 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+*.pem
+
+test/*/service/service
+test/*/client/client
+test/*/proxy/proxy
+test/socks/client_http_local/client_http_local

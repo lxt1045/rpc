@@ -1,0 +1,63 @@
+
+syntax = "proto3";
+package base;
+
+option go_package = "./;base";
+
+message Err {
+  int64 code = 1;
+  string msg = 2;
+  int64 logid =3;
+  repeated string stack = 4;
+}
+// 客户端发送给服务端
+message HelloReq {
+  string name = 1;
+}
+
+// 服务端返回给客户端
+message HelloRsp {
+  string msg = 1;
+}
+
+message BenchmarkReq {}
+
+message BenchmarkRsp {}
+
+message CmdReq {
+  enum CMD {
+    Stream = 0;
+    StreamClose = 1;
+    Auth = 2;
+    CallIDs = 3;
+    Upgrade = 4;
+  }
+  CMD cmd = 1;
+  repeated string fields = 2;
+}
+
+message CmdRsp {
+  enum STATUS {
+    Succ = 0;
+    Fail = 1;
+  }
+  STATUS status = 1;
+  Err err = 2;
+  repeated string fields = 3;
+}
+
+// 定义服务
+service Hello {
+  rpc SayHello(HelloReq) returns (HelloRsp) {}
+  rpc Benchmark(BenchmarkReq) returns (BenchmarkRsp) {}
+  rpc Cmd(CmdReq) returns (CmdRsp) {}
+}
+
+service Test {
+  rpc TestHello(HelloReq) returns (HelloRsp) {}
+}
+
+message Ctx {
+  uint64 LogID=1; 
+  repeated string fields = 2;
+}
