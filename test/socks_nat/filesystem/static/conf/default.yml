@@ -17,7 +17,7 @@ log:
 conn:
   tcp: ":18088"
   addr: ":18088"
-  host: "lxt1045.com"
+  host: "speedtest.cn"
   enable-tls: true
   read-concurrency: 1
   write-concurrency: 1
@@ -35,8 +35,9 @@ client-conn:
   write-concurrency: 1
   read-window: 20 # 1 << 20
   write-window: 21 # 1 << 21
-  addr: "127.0.0.1:18086"
-  host: lxt1045.com
+  # addr: "127.0.0.1:18086"
+  addr: "43.155.182.37:18088"
+  host: speedtest.cn
   tls:
     ca-cert: "static/ca/root-cert.pem"
     client-cert: "static/ca/client-cert.pem"

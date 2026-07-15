@@ -18,7 +18,7 @@ log:
 conn:
   proxy_addr: ":18087"
   addr: ":18086"
-  host: "lxt1045.com"
+  host: "speedtest.cn"
   enable-tls: true
   read-concurrency: 1
   write-concurrency: 1
@@ -41,7 +41,7 @@ proxy-conn:
   # addr: "39.100.74.134:18086"
   addr: "152.32.218.32:18086"
   # addr: "10.1.1.121:18086"
-  host: lxt1045.com
+  host: speedtest.cn
   tls:
     ca-cert: "static/ca/root-cert.pem"
     client-cert: "static/ca/client-cert.pem"
@@ -54,7 +54,7 @@ client-conn:
   read-window: 20 # 1 << 20
   write-window: 21 # 1 << 21
   addr: "127.0.0.1:18086"
-  host: lxt1045.com
+  host: speedtest.cn
   tls:
     ca-cert: "static/ca/root-cert.pem"
     client-cert: "static/ca/client-cert.pem"

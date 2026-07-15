@@ -31,8 +31,10 @@ go.work.sum
 # .idea/
 # .vscode/
 *.pem
+*.yml
 
 test/*/service/service
 test/*/client/client
 test/*/proxy/proxy
 test/socks/client_http_local/client_http_local
+test/cert/cert_test2.go

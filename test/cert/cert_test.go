@@ -10,7 +10,7 @@ import (
 
 func TestMake(t *testing.T) {
 	dir := "./ca"
-	os.Mkdir(dir, 0666)
+	os.Mkdir(dir, 0666) 
 
 	cert.MakeRoot(dir, "lxt")          // 创建根正式
 	cert.MainInner(dir, "lxt", "root") // 创建证书颁发机构证书

@@ -16,14 +16,24 @@ log:
 
 # 服务端配置
 conn:
-  proxy_addr: ":18087" #
+  # proxy_addr: ":18087" #
   addr: ":18086" # sevice
-  host: "lxt1045.com"
+  host: "speedtest.cn"
   enable-tls: true
   read-concurrency: 1
   write-concurrency: 1
   read-window: 21 # 1 << 21
   write-window: 19 # 1 << 19
+  tls:
+    ca-cert: "static/ca/root-cert.pem" #CA root certificate file path. Not empty enable bidirectional authentication.
+    server-cert: "static/ca/server-cert.pem" #Server certificate file path
+    server-key: "static/ca/server-key.pem" #server rsa private key file path
+    client-cert: "static/ca/client-cert.pem" #Server certificate file path
+    client-key: "static/ca/client-key.pem" #server rsa private key file path
+
+http:
+  addr: ":18087" # sevice
+  host: "speedtest.cn"
   tls:
     ca-cert: "static/ca/root-cert.pem" #CA root certificate file path. Not empty enable bidirectional authentication.
     server-cert: "static/ca/server-cert.pem" #Server certificate file path
@@ -41,7 +51,7 @@ proxy-conn:
   # addr: "39.100.74.134:18086"
   addr: "152.32.218.32:18086"
   # addr: "10.1.1.121:18086"
-  host: lxt1045.com
+  host: speedtest.cn
   tls:
     ca-cert: "static/ca/root-cert.pem"
     client-cert: "static/ca/client-cert.pem"
@@ -53,8 +63,9 @@ client-conn:
   write-concurrency: 1
   read-window: 20 # 1 << 20
   write-window: 21 # 1 << 21
-  addr: "127.0.0.1:18086"
-  host: lxt1045.com
+  # addr: "127.0.0.1:18086"
+  addr: "43.155.182.37:18086"
+  host: speedtest.cn
   tls:
     ca-cert: "static/ca/root-cert.pem"
     client-cert: "static/ca/client-cert.pem"

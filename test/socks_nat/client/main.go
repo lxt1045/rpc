@@ -30,6 +30,14 @@ type Config struct {
 	Log        config.Log
 }
 
+/*
+p2p service 端
+./client  -c=test2 -socks=""
+
+p2p client 端
+./client
+*/
+
 func main() {
 	var flags struct {
 		Client  string
@@ -88,8 +96,8 @@ func main() {
 		RemoteAddr: conn.RemoteAddr().String(),
 		bClient:    flags.Socks != "",
 		socksAddr:  flags.Socks,
-		ChPeer:     make(chan *peerCli, 16),
-		ChPeerSvc:  make(chan *peerSvc, 16),
+		ChPeer:     make(chan *peerCli, 3),
+		ChPeerSvc:  make(chan *peerSvc, 3),
 		ChP2P:      make(chan error, 1),
 	}
 	var _ pb.ClientServer = cli
