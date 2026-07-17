@@ -7,4 +7,5 @@
 2. socks_nat
    通过 TCP 打洞 实现基于 P2P 的 rpc 库实现远程 socks5/http 代理。
 
-
+3. socks_truck
+   使用 trunk 包，多条连接融合成一条。

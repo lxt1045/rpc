@@ -19,7 +19,7 @@ protoc -I=. service.proto --gogofast_out=plugins=grpc:./gogofastgen
 ```ps1
 
 $env:dir="[github.com/lxt1045/utils]"
-$env:dir="D:/project/go/src/github.com/lxt1045/utils"
+$env:dir="D:/project/go/src/github.com/lxt1045"
 protoc -I="$env:dir" $env:dir/rpc/base/*.proto --gogofast_out=plugins=grpc:"$env:dir/rpc/base/" 
 
 ```

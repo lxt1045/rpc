@@ -11,7 +11,8 @@ import (
 const (
 	CmdCloseConn = 1
 	CmdAddConn   = 2
-	CmdAppData   = 3
+	CmdEventReq  = 3
+	CmdEventRes  = 4
 )
 
 const (

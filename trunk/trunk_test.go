@@ -23,11 +23,11 @@ func TestTrunk0(t *testing.T) {
 
 	s0, c0 := rpc.NewFakeConnPipe()
 
-	peer1, peer2 := NewTrunk(nil, s0), NewTrunk(nil, c0)
+	peer1, peer2 := NewTrunk(s0), NewTrunk(c0)
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)
 
-	payload11, payload12 := peer1.GetPayload(1), peer2.GetPayload(1)
+	payload11, payload12 := peer1.GetConn(1), peer2.GetConn(1)
 
 	g := errgroup.Group{}
 	g.Go(func() (err error) {
@@ -64,12 +64,12 @@ func TestTrunk(t *testing.T) {
 	s1, c1 := rpc.NewFakeConnPipe()
 	s2, c2 := rpc.NewFakeConnPipe()
 
-	peer1, peer2 := NewTrunk(nil, s0, s1, s2), NewTrunk(nil, c0, c1, c2)
+	peer1, peer2 := NewTrunk(s0, s1, s2), NewTrunk(c0, c1, c2)
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)
 
-	payload11, payload12 := peer1.GetPayload(1), peer2.GetPayload(1)
-	payload21, payload22 := peer1.GetPayload(2), peer2.GetPayload(2)
+	payload11, payload12 := peer1.GetConn(1), peer2.GetConn(1)
+	payload21, payload22 := peer1.GetConn(2), peer2.GetConn(2)
 
 	nLinePrint := 256
 	g := errgroup.Group{}

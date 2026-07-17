@@ -9,7 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/lxt1045/errors"
+	"github.com/lxt1045/rpc/base"
 	"github.com/lxt1045/utils/log"
 	"golang.org/x/sync/errgroup"
 )
@@ -24,8 +26,6 @@ type Trunk struct {
 
 	payloads  []*Conn // [ConnID]Payload
 	lPayloads sync.RWMutex
-
-	fData func(uint16, []byte) error // 处理上层数据
 
 	done   chan struct{} // 等待退出
 	closed atomic.Bool
@@ -43,11 +43,19 @@ type Conn struct {
 	rBuf     []byte      // 一次没读完的数据
 	rl       sync.Mutex
 
+	// 发送数据时需要，只支持一个消息并发
+	chEvent      atomic.Pointer[CallInfo]
+	eventHandler func([]byte) error // 处理上层数据
+
 	// writer
 	idxPkg uint16
 
 	tsLastData int64 // 上次获取数据的时间
 	closed     atomic.Bool
+}
+
+type CallInfo struct {
+	done chan error
 }
 
 var _ io.Closer = &Trunk{}
@@ -56,6 +64,10 @@ var _ io.ReadWriter = &Conn{}
 type Package struct {
 	Header
 	Body []byte
+}
+
+func (p *Conn) SetEventHandler(handler func([]byte) error) {
+	p.eventHandler = handler
 }
 
 func (p *Conn) Close() (err error) {
@@ -72,8 +84,7 @@ func (p *Conn) Close() (err error) {
 
 func (p *Conn) close() (err error) {
 	if p.closed.CompareAndSwap(false, true) {
-		// p.Trunk.RemovePayload(int(p.connID))
-
+		p.Trunk.RemoveConn(int(p.connID))
 		close(p.chReader) // 只执行一次
 		return
 	}
@@ -103,10 +114,42 @@ func (p *Conn) Read(bs []byte) (n int, err error) {
 	}
 }
 
-func (p *Conn) CmdAppData(data []byte) (err error) {
+func (p *Conn) SendEvent(data []byte) (err error) {
+	info := &CallInfo{
+		done: make(chan error, 1),
+	}
+	swapped := p.chEvent.CompareAndSwap(nil, info)
+	if !swapped {
+		err = errors.Errorf("only one concurrent call is supported, and the previous call has not returned yet")
+		return
+	}
+	defer p.chEvent.CompareAndSwap(info, nil)
+
+	err = p.sendEvent(data)
+
+	select {
+	case err = <-info.done:
+	case <-time.After(time.Second * 30):
+		err = errors.New("time out")
+	}
+	return
+}
+
+func (p *Conn) sendEvent(data []byte) (err error) {
 	header := Header{
 		ConnID: p.connID,
-		Cmd:    CmdAppData,
+		Cmd:    CmdEventReq,
+	}
+	_, err = p.write(header, data)
+	if err != nil {
+		return
+	}
+	return
+}
+func (p *Conn) sendEventResp(data []byte) (err error) {
+	header := Header{
+		ConnID: p.connID,
+		Cmd:    CmdEventRes,
 	}
 	_, err = p.write(header, data)
 	if err != nil {
@@ -163,11 +206,10 @@ func (p *Conn) write(header Header, bs []byte) (n int, err error) {
 	return
 }
 
-func NewTrunk(fData func(connID uint16, data []byte) error, rws ...io.ReadWriteCloser) (t *Trunk) {
+func NewTrunk(rws ...io.ReadWriteCloser) (t *Trunk) {
 	t = &Trunk{
-		rws:   rws,
-		done:  make(chan struct{}),
-		fData: fData,
+		rws:  rws,
+		done: make(chan struct{}),
 		// payloads: make([]*Payload, 0, 100),
 	}
 	return
@@ -191,7 +233,7 @@ func (t *Trunk) Close() (err error) {
 	return errors.New("has beed closed")
 }
 
-func (t *Trunk) RemovePayload(connID int) {
+func (t *Trunk) RemoveConn(connID int) {
 	if connID > math.MaxInt16 {
 		return
 	}
@@ -203,11 +245,11 @@ func (t *Trunk) RemovePayload(connID int) {
 	}
 	t.payloads[connID] = nil
 }
-func (t *Trunk) GetPayload(connID uint16) (payload *Conn) {
+func (t *Trunk) GetConn(connID uint16) (conn *Conn) {
 	if connID > math.MaxInt16 {
 		return nil
 	}
-	payload = func(connID uint16) (payload *Conn) {
+	conn = func(connID uint16) (payload *Conn) {
 		t.lPayloads.RLock()
 		defer t.lPayloads.RUnlock()
 
@@ -216,11 +258,11 @@ func (t *Trunk) GetPayload(connID uint16) (payload *Conn) {
 		}
 		return
 	}(connID)
-	if payload != nil {
+	if conn != nil {
 		return
 	}
 
-	payload = func(i uint16) (payload *Conn) {
+	conn = func(i uint16) (payload *Conn) {
 		t.lPayloads.Lock()
 		defer t.lPayloads.Unlock()
 
@@ -246,7 +288,7 @@ func (t *Trunk) GetPayload(connID uint16) (payload *Conn) {
 }
 
 func (t *Trunk) GetReadWriter(connID uint16) io.ReadWriter {
-	payload := t.GetPayload(connID)
+	payload := t.GetConn(connID)
 	return payload
 }
 
@@ -328,24 +370,24 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 			}
 			connID := pkg.Header.ConnID
 
-			payload := t.GetPayload(connID)
-			idx := pkg.Header.Idx - payload.startIdx // uint16 类型模运算, 会自动溢出为对应模运算结果
+			conn := t.GetConn(connID)
+			idx := pkg.Header.Idx - conn.startIdx // uint16 类型模运算, 会自动溢出为对应模运算结果
 			i := int(idx)
-			if i >= len(payload.packages) {
-				payload.packages = append(payload.packages, make([]Package, i+1-len(payload.packages))...)
+			if i >= len(conn.packages) {
+				conn.packages = append(conn.packages, make([]Package, i+1-len(conn.packages))...)
 				// payload.bodys = slices.Grow(payload.bodys, i+1-len(payload.bodys))[:i+1]  // 数据太精确了，可以多分配点减少分配次数
 			}
-			payload.packages[i] = pkg
+			conn.packages[i] = pkg
 
 			// 如果 payload.chReader 当前不可写入，则不尝试了
-			if cap(payload.chReader) == len(payload.chReader) {
+			if cap(conn.chReader) == len(conn.chReader) {
 				continue
 			}
 
 			// 看一下可以有多少个body移动到 chReader
 			lNeedMove := 0
 			cmds := []Package{}
-			for _, pkg := range payload.packages {
+			for _, pkg := range conn.packages {
 				if pkg.Len == 0 {
 					break
 				}
@@ -353,8 +395,8 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 
 				// 最高位位类型, 0: ConnID(数据包), 1: 命令类型(命令数据包)
 				if pkg.Header.Cmd == 0 {
-					if payload != nil {
-						payload.chReader <- pkg.Body
+					if conn != nil {
+						conn.chReader <- pkg.Body
 					}
 					pkg.Body = nil
 					continue
@@ -363,37 +405,75 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 				}
 			}
 			if lNeedMove > 0 {
-				payload.packages = payload.packages[lNeedMove:]
-				payload.startIdx += uint16(lNeedMove)
+				conn.packages = conn.packages[lNeedMove:]
+				conn.startIdx += uint16(lNeedMove)
 			}
 			for _, pkg := range cmds {
-				t.DoCmd(pkg)
+				conn.DoCmd(pkg)
 			}
 
 		}
 	}
 }
 
-func (t *Trunk) DoCmd(pkg Package) {
+func (conn *Conn) DoCmd(pkg Package) {
 
 	switch pkg.Cmd {
 	case CmdCloseConn:
-		payload := t.GetPayload(pkg.ConnID)
-		payload.close()
+		conn.close()
 	case CmdAddConn:
 		// data = pkg.Body[CmdSize:]
-	case CmdAppData:
+	case CmdEventReq:
 		data := pkg.Body
-		if t.fData != nil {
+		if conn.eventHandler != nil {
 			go func() {
+				var err error
 				defer func() {
 					if e := recover(); e != nil {
 						err := errors.Errorf("recove:%v", e)
 						log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("t.fData defer")
 					}
+					bs := []byte{}
+					if err != nil {
+						result := base.Err{
+							Code: 1,
+							Msg:  err.Error(),
+							// Logid
+						}
+						buf := proto.NewBuffer(bs[:0]) //
+						err = buf.Marshal(&result)
+						if err != nil {
+							log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("CmdEventReq error")
+							bs = []byte(err.Error())
+						} else {
+							bs = buf.Bytes()
+						}
+					}
+
+					err = conn.sendEventResp(bs)
+					if err != nil {
+						log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("CmdEventReq error")
+					}
 				}()
-				t.fData(pkg.ConnID, data)
+
+				err = conn.eventHandler(data)
 			}()
+		}
+	case CmdEventRes:
+		data := pkg.Body
+		result := base.Err{}
+		err := proto.Unmarshal(data, &result)
+		if err != nil {
+			log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("CmdEventRes error")
+			result = base.Err{
+				Code: -1,
+				Msg:  string(data),
+			}
+		}
+
+		info := conn.chEvent.Load()
+		if info != nil {
+			info.done <- errors.NewCode(0, int(result.Code), result.Msg)
 		}
 	default:
 	}
