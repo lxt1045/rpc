@@ -23,7 +23,7 @@ func TestTrunk0(t *testing.T) {
 
 	s0, c0 := rpc.NewFakeConnPipe()
 
-	peer1, peer2 := NewTrunk(s0), NewTrunk(c0)
+	peer1, peer2 := NewTrunk(nil, s0), NewTrunk(nil, c0)
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)
 
@@ -43,6 +43,7 @@ func TestTrunk0(t *testing.T) {
 			n, err := payload12.Read(bs)
 			if err != nil {
 				t.Error(err)
+				break
 			}
 			t.Logf("connID: %d, i:%d, msg: %s\n", payload11.connID, i, bs[:n])
 		}
@@ -63,13 +64,14 @@ func TestTrunk(t *testing.T) {
 	s1, c1 := rpc.NewFakeConnPipe()
 	s2, c2 := rpc.NewFakeConnPipe()
 
-	peer1, peer2 := NewTrunk(s0, s1, s2), NewTrunk(c0, c1, c2)
+	peer1, peer2 := NewTrunk(nil, s0, s1, s2), NewTrunk(nil, c0, c1, c2)
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)
 
 	payload11, payload12 := peer1.GetPayload(1), peer2.GetPayload(1)
 	payload21, payload22 := peer1.GetPayload(2), peer2.GetPayload(2)
 
+	nLinePrint := 256
 	g := errgroup.Group{}
 	g.Go(func() (err error) {
 		go func() {
@@ -91,10 +93,10 @@ func TestTrunk(t *testing.T) {
 			}
 			all = append(all, bs[:n]...)
 		}
-		for i := 0; i < len(all); i += 100 {
+		for i := 0; i < len(all); i += nLinePrint {
 			bs := all[i:]
-			if len(bs) > 100 {
-				bs = bs[:100]
+			if len(bs) > nLinePrint {
+				bs = bs[:nLinePrint]
 			}
 			t.Logf("connID: %d, msg: %s\n", payload11.connID, bs)
 		}
@@ -120,10 +122,10 @@ func TestTrunk(t *testing.T) {
 			}
 			all = append(all, bs[:n]...)
 		}
-		for i := 0; i < len(all); i += 100 {
+		for i := 0; i < len(all); i += nLinePrint {
 			bs := all[i:]
-			if len(bs) > 100 {
-				bs = bs[:100]
+			if len(bs) > nLinePrint {
+				bs = bs[:nLinePrint]
 			}
 			t.Logf("connID: %d, msg: %s\n", payload21.connID, bs)
 		}

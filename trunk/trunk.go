@@ -22,15 +22,17 @@ type Trunk struct {
 	wIdx int // 写索引: 当前写到哪个连接了
 	lRws sync.Mutex
 
-	payloads  []*Payload // [ConnID]Payload
+	payloads  []*Conn // [ConnID]Payload
 	lPayloads sync.RWMutex
+
+	fData func(uint16, []byte) error // 处理上层数据
 
 	done   chan struct{} // 等待退出
 	closed atomic.Bool
 	err    error
 }
 
-type Payload struct {
+type Conn struct {
 	*Trunk
 	connID   uint16
 	startIdx uint16    // 序列号开始的地方
@@ -49,38 +51,36 @@ type Payload struct {
 }
 
 var _ io.Closer = &Trunk{}
-var _ io.ReadWriter = &Payload{}
+var _ io.ReadWriter = &Conn{}
 
 type Package struct {
 	Header
-	body []byte
+	Body []byte
 }
 
-func (p *Payload) Close() (err error) {
+func (p *Conn) Close() (err error) {
 	header := Header{
-		ConnID: p.connID | 0x80,
+		ConnID: p.connID,
+		Cmd:    CmdCloseConn,
 	}
-	cmd := Cmd{
-		Cmd: CmdCloseConn,
-	}
-	bsCmd := make([]byte, CmdSize)
-	bsCmd = cmd.Format(bsCmd)
-	_, err = p.write(header, bsCmd)
+	_, err = p.write(header, nil)
 	if err != nil {
 		return
 	}
 	return p.close()
 }
-func (p *Payload) close() (err error) {
+
+func (p *Conn) close() (err error) {
 	if p.closed.CompareAndSwap(false, true) {
-		p.Trunk.RemovePayload(int(p.connID))
+		// p.Trunk.RemovePayload(int(p.connID))
+
 		close(p.chReader) // 只执行一次
 		return
 	}
 	return errors.New("has beed closed")
 }
 
-func (p *Payload) Read(bs []byte) (n int, err error) {
+func (p *Conn) Read(bs []byte) (n int, err error) {
 	p.rl.Lock()
 	defer p.rl.Unlock()
 
@@ -103,14 +103,26 @@ func (p *Payload) Read(bs []byte) (n int, err error) {
 	}
 }
 
-func (p *Payload) Write(bs []byte) (n int, err error) {
+func (p *Conn) CmdAppData(data []byte) (err error) {
 	header := Header{
-		ConnID: p.connID & 0x8f,
+		ConnID: p.connID,
+		Cmd:    CmdAppData,
+	}
+	_, err = p.write(header, data)
+	if err != nil {
+		return
+	}
+	return
+}
+
+func (p *Conn) Write(bs []byte) (n int, err error) {
+	header := Header{
+		ConnID: p.connID,
 	}
 	return p.write(header, bs)
 }
 
-func (p *Payload) write(header Header, bs []byte) (n int, err error) {
+func (p *Conn) write(header Header, bs []byte) (n int, err error) {
 	if p.closed.Load() {
 		err = errors.New("has been closed")
 		return
@@ -118,14 +130,21 @@ func (p *Payload) write(header Header, bs []byte) (n int, err error) {
 	p.Trunk.lRws.Lock()
 	defer p.Trunk.lRws.Unlock()
 
+	const MTU = 1460
+	m := 0
+	// for i := 0; i < len(bs); i += MTU {
 	idx := p.Trunk.wIdx % len(p.Trunk.rws)
 	p.Trunk.wIdx++
 
-	header.Len = uint16(len(bs))
+	if header.Cmd > 0 {
+		header.Len = uint16(len(bs) + CmdHeaderSize)
+	} else {
+		header.Len = uint16(len(bs) + HeaderSize)
+	}
 	header.Idx = p.idxPkg
 	p.idxPkg++
 
-	bsH := make([]byte, HeaderSize)
+	bsH := make([]byte, CmdHeaderSize)
 	bsH = header.Format(bsH)
 
 	_, err = p.Trunk.rws[idx].Write(bsH)
@@ -135,13 +154,20 @@ func (p *Payload) write(header Header, bs []byte) (n int, err error) {
 	if len(bs) == 0 {
 		return
 	}
-	return p.Trunk.rws[idx].Write(bs)
+	m, err = p.Trunk.rws[idx].Write(bs)
+	if err != nil {
+		return
+	}
+	n += m
+	// }
+	return
 }
 
-func NewTrunk(rws ...io.ReadWriteCloser) (t *Trunk) {
+func NewTrunk(fData func(connID uint16, data []byte) error, rws ...io.ReadWriteCloser) (t *Trunk) {
 	t = &Trunk{
-		rws:  rws,
-		done: make(chan struct{}),
+		rws:   rws,
+		done:  make(chan struct{}),
+		fData: fData,
 		// payloads: make([]*Payload, 0, 100),
 	}
 	return
@@ -177,16 +203,16 @@ func (t *Trunk) RemovePayload(connID int) {
 	}
 	t.payloads[connID] = nil
 }
-func (t *Trunk) GetPayload(connID int) (payload *Payload) {
+func (t *Trunk) GetPayload(connID uint16) (payload *Conn) {
 	if connID > math.MaxInt16 {
 		return nil
 	}
-	payload = func(i int) (payload *Payload) {
+	payload = func(connID uint16) (payload *Conn) {
 		t.lPayloads.RLock()
 		defer t.lPayloads.RUnlock()
 
-		if connID < len(t.payloads) {
-			payload = t.payloads[i]
+		if int(connID) < len(t.payloads) {
+			payload = t.payloads[connID]
 		}
 		return
 	}(connID)
@@ -194,20 +220,20 @@ func (t *Trunk) GetPayload(connID int) (payload *Payload) {
 		return
 	}
 
-	payload = func(i int) (payload *Payload) {
+	payload = func(i uint16) (payload *Conn) {
 		t.lPayloads.Lock()
 		defer t.lPayloads.Unlock()
 
-		if connID >= len(t.payloads) {
+		if int(connID) >= len(t.payloads) {
 			// t.payloads = append(t.payloads, make([]*Payload, connID+1-len(t.payloads))...)
-			t.payloads = slices.Grow(t.payloads, connID+1-len(t.payloads))[:connID+1]
+			t.payloads = slices.Grow(t.payloads, int(connID)+1-len(t.payloads))[:connID+1]
 		}
 		payload = t.payloads[i]
 		if payload != nil {
 			return
 		}
 
-		payload = &Payload{
+		payload = &Conn{
 			Trunk:    t,
 			connID:   uint16(connID),
 			chReader: make(chan []byte, 64),
@@ -219,7 +245,7 @@ func (t *Trunk) GetPayload(connID int) (payload *Payload) {
 	return
 }
 
-func (t *Trunk) GetReadWriter(connID int) io.ReadWriter {
+func (t *Trunk) GetReadWriter(connID uint16) io.ReadWriter {
 	payload := t.GetPayload(connID)
 	return payload
 }
@@ -268,7 +294,7 @@ func (t *Trunk) Run(ctx context.Context) {
 
 					pkg := Package{
 						Header: header,
-						body:   append(bsBody[:0:0], bsBody...),
+						Body:   append(bsBody[:0:0], bsBody...),
 					}
 					ch <- pkg
 				}
@@ -300,9 +326,9 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 			if !ok {
 				return
 			}
-			connID := pkg.Header.ConnID & 0x7f
+			connID := pkg.Header.ConnID
 
-			payload := t.GetPayload(int(connID))
+			payload := t.GetPayload(connID)
 			idx := pkg.Header.Idx - payload.startIdx // uint16 类型模运算, 会自动溢出为对应模运算结果
 			i := int(idx)
 			if i >= len(payload.packages) {
@@ -320,17 +346,17 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 			lNeedMove := 0
 			cmds := []Package{}
 			for _, pkg := range payload.packages {
-				if len(pkg.body) == 0 {
+				if pkg.Len == 0 {
 					break
 				}
 				lNeedMove++
 
 				// 最高位位类型, 0: ConnID(数据包), 1: 命令类型(命令数据包)
-				if pkg.Header.ConnID&0x80 == 0 {
+				if pkg.Header.Cmd == 0 {
 					if payload != nil {
-						payload.chReader <- pkg.body
+						payload.chReader <- pkg.Body
 					}
-					pkg.body = nil
+					pkg.Body = nil
 					continue
 				} else {
 					cmds = append(cmds, pkg)
@@ -341,31 +367,34 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 				payload.startIdx += uint16(lNeedMove)
 			}
 			for _, pkg := range cmds {
-				data := t.DoCmd(pkg)
-				_ = data
+				t.DoCmd(pkg)
 			}
 
 		}
 	}
 }
 
-func (t *Trunk) DoCmd(pkg Package) (data []byte) {
-	if len(pkg.body) < CmdSize {
-		return
-	}
-	// 最高位位类型, 0: ConnID(数据包), 1: 命令类型(命令数据包)
-	connID := pkg.Header.ConnID & 0x7f
-	cmd := ParseCmd(pkg.body)
+func (t *Trunk) DoCmd(pkg Package) {
 
-	switch cmd.Cmd {
+	switch pkg.Cmd {
 	case CmdCloseConn:
-		payload := t.GetPayload(int(connID))
+		payload := t.GetPayload(pkg.ConnID)
 		payload.close()
 	case CmdAddConn:
-		data = pkg.body[CmdSize:]
+		// data = pkg.Body[CmdSize:]
 	case CmdAppData:
-		data = pkg.body[CmdSize:]
+		data := pkg.Body
+		if t.fData != nil {
+			go func() {
+				defer func() {
+					if e := recover(); e != nil {
+						err := errors.Errorf("recove:%v", e)
+						log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("t.fData defer")
+					}
+				}()
+				t.fData(pkg.ConnID, data)
+			}()
+		}
 	default:
 	}
-	return
 }
