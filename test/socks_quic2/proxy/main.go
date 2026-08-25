@@ -35,7 +35,7 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx, _ = log.WithLogid(ctx, gid.GetGID())
+	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	go socks.CheckMemLoop(1024)
 

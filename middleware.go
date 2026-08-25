@@ -98,7 +98,7 @@ func (m WrapSvcMethod) SvcInvoke(ctx context.Context, req codec.Msg) (resp codec
 // func SvcLogid(p *SvcParam) {
 // 	logid, _ := p.Ctx.Value(LogidKey{}).(uint64)
 // 	if logid == 0 {
-// 		logid = uint64(gid.GetGID())
+// 		logid = uint64(gid.New())
 // 	}
 // 	p.Ctx, _ = log.WithLogid(p.Ctx, int64(logid))
 // }

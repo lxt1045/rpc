@@ -72,7 +72,7 @@ func main() {
 		return
 	}
 	// log.Init()
-	ctx, _ = log.WithLogid(ctx, gid.GetGID())
+	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	cmtls := conf.ClientConn.TLS
 	tlsConfig, err := config.LoadTLSConfig(filesystem.Static, cmtls.ClientCert, cmtls.ClientKey, cmtls.CACert)
@@ -251,7 +251,7 @@ func main1() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx, _ = log.WithLogid(ctx, gid.GetGID())
+	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	log.Ctx(ctx).Error().Caller().Msgf("SOCKS proxy on %s", flags.Socks)
 	go socks.TCPLocalOnly(ctx, flags.Socks)

@@ -27,7 +27,7 @@ type Config struct {
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx, _ = log.WithLogid(ctx, gid.GetGID())
+	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	// 解析配置文件
 	conf := &Config{}

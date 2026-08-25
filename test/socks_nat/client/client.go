@@ -242,7 +242,7 @@ func (c *client) RunConnLoop(ctx context.Context, cancel context.CancelFunc, add
 	}()
 	for {
 		ctx := context.TODO()
-		ctx, _ = log.WithLogid(ctx, gid.GetGID())
+		ctx, _ = log.WithLogid(ctx, gid.New())
 
 		select {
 		case <-ctx.Done():

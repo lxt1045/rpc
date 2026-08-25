@@ -75,7 +75,7 @@ func main() {
 		return
 	}
 	// log.Init()
-	ctx, _ = log.WithLogid(ctx, gid.GetGID())
+	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	cli := &socks.SocksCli{
 		ChPeer:       make(chan *socks.Peer, 1),

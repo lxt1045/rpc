@@ -26,7 +26,7 @@ type Config struct {
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx, _ = log.WithLogid(ctx, gid.GetGID())
+	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	// 解析配置文件
 	conf := &Config{}
@@ -63,7 +63,7 @@ func main() {
 			return
 		default:
 		}
-		// ctx, _ := log.WithLogid(context.TODO(), gid.GetGID())
+		// ctx, _ := log.WithLogid(context.TODO(), gid.New())
 		conn, err := listener.Accept()
 		if err != nil {
 			if strings.Contains(err.Error(), "use of closed network connection") {
