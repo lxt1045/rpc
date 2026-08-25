@@ -58,7 +58,7 @@ func InitHTTP(ctx context.Context, addr string, conf config.TLS, f func(conn *we
 		Addr:      addr,
 		Handler:   router,
 		TLSConfig: config,
-		ErrorLog:  log.New(llog.GetStdOutput(ctx), "", log.Lshortfile|log.Ldate|log.Ltime),
+		ErrorLog:  log.New(llog.GetOutput(), "", log.Lshortfile|log.Ldate|log.Ltime),
 		// ConnState:   func(c net.Conn, cs http.ConnState) {},
 		// ConnContext: func(ctx context.Context, c net.Conn) context.Context { return ctx },
 	}
