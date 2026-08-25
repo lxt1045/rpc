@@ -55,6 +55,10 @@ func isBenignCloseErr(err error) bool {
 }
 
 var _ pb.SocksSvcServer = &SocksSvc{}
+var (
+	mTrunkConn map[uint32][]Conn // trunk 的待用连接
+	lTrunkConn sync.Mutex
+)
 
 type SocksSvc struct {
 	Name       string
@@ -62,9 +66,7 @@ type SocksSvc struct {
 	RemoteAddr string
 	Peer       rpc.Peer
 
-	mTrunkConn map[uint32][]Conn // trunk 的待用连接
-	lTrunkConn sync.Mutex
-	trunk      *trunk.Trunk
+	trunk *trunk.Trunk
 }
 
 type Conn struct {
@@ -290,25 +292,28 @@ func (p *SocksSvc) TrunkUpgrade(ctx context.Context, req *pb.TrunkUpgradeReq) (r
 		return
 	}
 	func() {
-		p.lTrunkConn.Lock()
-		defer p.lTrunkConn.Unlock()
+		lTrunkConn.Lock()
+		defer lTrunkConn.Unlock()
+		if mTrunkConn == nil {
+			mTrunkConn = make(map[uint32][]Conn)
+		}
 
-		p.mTrunkConn[req.TrunkId] = append(p.mTrunkConn[req.TrunkId], Conn{
+		mTrunkConn[req.TrunkId] = append(mTrunkConn[req.TrunkId], Conn{
 			Req: *req,
 			rw:  upgrade,
 		})
 	}()
-
+	// resp = &pb.TrunkUpgradeRsp{}
 	return
 }
 
 func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (resp *pb.TrunkStartRsp, err error) {
 	conns := func() (conns []Conn) {
-		p.lTrunkConn.Lock()
-		defer p.lTrunkConn.Unlock()
+		lTrunkConn.Lock()
+		defer lTrunkConn.Unlock()
 
 		// conns = append(conns, p.mTrunkConn[req.TrunkId]...)
-		conns = p.mTrunkConn[req.TrunkId]
+		conns = mTrunkConn[req.TrunkId]
 		return
 	}()
 	if len(conns) != int(req.UpgradeCount) {
@@ -321,12 +326,13 @@ func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (resp 
 	}
 
 	trunk0 := trunk.NewTrunk(rws...)
+	trunk0.SetEventHandler(p.trunkEvent)
 	p.trunk = trunk0
 	go trunk0.Run(ctx)
 
 	return
 }
-func (p *SocksSvc) trunkDo(connID uint16, data []byte) (err error) {
+func (p *SocksSvc) trunkEvent(connID uint16, data []byte) (err error) {
 	req := &pb.TrunkStartData{}
 	err = proto.Unmarshal(data, req)
 	if err != nil {
@@ -341,7 +347,7 @@ func (p *SocksSvc) trunkDo(connID uint16, data []byte) (err error) {
 	}
 	rc, err1 := d.Dial("tcp", req.Addr)
 	if err1 != nil {
-		err = errors.New(err.Error())
+		err = errors.Errorf("Dial %s got err: %s", req.Addr, err1.Error())
 		return
 	}
 	rc.(*net.TCPConn).SetKeepAlive(true)

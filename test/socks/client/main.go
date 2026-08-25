@@ -64,7 +64,7 @@ func main() {
 		return
 	}
 	// log.Init()
-	ctx, _ = log.WithLogid(ctx, gid.GetGID())
+	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	cmtls := conf.ClientConn.TLS
 	tlsConfig, err := config.LoadTLSConfig(filesystem.Static, cmtls.ClientCert, cmtls.ClientKey, cmtls.CACert)
@@ -84,7 +84,7 @@ func main() {
 		PeerAddr: conf.ClientConn.Addr,
 	}
 	var _ pb.SocksCliServer = cli
-	for range 32 {
+	for range 8 {
 		go cli.RunConnLoop(ctx, cancel, conf.ClientConn.Addr, tlsConfig)
 	}
 

@@ -84,14 +84,20 @@ func main() {
 		PeerAddr: conf.ClientConn.Addr,
 	}
 	var _ pb.SocksCliServer = cli
-	for range 32 {
+	for range 2 {
 		go cli.RunConnLoop(ctx, cancel, conf.ClientConn.Addr, tlsConfig)
 	}
 
 	//
+	err = cli.InitTrunk(ctx)
+	if err != nil {
+		log.Ctx(ctx).Error().Caller().Err(err).Send()
+		return
+	}
 
 	go cli.RunSocks(ctx, flags.Socks)
 	go cli.RunHttpProxy(ctx, ":18082", 1)
+	go cli.RunHttpProxy(ctx, ":18083", 3)
 
 	go cli.RunHttpProxy(ctx, ":18081", 0)
 	log.Ctx(ctx).Info().Caller().Str("Socks", flags.Socks).Send()

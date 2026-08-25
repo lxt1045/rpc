@@ -24,8 +24,9 @@ type Trunk struct {
 	wIdx int // 写索引: 当前写到哪个连接了
 	lRws sync.Mutex
 
-	payloads  []*Conn // [ConnID]Payload
-	lPayloads sync.RWMutex
+	payloads     []*Conn // [ConnID]Payload
+	lPayloads    sync.RWMutex
+	eventHandler func(uint16, []byte) error // 处理上层数据
 
 	done   chan struct{} // 等待退出
 	closed atomic.Bool
@@ -67,6 +68,9 @@ type Package struct {
 }
 
 func (p *Conn) SetEventHandler(handler func([]byte) error) {
+	p.eventHandler = handler
+}
+func (p *Trunk) SetEventHandler(handler func(uint16, []byte) error) {
 	p.eventHandler = handler
 }
 
@@ -115,6 +119,9 @@ func (p *Conn) Read(bs []byte) (n int, err error) {
 }
 
 func (p *Conn) SendEvent(data []byte) (err error) {
+	if p.closed.Load() {
+		return errors.New("has beed closed")
+	}
 	info := &CallInfo{
 		done: make(chan error, 1),
 	}
@@ -129,8 +136,8 @@ func (p *Conn) SendEvent(data []byte) (err error) {
 
 	select {
 	case err = <-info.done:
-	case <-time.After(time.Second * 30):
-		err = errors.New("time out")
+	case <-time.After(time.Second * 10):
+		err = errors.Errorf("time out, connID: %d", p.connID)
 	}
 	return
 }
@@ -248,13 +255,14 @@ func (t *Trunk) RemoveConn(connID int) {
 func (t *Trunk) GetConn(connID uint16) (conn *Conn) {
 	if connID > math.MaxInt16 {
 		return nil
+		connID = connID & 0x7f
 	}
-	conn = func(connID uint16) (payload *Conn) {
+	conn = func(connID uint16) (conn *Conn) {
 		t.lPayloads.RLock()
 		defer t.lPayloads.RUnlock()
 
 		if int(connID) < len(t.payloads) {
-			payload = t.payloads[connID]
+			conn = t.payloads[connID]
 		}
 		return
 	}(connID)
@@ -262,7 +270,7 @@ func (t *Trunk) GetConn(connID uint16) (conn *Conn) {
 		return
 	}
 
-	conn = func(i uint16) (payload *Conn) {
+	conn = func(i uint16) (conn *Conn) {
 		t.lPayloads.Lock()
 		defer t.lPayloads.Unlock()
 
@@ -270,17 +278,17 @@ func (t *Trunk) GetConn(connID uint16) (conn *Conn) {
 			// t.payloads = append(t.payloads, make([]*Payload, connID+1-len(t.payloads))...)
 			t.payloads = slices.Grow(t.payloads, int(connID)+1-len(t.payloads))[:connID+1]
 		}
-		payload = t.payloads[i]
-		if payload != nil {
+		conn = t.payloads[i]
+		if conn != nil {
 			return
 		}
 
-		payload = &Conn{
+		conn = &Conn{
 			Trunk:    t,
 			connID:   uint16(connID),
 			chReader: make(chan []byte, 64),
 		}
-		t.payloads[connID] = payload
+		t.payloads[connID] = conn
 		return
 	}(connID)
 
@@ -319,7 +327,7 @@ func (t *Trunk) Run(ctx context.Context) {
 						err = errors.Errorf("recove:%v", e)
 					}
 				}()
-				log.Ctx(ctx).Info().Msgf("[Run] idx:%d", idx)
+				log.Ctx(ctx).Trace().Caller().Msgf("[Trunk.Run] idx:%d", idx)
 
 				rbuf := make([]byte, 0, math.MaxUint16)
 				for {
@@ -371,6 +379,10 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 			connID := pkg.Header.ConnID
 
 			conn := t.GetConn(connID)
+			if conn == nil {
+				log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("t.GetConn(connID) got nil")
+				continue
+			}
 			idx := pkg.Header.Idx - conn.startIdx // uint16 类型模运算, 会自动溢出为对应模运算结果
 			i := int(idx)
 			if i >= len(conn.packages) {
@@ -425,7 +437,7 @@ func (conn *Conn) DoCmd(pkg Package) {
 		// data = pkg.Body[CmdSize:]
 	case CmdEventReq:
 		data := pkg.Body
-		if conn.eventHandler != nil {
+		if conn.eventHandler != nil || conn.Trunk.eventHandler != nil {
 			go func() {
 				var err error
 				defer func() {
@@ -456,24 +468,37 @@ func (conn *Conn) DoCmd(pkg Package) {
 					}
 				}()
 
-				err = conn.eventHandler(data)
+				if conn.eventHandler != nil {
+					err = conn.eventHandler(data)
+					if err != nil {
+						log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("conn.eventHandler  error")
+					}
+				}
+
+				if conn.Trunk.eventHandler != nil {
+					err = conn.Trunk.eventHandler(pkg.ConnID, data)
+					if err != nil {
+						log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("conn.Trunk.eventHandler error")
+					}
+				}
 			}()
 		}
 	case CmdEventRes:
-		data := pkg.Body
-		result := base.Err{}
-		err := proto.Unmarshal(data, &result)
-		if err != nil {
-			log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("CmdEventRes error")
-			result = base.Err{
-				Code: -1,
-				Msg:  string(data),
-			}
-		}
-
 		info := conn.chEvent.Load()
 		if info != nil {
-			info.done <- errors.NewCode(0, int(result.Code), result.Msg)
+			data := pkg.Body
+			result := base.Err{}
+			err := proto.Unmarshal(data, &result)
+			if err != nil {
+				log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("CmdEventRes error")
+				result = base.Err{
+					Code: -1,
+					Msg:  string(data),
+				}
+				info.done <- errors.NewCode(0, int(result.Code), result.Msg)
+			} else {
+				info.done <- nil
+			}
 		}
 	default:
 	}

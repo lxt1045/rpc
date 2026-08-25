@@ -52,7 +52,8 @@ func (c *Codec) Handler(ctx context.Context, caller Method, header Header, req M
 		}
 		return
 	}
-	if resp == nil || caller.RespType() == nil {
+	// if resp == nil || caller.RespType() == nil {
+	if caller.RespType() == nil {
 		return
 	}
 

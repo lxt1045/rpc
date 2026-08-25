@@ -351,6 +351,9 @@ func (p *SocksCli) TrunkConn(ctx context.Context, trunkID uint16, n int) (conns 
 	g := errgroup.Group{}
 	l := sync.Mutex{}
 	for i := range n {
+		if i != 0 && i%10 == 0 {
+			time.Sleep(time.Millisecond * 100)
+		}
 		func(i int) {
 			g.Go(func() (err error) {
 				conn, err := socket.DialTLSTimeout1(ctx, "tcp", p.PeerAddr, p.TlsConf, time.Second*3)
@@ -399,7 +402,7 @@ func (p *SocksCli) TrunkConn(ctx context.Context, trunkID uint16, n int) (conns 
 }
 
 func (p *SocksCli) InitTrunk(ctx context.Context) (err error) {
-	trunkID, upgradeCount := uint16(10086), 16
+	trunkID, upgradeCount := uint16(10086), 32
 	conns, err := p.TrunkConn(ctx, trunkID, upgradeCount)
 	if err != nil {
 		return
@@ -415,7 +418,6 @@ func (p *SocksCli) InitTrunk(ctx context.Context) (err error) {
 	resp := &pb.TrunkStartRsp{}
 	err = p.trunkPeer.Invoke(ctx, "TrunkStart", reqPeer, resp)
 	if err != nil {
-		err = errors.Errorf("Invoke err:%s", err)
 		return
 	}
 
@@ -482,7 +484,9 @@ func (p *SocksCli) OutToTCPPeer2(ctx context.Context, address string, inConn net
 	defer p.ResetTrunkConnID(connID)
 	conn := p.trunk.GetConn(connID)
 
-	reqPeer := pb.TrunkStartData{}
+	reqPeer := pb.TrunkStartData{
+		Addr: address,
+	}
 	if !req.IsHTTPS() {
 		reqPeer.Body = req.HeadBuf
 	}
@@ -493,7 +497,7 @@ func (p *SocksCli) OutToTCPPeer2(ctx context.Context, address string, inConn net
 		bufPool.Put(wbuf)
 		return
 	}
-	err = conn.SendCall(buf.Bytes())
+	err = conn.SendEvent(buf.Bytes())
 	bufPool.Put(wbuf)
 	if err != nil {
 		return

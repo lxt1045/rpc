@@ -101,6 +101,7 @@ message ConnUpgradeRsp {
 message TrunkStartReq {
   uint32 trunk_id = 1;
   uint32 upgrade_count = 2;
+  repeated uint32 upgrade_ids = 3;
 }
 
 message TrunkStartRsp {

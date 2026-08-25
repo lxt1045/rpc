@@ -355,7 +355,7 @@ func (c *Codec) ReadLoop() {
 			}
 		}
 
-		ctxDo, logID := ctx, uint64(gid.GetGID())
+		ctxDo, logID := ctx, uint64(gid.New())
 		if header.CtxLen != 0 {
 			m := base.Ctx{}
 			err = proto.Unmarshal(bsBody[:header.CtxLen], &m)
@@ -595,7 +595,7 @@ func (c *Codec) SendMsg(ctx context.Context, ver, callID uint16, callSN uint32, 
 		m := base.Ctx{}
 		m.LogID, _ = ctx.Value(LogidKey{}).(uint64)
 		if m.LogID == 0 {
-			logid, _ := log.Logid(ctx)
+			logid := log.Logid(ctx)
 			m.LogID = uint64(logid)
 		}
 		if len(c.cliPassKeys) > 0 {
@@ -625,6 +625,8 @@ func (c *Codec) SendMsg(ctx context.Context, ver, callID uint16, callSN uint32, 
 			bufPool.Put(bs)
 			return
 		}
+		wbuf = buf.Bytes()
+	} else {
 		wbuf = buf.Bytes()
 	}
 
@@ -656,7 +658,7 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 		}
 		if status := atomic.LoadUint32(&c.status); status > 1 ||
 			(status == 1 && ver != VerUpgradeReq && ver != VerUpgradeResp) { // 升级过程中允许发送 UpgradeReq 和 UpgradeResp
-			err = ErrHasBeenUpgraded.Clonef("Send c.status: %d, callID: %d", c.status, callID)
+			err = ErrHasBeenUpgraded.Clonef("Send c.status: %d, callID: %d, ver:%d", c.status, callID, ver)
 			return
 		}
 		_, err = c.rwc.Write(wbuf)

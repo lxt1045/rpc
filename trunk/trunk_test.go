@@ -29,6 +29,30 @@ func TestTrunk0(t *testing.T) {
 
 	payload11, payload12 := peer1.GetConn(1), peer2.GetConn(1)
 
+	peer1.SetEventHandler(func(connID uint16, bs []byte) error {
+		t.Logf("peer1 SetEventHandler connID: %d, event: msg: %s\n", connID, string(bs))
+		return nil
+	})
+
+	payload11.SetEventHandler(func(bs []byte) error {
+		t.Logf("payload11 SetEventHandler connID: %d, event: msg: %s\n", payload11.connID, string(bs))
+		return nil
+	})
+	go func() {
+		err := payload12.SendEvent([]byte("test0..."))
+		if err != nil {
+			t.Error(err)
+		}
+	}()
+	err := payload12.SendEvent([]byte("test1..."))
+	if err != nil {
+		t.Error(err)
+	}
+	err = payload12.SendEvent([]byte("test2..."))
+	if err != nil {
+		t.Error(err)
+	}
+
 	g := errgroup.Group{}
 	g.Go(func() (err error) {
 		go func() {
@@ -51,7 +75,11 @@ func TestTrunk0(t *testing.T) {
 		return
 	})
 
-	err := g.Wait()
+	err = g.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = payload12.SendEvent([]byte("test3..."))
 	if err != nil {
 		t.Fatal(err)
 	}
