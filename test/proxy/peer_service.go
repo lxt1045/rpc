@@ -307,6 +307,12 @@ func Copy(ctx context.Context, dst io.WriteCloser, src io.ReadCloser) (written i
 				}
 			}
 			if er != nil {
+				err := errors.WithErr(er)
+				if tcpConn, ok := src.(*net.TCPConn); ok {
+					log.Ctx(ctx).Error().Caller().Err(err).Str("local", tcpConn.LocalAddr().String()).Str("remote", tcpConn.RemoteAddr().String()).Msg("src.Read")
+				} else {
+					log.Ctx(ctx).Error().Caller().Err(err).Msg("src.Read")
+				}
 				return
 			}
 		}
@@ -323,9 +329,17 @@ func Copy(ctx context.Context, dst io.WriteCloser, src io.ReadCloser) (written i
 		// 	_ = dl.SetDeadline(time.Now())
 		// }
 		if err != nil && !isBenignCloseErr(err) {
-			log.Ctx(ctx).Error().Caller().Err(err).Msg("Copy defer")
+			if tcpConn, ok := dst.(*net.TCPConn); ok {
+				log.Ctx(ctx).Error().Caller().Err(err).Str("local", tcpConn.LocalAddr().String()).Str("remote", tcpConn.RemoteAddr().String()).Msg("Copy defer")
+			} else {
+				log.Ctx(ctx).Error().Caller().Err(err).Msg("Copy defer")
+			}
 		} else if err != nil {
-			log.Ctx(ctx).Debug().Caller().Err(err).Msg("Copy defer benign close")
+			if tcpConn, ok := dst.(*net.TCPConn); ok {
+				log.Ctx(ctx).Error().Caller().Err(err).Str("local", tcpConn.LocalAddr().String()).Str("remote", tcpConn.RemoteAddr().String()).Msg("Copy defer benign close")
+			} else {
+				log.Ctx(ctx).Debug().Caller().Err(err).Msg("Copy defer benign close")
+			}
 			err = nil // 将良性关闭视为正常退出
 		}
 	}()
