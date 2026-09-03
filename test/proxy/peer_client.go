@@ -840,23 +840,24 @@ func (p *SocksCli) CopyLoop(ctx context.Context, rwc io.ReadWriteCloser, peer *P
 }
 
 // 创建备用connect，提前三次握手较少延时
-func (p *SocksCli) RunConnLoop(ctx context.Context, cancel context.CancelFunc, addr string, tlsConfig *tls.Config) {
+func (p *SocksCli) RunConnLoop(ctxOut context.Context, cancel context.CancelFunc, addr string, tlsConfig *tls.Config) {
 	var err error
 	defer func() {
 		e := recover()
 		cancel()
 		if e != nil {
 			err = errors.Errorf("recover : %v", e)
-			log.Ctx(ctx).Error().Caller().Err(err).Send()
+			log.Ctx(ctxOut).Error().Caller().Err(err).Send()
 		}
 	}()
 	for {
 		select {
-		case <-ctx.Done():
-			log.Ctx(ctx).Info().Caller().Str("addr", addr).Msg("ctx.Done")
+		case <-ctxOut.Done():
+			log.Ctx(ctxOut).Info().Caller().Str("addr", addr).Msg("ctx.Done")
 			return
 		default:
 		}
+		ctx := log.RefleshLogid(ctxOut)
 		// conn, err := tls.Dial("tcp", conf.ClientConn.Addr, tlsConfig)
 		// conn, err := socket.DialTLS(ctx, "tcp", addr, tlsConfig)
 		// conn, err := socket.DialTLSTimeout(ctx, "tcp", addr, tlsConfig, time.Second*3)

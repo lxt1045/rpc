@@ -339,7 +339,7 @@ func Copy(ctx context.Context, dst io.WriteCloser, src io.ReadCloser) (written i
 				if tcpConn, ok := dst.(*net.TCPConn); ok {
 					// 不能直接直接调用 conn.Close()，会发送RST 直接断开tcp 链接
 					tcpConn.CloseWrite()
-					log.Ctx(ctx).Info().Caller().Msg("Copy CloseWrite, Send FIN")
+					log.Ctx(ctx).Info().Caller().Str("local", tcpConn.LocalAddr().String()).Str("remote", tcpConn.RemoteAddr().String()).Msg("Copy CloseWrite, Send FIN")
 				}
 				return
 			}
