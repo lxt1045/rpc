@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -Ei '\\\\.\\(yml|yaml|pem|proto|json\\)$')",
+      "Bash(go version *)",
+      "Bash(go env *)",
+      "Bash(go build *)",
+      "Bash(go vet *)",
+      "Bash(go test *)",
+      "Bash(grep -c \"\\\\.pem$\")",
+      "Bash(grep \"\\\\.yml$\")",
+      "Bash(ls \"$\\(go env GOMODCACHE\\)/github.com/pion\")",
+      "Bash(grep -n 'type ReadWriteCloser\\\\|type Reader\\\\|type Writer\\\\|ErrShortBuffer\\\\|func \\(c \\\\*DataChannel\\) Read' __CMDSUB_OUTPUT__/github.com/pion/datachannel@v1.6.2/datachannel.go)",
+      "Bash(protoc --version)",
+      "Bash(ls \"$\\(go env GOPATH\\)/bin\")",
+      "Bash(cd \"$\\(go env GOMODCACHE\\)/github.com/pion/datachannel@v1.6.2\")",
+      "Bash(cd \"$\\(go env GOMODCACHE\\)/github.com/pion/webrtc/v3@v3.3.6\")",
+      "Bash(grep -v '^\\\\s*//')",
+      "Bash(ls \"$\\(go env GOMODCACHE\\)/cache/download/github.com/pion/webrtc/v3/@v/\")",
+      "Bash(grep -n '^#\\\\{2,4\\\\} ' test/webrtc/plan.md)",
+      "Bash(ls \"$\\(go env GOMODCACHE\\)/cache/download/github.com/pion/webrtc\")",
+      "Bash(GOFLAGS=-mod=mod GOPROXY=off go get github.com/pion/webrtc/v3@v3.3.6)",
+      "Bash(GOFLAGS=-mod=mod GOPROXY=off GONOSUMCHECK=1 GONOSUMDB='*' GOSUMDB=off GOFLAGS=-mod=mod go get github.com/pion/webrtc/v3@v3.3.6)",
+      "Bash(cd \"$\\(go env GOMODCACHE\\)/github.com/pion\")",
+      "Bash(cat \"$\\(go env GOMODCACHE\\)/github.com/pion/webrtc/v3@v3.3.6/go.mod\")",
+      "Bash(cp go.mod /tmp/go.mod.bak)",
+      "Bash(cp go.sum /tmp/go.sum.bak)",
+      "Bash(GOFLAGS=-mod=mod GOPROXY=off GOSUMDB=off go get github.com/pion/webrtc/v4@v4.2.19-0.20260822214530-2ac66ee534e3)",
+      "Bash(cp /tmp/go.mod.bak go.mod)",
+      "Bash(cp /tmp/go.sum.bak go.sum)",
+      "Bash(gofmt -e 'test/webrtc copy/peer_client.go')",
+      "Bash(gofmt -l -e 'test/webrtc copy/peer_client.go')",
+      "Bash(protoc -I=. ./rpc/test/webrtc/pb/service.proto --go_out=plugins=grpc:./rpc/test/webrtc/pb/)",
+      "Bash(echo \"--- exit:$? ---\")",
+      "Bash(protoc-gen-go --version)",
+      "Bash(protoc -I=. ./rpc/test/webrtc/pb/service.proto --gogofast_out=plugins=grpc:./rpc/test/webrtc/pb/)",
+      "Read(//d/project/go/pkg/mod/cache/download/github.com/pion/webrtc//**)",
+      "Read(//d/project/go/pkg/mod/cache/download/github.com/pion/webrtc/v3/@v//**)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(grep -E '\\\\.\\(pem|yml\\)$')"
+    ]
+  }
+}
