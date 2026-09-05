@@ -38,11 +38,11 @@ func TestTrunk0(t *testing.T) {
 		t.Logf("payload11 SetEventHandler connID: %d, event: msg: %s\n", payload11.connID, string(bs))
 		return nil
 	})
+	// 三个 SendEvent 无论并发还是串行都必须成功: SendEvent 应该排队,
+	// 而不是直接报 "only one concurrent call is supported"
+	chEvent := make(chan error, 1)
 	go func() {
-		err := payload12.SendEvent([]byte("test0..."))
-		if err != nil {
-			t.Error(err)
-		}
+		chEvent <- payload12.SendEvent([]byte("test0..."))
 	}()
 	err := payload12.SendEvent([]byte("test1..."))
 	if err != nil {
@@ -50,6 +50,10 @@ func TestTrunk0(t *testing.T) {
 	}
 	err = payload12.SendEvent([]byte("test2..."))
 	if err != nil {
+		t.Error(err)
+	}
+	// 等并发那个也返回, 避免它与后面的 Close 竞争
+	if err = <-chEvent; err != nil {
 		t.Error(err)
 	}
 
@@ -66,7 +70,8 @@ func TestTrunk0(t *testing.T) {
 		for i := range 100 {
 			n, err := payload12.Read(bs)
 			if err != nil {
-				t.Error(err)
+				// Close 之后 Read 报错是预期的结束条件
+				t.Log(err)
 				break
 			}
 			t.Logf("connID: %d, i:%d, msg: %s\n", payload11.connID, i, bs[:n])
@@ -79,9 +84,9 @@ func TestTrunk0(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = payload12.SendEvent([]byte("test3..."))
-	if err != nil {
-		t.Fatal(err)
+	// payload11.Close() 会通过 CmdCloseConn 关掉对端, 所以这里必须失败
+	if err = payload12.SendEvent([]byte("test3...")); err == nil {
+		t.Fatal("SendEvent after close should fail")
 	}
 }
 

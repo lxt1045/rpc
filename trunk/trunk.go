@@ -47,6 +47,7 @@ type Conn struct {
 	// 发送数据时需要，只支持一个消息并发
 	chEvent      atomic.Pointer[CallInfo]
 	eventHandler func([]byte) error // 处理上层数据
+	el           sync.Mutex         // 串行化 SendEvent, 并发调用要排队而不是报错
 
 	// writer
 	idxPkg uint16
@@ -92,7 +93,7 @@ func (p *Conn) close() (err error) {
 		close(p.chReader) // 只执行一次
 		return
 	}
-	return errors.New("has beed closed")
+	return errors.New("has been closed")
 }
 
 func (p *Conn) Read(bs []byte) (n int, err error) {
@@ -119,20 +120,21 @@ func (p *Conn) Read(bs []byte) (n int, err error) {
 }
 
 func (p *Conn) SendEvent(data []byte) (err error) {
+	p.el.Lock()
+	defer p.el.Unlock()
+
 	if p.closed.Load() {
-		return errors.New("has beed closed")
+		return errors.New("has been closed")
 	}
 	info := &CallInfo{
 		done: make(chan error, 1),
 	}
-	swapped := p.chEvent.CompareAndSwap(nil, info)
-	if !swapped {
-		err = errors.Errorf("only one concurrent call is supported, and the previous call has not returned yet")
+	p.chEvent.Store(info)
+	defer p.chEvent.Store(nil)
+
+	if err = p.sendEvent(data); err != nil {
 		return
 	}
-	defer p.chEvent.CompareAndSwap(info, nil)
-
-	err = p.sendEvent(data)
 
 	select {
 	case err = <-info.done:
@@ -237,7 +239,7 @@ func (t *Trunk) Close() (err error) {
 		close(t.done) // 只执行一次
 		return
 	}
-	return errors.New("has beed closed")
+	return errors.New("has been closed")
 }
 
 func (t *Trunk) RemoveConn(connID int) {
@@ -255,7 +257,6 @@ func (t *Trunk) RemoveConn(connID int) {
 func (t *Trunk) GetConn(connID uint16) (conn *Conn) {
 	if connID > math.MaxInt16 {
 		return nil
-		connID = connID & 0x7f
 	}
 	conn = func(connID uint16) (conn *Conn) {
 		t.lPayloads.RLock()
@@ -407,9 +408,11 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 
 				// 最高位位类型, 0: ConnID(数据包), 1: 命令类型(命令数据包)
 				if pkg.Header.Cmd == 0 {
-					if conn != nil {
-						conn.chReader <- pkg.Body
+					// 连接已关闭, 丢弃剩余数据, 避免阻塞在 chReader 上
+					if conn.closed.Load() {
+						continue
 					}
+					conn.chReader <- pkg.Body
 					pkg.Body = nil
 					continue
 				} else {
@@ -440,29 +443,30 @@ func (conn *Conn) DoCmd(pkg Package) {
 		if conn.eventHandler != nil || conn.Trunk.eventHandler != nil {
 			go func() {
 				var err error
+				// 无论 handler 成功还是失败，都要回一个 CmdEventRes，否则对端
+				// SendEvent 会一直等到 10s 超时。
 				defer func() {
 					if e := recover(); e != nil {
-						err := errors.Errorf("recove:%v", e)
+						err = errors.Errorf("recove:%v", e)
 						log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("t.fData defer")
 					}
-					bs := []byte{}
+
+					result := base.Err{}
 					if err != nil {
-						result := base.Err{
-							Code: 1,
-							Msg:  err.Error(),
-							// Logid
-						}
-						buf := proto.NewBuffer(bs[:0]) //
-						err = buf.Marshal(&result)
-						if err != nil {
-							log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("CmdEventReq error")
-							bs = []byte(err.Error())
-						} else {
-							bs = buf.Bytes()
-						}
+						result.Code = 1
+						result.Msg = err.Error()
+						// Logid
+					}
+					buf := proto.NewBuffer(nil)
+					err = buf.Marshal(&result)
+					if err != nil {
+						log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("CmdEventReq error")
+						// 编码失败时直接把错误文本透传, 让对端至少能拿到一个错误
+						conn.sendEventResp([]byte(err.Error()))
+						return
 					}
 
-					err = conn.sendEventResp(bs)
+					err = conn.sendEventResp(buf.Bytes())
 					if err != nil {
 						log.Ctx(context.TODO()).Info().Caller().Err(err).Msg("CmdEventReq error")
 					}
@@ -496,7 +500,10 @@ func (conn *Conn) DoCmd(pkg Package) {
 					Msg:  string(data),
 				}
 				info.done <- errors.NewCode(0, int(result.Code), result.Msg)
+			} else if result.Code != 0 || result.Msg != "" {
+				info.done <- errors.NewCode(0, int(result.Code), result.Msg)
 			} else {
+				// 成功: 空 base.Err 编码出来是 0 字节, 这里 send(nil) 表示无错
 				info.done <- nil
 			}
 		}

@@ -37,7 +37,9 @@
       "Read(//d/project/go/pkg/mod/cache/download/github.com/pion/webrtc//**)",
       "Read(//d/project/go/pkg/mod/cache/download/github.com/pion/webrtc/v3/@v//**)",
       "Bash(echo \"EXIT:$?\")",
-      "Bash(grep -E '\\\\.\\(pem|yml\\)$')"
+      "Bash(grep -E '\\\\.\\(pem|yml\\)$')",
+      "Bash(go doc *)",
+      "Bash(cd *)"
     ]
   }
 }
