@@ -1,0 +1,291 @@
+package trunk_kcp
+
+import (
+	"context"
+	"io"
+	"math"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/lxt1045/errors"
+	"github.com/lxt1045/utils/log"
+	"github.com/xtaci/kcp-go"
+	"golang.org/x/sync/errgroup"
+)
+
+// TrunkKCP 基于 KCP 协议的链路聚合
+// 将多个网络连接聚合成一个逻辑连接，通过 KCP 提供可靠传输保障
+type TrunkKCP struct {
+	// 底层物理连接
+	rws []io.ReadWriteCloser
+
+	// KCP 实例（单实例处理双向通信）
+	kcp     *kcp.KCP
+	kcpLock sync.Mutex
+
+	// 数据通道
+	sendChan chan []byte // KCP 输出 -> 网络发送
+	recvChan chan []byte // 网络接收 -> KCP 输入
+
+	// 虚拟连接管理
+	conns    []*VirtualConn
+	connLock sync.RWMutex
+
+	// 写索引（轮询发送）
+	wIdx atomic.Int32
+
+	// 控制信号
+	done   chan struct{}
+	closed atomic.Bool
+}
+
+// NewTrunkKCP 创建一个新的 TrunkKCP 实例
+// conv: KCP conversation ID，两端必须相同
+// rws: 物理连接列表
+func NewTrunkKCP(conv uint32, rws ...io.ReadWriteCloser) *TrunkKCP {
+	t := &TrunkKCP{
+		rws:      rws,
+		sendChan: make(chan []byte, 1024),
+		recvChan: make(chan []byte, 1024),
+		done:     make(chan struct{}),
+	}
+
+	// 创建 KCP 实例，output 回调写入 sendChan
+	t.kcp = kcp.NewKCP(conv, func(buf []byte, size int) {
+		packet := make([]byte, size)
+		copy(packet, buf[:size])
+		select {
+		case t.sendChan <- packet:
+		case <-t.done:
+		}
+	})
+	// 增大窗口以提高吞吐量：发送窗口 1024，接收窗口 1024
+	t.kcp.WndSize(1024, 1024)
+	// 设置 MTU 为 1400（典型以太网 MTU 1500 - IP/UDP 头部）
+	// MSS = MTU - KCP头部(24) = 1376，更大的 MSS 减少分片
+	t.kcp.SetMtu(1400)
+	t.kcp.NoDelay(1, 10, 2, 1) // 快速模式
+
+	return t
+}
+
+// Run 启动 TrunkKCP 的所有协程
+func (t *TrunkKCP) Run(ctx context.Context) error {
+	var g errgroup.Group
+
+	// 启动 KCP 更新协程
+	g.Go(func() error {
+		return t.kcpUpdateLoop(ctx)
+	})
+
+	// 启动发送协程
+	g.Go(func() error {
+		return t.sendLoop(ctx)
+	})
+
+	// 启动接收协程（每个物理连接一个）
+	for i := range t.rws {
+		idx := i
+		g.Go(func() error {
+			return t.recvLoop(ctx, idx)
+		})
+	}
+
+	// 启动 KCP 输入处理协程
+	g.Go(func() error {
+		return t.kcpInputLoop(ctx)
+	})
+
+	return g.Wait()
+}
+
+// sendLoop 从 sendChan 读取 KCP 输出的数据包，轮询发送到物理连接
+func (t *TrunkKCP) sendLoop(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.done:
+			return nil
+		case packet := <-t.sendChan:
+			idx := int(t.wIdx.Add(1)-1) % len(t.rws)
+			_, err := t.rws[idx].Write(packet)
+			if err != nil {
+				log.Ctx(ctx).Error().Err(err).
+					Msgf("sendLoop conn %d write error", idx)
+				return err
+			}
+		}
+	}
+}
+
+// recvLoop 从物理连接读取数据包，发送到 recvChan
+func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
+	buf := make([]byte, 2048)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.done:
+			return nil
+		default:
+		}
+
+		n, err := t.rws[connIdx].Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+
+		packet := make([]byte, n)
+		copy(packet, buf[:n])
+
+		select {
+		case t.recvChan <- packet:
+		case <-t.done:
+			return nil
+		}
+	}
+}
+
+// kcpInputLoop 从 recvChan 读取数据包，喂给接收端 KCP，然后从 KCP 读取完整数据并分发
+func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
+	buf := make([]byte, math.MaxUint16)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.done:
+			return nil
+		case packet := <-t.recvChan:
+			t.kcpLock.Lock()
+			t.kcp.Input(packet, true, false)
+
+			// 尝试从 KCP 读取完整数据
+			for {
+				n := t.kcp.Recv(buf)
+				if n <= 0 {
+					break
+				}
+
+				// 解析 Header 和 ConnID 并分发
+				if n < HeaderSize {
+					continue
+				}
+				header, lHeader := ParseHeader(buf[:CmdHeaderSize])
+				if n > lHeader {
+					data := make([]byte, n-lHeader)
+					copy(data, buf[lHeader:n])
+					t.kcpLock.Unlock()
+					t.demuxData(header, data)
+					t.kcpLock.Lock()
+				}
+			}
+			t.kcpLock.Unlock()
+		}
+	}
+}
+
+// demuxData 根据 ConnID 将数据分发到对应的虚拟连接
+func (t *TrunkKCP) demuxData(header Header, data []byte) {
+	conn := t.GetConn(header.ConnID)
+	if conn == nil || conn.closed.Load() {
+		return
+	}
+
+	// 根据 Cmd 类型处理
+	if header.Cmd == 0 {
+		// 普通数据
+		select {
+		case conn.readChan <- data:
+		default:
+			// 通道满，丢弃
+		}
+	} else {
+		// 命令处理
+		conn.handleCmd(header, data)
+	}
+}
+
+// kcpUpdateLoop KCP 定时更新循环
+func (t *TrunkKCP) kcpUpdateLoop(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.done:
+			return nil
+		case <-ticker.C:
+			now := uint32(time.Now().UnixMilli())
+
+			t.kcpLock.Lock()
+			if t.kcp.Check() <= now {
+				t.kcp.Update()
+			}
+			t.kcpLock.Unlock()
+		}
+	}
+}
+
+// GetConn 获取或创建虚拟连接
+func (t *TrunkKCP) GetConn(connID uint16) *VirtualConn {
+	t.connLock.RLock()
+	if int(connID) < len(t.conns) && t.conns[connID] != nil {
+		conn := t.conns[connID]
+		t.connLock.RUnlock()
+		return conn
+	}
+	t.connLock.RUnlock()
+
+	t.connLock.Lock()
+	defer t.connLock.Unlock()
+
+	// 扩展切片
+	if int(connID) >= len(t.conns) {
+		newConns := make([]*VirtualConn, connID+1)
+		copy(newConns, t.conns)
+		t.conns = newConns
+	}
+
+	if t.conns[connID] == nil {
+		t.conns[connID] = &VirtualConn{
+			TrunkKCP: t,
+			connID:   connID,
+			readChan: make(chan []byte, 64),
+		}
+	}
+
+	return t.conns[connID]
+}
+
+// Close 关闭 TrunkKCP
+func (t *TrunkKCP) Close() error {
+	if !t.closed.CompareAndSwap(false, true) {
+		return errors.New("already closed")
+	}
+
+	// 关闭所有虚拟连接
+	t.connLock.Lock()
+	for _, conn := range t.conns {
+		if conn != nil {
+			conn.Close()
+		}
+	}
+	t.connLock.Unlock()
+
+	// 发送信号关闭所有协程
+	close(t.done)
+
+	// 关闭物理连接
+	for _, rw := range t.rws {
+		rw.Close()
+	}
+
+	return nil
+}

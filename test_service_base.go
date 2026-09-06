@@ -74,9 +74,11 @@ func (f *fakeConn) Read(data []byte) (n int, err error) {
 }
 
 func (f *fakeConn) Write(data []byte) (n int, err error) {
-	f.wl.Lock()
-	defer f.wl.Unlock()
-	*f.wCache = append(*f.wCache, data...)
+	func() {
+		f.wl.Lock()
+		defer f.wl.Unlock()
+		*f.wCache = append(*f.wCache, data...)
+	}()
 	select {
 	case f.w <- struct{}{}:
 	default:
