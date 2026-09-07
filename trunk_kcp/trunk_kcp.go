@@ -80,9 +80,12 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 	})
 
 	// 启动发送协程
-	g.Go(func() error {
-		return t.sendLoop(ctx)
-	})
+	for i := range t.rws {
+		idx := i
+		g.Go(func() error {
+			return t.sendLoop(ctx, idx)
+		})
+	}
 
 	// 启动接收协程（每个物理连接一个）
 	for i := range t.rws {
@@ -101,7 +104,9 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 }
 
 // sendLoop 从 sendChan 读取 KCP 输出的数据包，轮询发送到物理连接
-func (t *TrunkKCP) sendLoop(ctx context.Context) error {
+func (t *TrunkKCP) sendLoop(ctx context.Context, idx int) error {
+	log.Ctx(ctx).Error().Msgf("sendLoop conn %d", idx)
+	rw := t.rws[idx]
 	for {
 		select {
 		case <-ctx.Done():
@@ -109,8 +114,7 @@ func (t *TrunkKCP) sendLoop(ctx context.Context) error {
 		case <-t.done:
 			return nil
 		case packet := <-t.sendChan:
-			idx := int(t.wIdx.Add(1)-1) % len(t.rws)
-			_, err := t.rws[idx].Write(packet)
+			_, err := rw.Write(packet)
 			if err != nil {
 				log.Ctx(ctx).Error().Err(err).
 					Msgf("sendLoop conn %d write error", idx)
@@ -122,7 +126,8 @@ func (t *TrunkKCP) sendLoop(ctx context.Context) error {
 
 // recvLoop 从物理连接读取数据包，发送到 recvChan
 func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
-	buf := make([]byte, 2048)
+	buf := make([]byte, math.MaxUint16)
+	rw := t.rws[connIdx]
 	for {
 		select {
 		case <-ctx.Done():
@@ -132,7 +137,7 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 		default:
 		}
 
-		n, err := t.rws[connIdx].Read(buf)
+		n, err := rw.Read(buf)
 		if err != nil {
 			if err == io.EOF {
 				return nil
@@ -140,8 +145,7 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 			return err
 		}
 
-		packet := make([]byte, n)
-		copy(packet, buf[:n])
+		packet := append(buf[:0:0], buf[:n]...)
 
 		select {
 		case t.recvChan <- packet:
@@ -154,6 +158,9 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 // kcpInputLoop 从 recvChan 读取数据包，喂给接收端 KCP，然后从 KCP 读取完整数据并分发
 func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 	buf := make([]byte, math.MaxUint16)
+	nBuf := 0
+	header := Header{}
+	lHeader := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -166,25 +173,29 @@ func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 
 			// 尝试从 KCP 读取完整数据
 			for {
-				n := t.kcp.Recv(buf)
+				n := t.kcp.Recv(buf[nBuf:])
+				t.kcpLock.Unlock()
 				if n <= 0 {
 					break
 				}
+				nBuf += n
 
-				// 解析 Header 和 ConnID 并分发
-				if n < HeaderSize {
-					continue
+				if lHeader == 0 {
+					// 解析 Header 和 ConnID 并分发
+					if nBuf < HeaderSize {
+						continue
+					}
+					header, lHeader = ParseHeader(buf[:CmdHeaderSize])
 				}
-				header, lHeader := ParseHeader(buf[:CmdHeaderSize])
-				if n > lHeader {
-					data := make([]byte, n-lHeader)
-					copy(data, buf[lHeader:n])
-					t.kcpLock.Unlock()
+
+				if lPkg := lHeader + int(header.Len); nBuf >= lPkg {
+					data := make([]byte, header.Len)
+					copy(data, buf[lHeader:lPkg])
 					t.demuxData(header, data)
-					t.kcpLock.Lock()
+					lHeader, header = 0, Header{} // 重置
 				}
+				t.kcpLock.Lock()
 			}
-			t.kcpLock.Unlock()
 		}
 	}
 }

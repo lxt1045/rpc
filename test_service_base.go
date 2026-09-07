@@ -43,24 +43,29 @@ func NewFakeConnPipe() (svc, cli *fakeConn) {
 func (f *fakeConn) Read(data []byte) (n int, err error) {
 	read := func(data []byte) (n int, err error) {
 		f.rl.Lock()
-		defer f.rl.Unlock()
-		if l := len(*f.rCache); l > 0 {
-			if l >= len(data) {
-				n = len(data)
-				copy(data, *f.rCache)
-				*f.rCache = (*f.rCache)[n:]
+		defer func() {
+			f.rl.Unlock()
+			if n > 0 {
 				select {
 				case f.r <- struct{}{}:
 				default:
 				}
-				return
 			}
-
-			n = l
-			copy(data, *f.rCache)
-			*f.rCache = (*f.rCache)[:0]
+		}()
+		l := len(*f.rCache)
+		if l == 0 {
 			return
 		}
+		if l >= len(data) {
+			n = len(data)
+			copy(data, *f.rCache)
+			*f.rCache = (*f.rCache)[n:]
+			return
+		}
+
+		n = l
+		copy(data, *f.rCache)
+		*f.rCache = (*f.rCache)[:0]
 		return
 	}
 

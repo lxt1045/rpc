@@ -2,6 +2,7 @@ package trunk_kcp
 
 import (
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -38,7 +39,7 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 
 	// 由于 Header.Len 是 uint16，单次最大只能发送 65535 - HeaderSize 字节
 	// 对于大数据需要分块发送
-	const maxChunkSize = 65535 - HeaderSize
+	const maxChunkSize = math.MaxUint16 - HeaderSize
 	totalWritten := 0
 
 	for totalWritten < len(p) {
@@ -52,7 +53,7 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 		// 添加 ConnID 头部
 		header := Header{
 			ConnID: vc.connID,
-			Len:    uint16(chunkSize + HeaderSize),
+			Len:    uint16(chunkSize),
 		}
 
 		buf := make([]byte, HeaderSize+chunkSize)
