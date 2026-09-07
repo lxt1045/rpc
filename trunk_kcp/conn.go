@@ -106,7 +106,6 @@ func (vc *VirtualConn) Close() error {
 	header := Header{
 		ConnID: vc.connID,
 		Cmd:    CmdCloseConn,
-		Len:    CmdHeaderSize,
 	}
 
 	buf := make([]byte, CmdHeaderSize)

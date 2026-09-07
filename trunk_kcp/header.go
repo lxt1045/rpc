@@ -18,6 +18,7 @@ const (
 const (
 	HeaderSize    = 6
 	CmdHeaderSize = 8
+	kcpHeaderSize = 24
 )
 
 type Header struct {

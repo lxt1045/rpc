@@ -249,7 +249,7 @@ func TestTrunkKCP_LargeData(t *testing.T) {
 
 		// 等待数据传输完成（对于 1MB 数据，需要较长时间）
 		// 基于实际测试，1MB 需要约 30-40 秒传输
-		time.Sleep(35 * time.Second)
+		// KCP preserves send order, so close follows all data frames.
 
 		vconn1.Close()
 		return nil

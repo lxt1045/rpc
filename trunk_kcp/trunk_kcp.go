@@ -2,6 +2,7 @@ package trunk_kcp
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"math"
 	"sync"
@@ -127,6 +128,7 @@ func (t *TrunkKCP) sendLoop(ctx context.Context, idx int) error {
 // recvLoop 从物理连接读取数据包，发送到 recvChan
 func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 	buf := make([]byte, math.MaxUint16)
+	pending := make([]byte, 0, math.MaxUint16)
 	rw := t.rws[connIdx]
 	for {
 		select {
@@ -145,12 +147,24 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 			return err
 		}
 
-		packet := append(buf[:0:0], buf[:n]...)
+		pending = append(pending, buf[:n]...)
+		for {
+			if len(pending) < kcpHeaderSize {
+				break
+			}
 
-		select {
-		case t.recvChan <- packet:
-		case <-t.done:
-			return nil
+			packetLen := kcpHeaderSize + int(binary.LittleEndian.Uint32(pending[20:24]))
+			if len(pending) < packetLen {
+				break
+			}
+
+			packet := append([]byte(nil), pending[:packetLen]...)
+			pending = pending[packetLen:]
+			select {
+			case t.recvChan <- packet:
+			case <-t.done:
+				return nil
+			}
 		}
 	}
 }
@@ -158,9 +172,7 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 // kcpInputLoop 从 recvChan 读取数据包，喂给接收端 KCP，然后从 KCP 读取完整数据并分发
 func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 	buf := make([]byte, math.MaxUint16)
-	nBuf := 0
-	header := Header{}
-	lHeader := 0
+	pending := make([]byte, 0, math.MaxUint16)
 	for {
 		select {
 		case <-ctx.Done():
@@ -169,32 +181,38 @@ func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 			return nil
 		case packet := <-t.recvChan:
 			t.kcpLock.Lock()
-			t.kcp.Input(packet, true, false)
-
-			// 尝试从 KCP 读取完整数据
-			for {
-				n := t.kcp.Recv(buf[nBuf:])
+			if ret := t.kcp.Input(packet, true, false); ret < 0 {
 				t.kcpLock.Unlock()
-				if n <= 0 {
+				return errors.Errorf("kcp input failed: %d", ret)
+			}
+
+			for {
+				n := t.kcp.Recv(buf)
+				if n < 0 {
 					break
 				}
-				nBuf += n
+				pending = append(pending, buf[:n]...)
+			}
+			t.kcpLock.Unlock()
 
-				if lHeader == 0 {
-					// 解析 Header 和 ConnID 并分发
-					if nBuf < HeaderSize {
-						continue
-					}
-					header, lHeader = ParseHeader(buf[:CmdHeaderSize])
+			// Consume every completed virtual-connection frame before accepting more KCP input.
+			for {
+				if len(pending) < HeaderSize {
+					break
+				}
+				if pending[4]&0x80 != 0 && len(pending) < CmdHeaderSize {
+					break
 				}
 
-				if lPkg := lHeader + int(header.Len); nBuf >= lPkg {
-					data := make([]byte, header.Len)
-					copy(data, buf[lHeader:lPkg])
-					t.demuxData(header, data)
-					lHeader, header = 0, Header{} // 重置
+				header, headerLen := ParseHeader(pending)
+				packetLen := headerLen + int(header.Len)
+				if len(pending) < packetLen {
+					break
 				}
-				t.kcpLock.Lock()
+
+				data := append([]byte(nil), pending[headerLen:packetLen]...)
+				pending = pending[packetLen:]
+				t.demuxData(header, data)
 			}
 		}
 	}
