@@ -66,6 +66,14 @@ func NewTrunkKCP(conv uint32, rws ...io.ReadWriteCloser) *TrunkKCP {
 	// 设置 MTU 为 1400（典型以太网 MTU 1500 - IP/UDP 头部）
 	// MSS = MTU - KCP头部(24) = 1376，更大的 MSS 减少分片
 	t.kcp.SetMtu(1400)
+
+	// 第1个参数 nodelay-启用以后若干常规加速将启动
+	// 第2个参数 interval为内部处理时钟，默认设置为 10ms
+	// 第3个参数 resend为快速重传指标，设置为2
+	// 第4个参数 为是否禁用常规流控，这里禁止
+	// conn.kcp.NoDelay(0, 10, 0, 0) // 默认模式
+	//conn.kcp.NoDelay(0, 10, 0, 1) // 普通模式，关闭流控等
+	//conn.kcp.NoDelay(1, 10, 2, 1) // 启动快速模式
 	t.kcp.NoDelay(1, 10, 2, 1) // 快速模式
 
 	return t
