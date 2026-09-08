@@ -11,12 +11,27 @@ import (
 	"github.com/lxt1045/utils/log"
 )
 
+func signalUpgrade(ctx context.Context, ready bool) {
+	upgrade, _ := ctx.Value(ctxUpgradeKey{}).(*Upgrade)
+	if upgrade == nil {
+		return
+	}
+	if ready {
+		upgrade.markReady()
+	} else {
+		_ = upgrade.Close()
+	}
+}
+
 func (c *Codec) Handler(ctx context.Context, caller Method, header Header, req Msg) (resp Msg, err error) {
 	defer func() {
 		// resp 发送放 defer 中，及时panic也有返回值
 		e := recover()
 		if e != nil {
 			err = errors.Errorf("func: %s, recover: %v", caller.FuncName(), e)
+			if header.Ver == VerUpgradeReq {
+				signalUpgrade(ctx, false)
+			}
 		}
 		if err != nil {
 			log.Ctx(ctx).Error().Caller().Err(err).Send()
@@ -46,14 +61,18 @@ func (c *Codec) Handler(ctx context.Context, caller Method, header Header, req M
 				ver = VerUpgradeErrResp
 			}
 			err = c.SendMsg(ctx, ver, header.CallID, header.CallSN, pbErr)
-			if err != nil {
-				return
+			if header.Ver == VerUpgradeReq {
+				signalUpgrade(ctx, false)
 			}
+			return
 		}
 		return
 	}
 	// if resp == nil || caller.RespType() == nil {
 	if caller.RespType() == nil {
+		if header.Ver == VerUpgradeReq {
+			signalUpgrade(ctx, true)
+		}
 		return
 	}
 
@@ -65,6 +84,9 @@ func (c *Codec) Handler(ctx context.Context, caller Method, header Header, req M
 	}
 
 	err = c.SendMsg(ctx, ver, header.CallID, header.CallSN, resp)
+	if header.Ver == VerUpgradeReq {
+		signalUpgrade(ctx, err == nil)
+	}
 	if err != nil {
 		return
 	}

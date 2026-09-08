@@ -1,0 +1,45 @@
+name: socks-trunk
+
+on:
+  push:
+    paths:
+      - 'trunk/**'
+      - 'socks_trunk/**'
+      - 'cmd/**'
+      - 'test/socks_trunk/**'
+      - '.github/workflows/socks-trunk.yaml'
+  pull_request:
+    paths:
+      - 'trunk/**'
+      - 'socks_trunk/**'
+      - 'cmd/**'
+      - 'test/socks_trunk/**'
+      - '.github/workflows/socks-trunk.yaml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout rpc
+        uses: actions/checkout@v4
+        with:
+          path: rpc
+
+      - name: Checkout utils
+        uses: actions/checkout@v4
+        with:
+          repository: lxt1045/utils
+          path: utils
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: rpc/go.mod
+
+      - name: Unit tests
+        working-directory: rpc
+        run: go test -count=1 ./test/socks_trunk/socks_trunk/... ./test/socks_trunk/cmd/... ./test/socks_trunk/... ./trunk
+
+      - name: Vet
+        working-directory: rpc
+        run: go vet ./test/socks_trunk/socks_trunk/... ./test/socks_trunk/cmd/... ./test/socks_trunk/... ./trunk

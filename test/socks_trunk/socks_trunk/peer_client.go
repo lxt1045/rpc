@@ -15,7 +15,7 @@ import (
 	"github.com/lxt1045/errors"
 	"github.com/lxt1045/rpc"
 	"github.com/lxt1045/rpc/socket"
-	"github.com/lxt1045/rpc/test/socks_trunk/pb"
+	"github.com/lxt1045/rpc/test/socks_trunk/socks_trunk/pb"
 	"github.com/lxt1045/rpc/trunk"
 	"github.com/lxt1045/utils/log"
 	"github.com/lxt1045/utils/socks"

@@ -1,0 +1,19 @@
+[Unit]
+Description=socks-trunk client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=socks-trunk
+Group=socks-trunk
+EnvironmentFile=/etc/socks-trunk/client.env
+ExecStart=/usr/local/bin/socks-trunk-client -config /etc/socks-trunk/client.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

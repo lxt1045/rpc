@@ -15,6 +15,7 @@
 - **虚拟连接** / **Virtual Connections**: 支持在同一个 trunk 上复用多个虚拟连接
 - **轮询发送** / **Round-Robin Sending**: 在多个物理连接上轮询发送数据包，实现带宽聚合
 - **并发接收** / **Concurrent Receiving**: 每个物理连接独立接收数据，提高吞吐量
+- **完整分包接收** / **Complete Packet Reception**: 接收端根据 KCP 头部的长度字段拆分半包和粘包，只把完整 KCP 段送入 KCP
 
 ## 架构 / Architecture
 
@@ -63,15 +64,31 @@
    - 发送协程轮询从 `sendChan` 读取并发送到物理连接
 
 2. **接收路径** / **Receive Path**:
-   - 每个物理连接的接收协程读取数据包
-   - 数据包写入 `recvChan`
+   - 每个物理连接的接收协程读取字节流
+   - 根据 KCP 头部 `20~24` 字节中的小端长度字段拆出完整 KCP 段
+   - 只有完整 KCP 段才会写入 `recvChan`，半包会留在接收缓存中，粘包会被拆成多个段
    - KCP 输入协程从 `recvChan` 读取并喂给接收端 KCP
    - 从 KCP 读取完整数据，解析 ConnID 并分发到虚拟连接
    - 应用通过 `VirtualConn.Read()` 读取数据
 
 3. **KCP 更新** / **KCP Update**:
    - 独立的更新协程每 10ms 调用一次 `KCP.Update()`
-   - 分别更新发送端和接收端 KCP
+   - 同一个 KCP 实例负责双向数据的发送和接收
+
+## 业务帧格式 / Application Frame Format
+
+KCP 负责可靠传输、重传和顺序恢复，因此 `trunk_kcp` 的业务头不包含 `Idx`。业务数据在 KCP 数据中使用以下格式：
+
+```text
+普通数据帧: [Len uint16][ConnID uint16][Body Len 字节]
+命令数据帧: [Len uint16][ConnID|0x8000 uint16][Cmd uint16][Body Len 字节]
+```
+
+字段使用小端序。`Len` 表示业务体 `Body` 的字节数；普通帧头为 4 字节，命令帧头为 6 字节。`ConnID` 的最高位 `0x8000` 是命令标志，低 15 位保存虚拟连接编号，因此有效 `ConnID` 范围为 `0` 到 `32767`。
+
+物理连接承载的是 KCP 段。KCP 段头固定为 24 字节，段长度位于偏移 `20` 到 `24` 字节，接收协程会先依据该长度组装完整 KCP 段，再交给 KCP 输入协程。
+
+该业务帧格式与 `trunk` 不兼容；使用 `trunk_kcp` 的两端必须运行相同的头部格式。
 
 ## 使用示例 / Usage Example
 
@@ -182,7 +199,7 @@ func main() {
 
 #### `Run(ctx context.Context) error`
 
-启动 TrunkKCP 的所有协程，包括发送、接收、KCP 更新等。此方法会阻塞直到 context 取消或发生错误。
+启动 TrunkKCP 的所有协程，包括发送、接收、KCP 更新等。此方法会阻塞直到 context 取消、物理连接关闭或发生错误；退出时会关闭关联的物理连接和虚拟连接。
 
 #### `GetConn(connID uint16) *VirtualConn`
 
@@ -217,7 +234,7 @@ func main() {
 |------|-------|-----------|
 | **可靠性** | 依赖底层连接 | KCP 协议保证 |
 | **丢包恢复** | 无自动重传 | KCP 自动重传 |
-| **顺序保证** | 需要 Idx 重排序 | KCP 保证顺序 |
+| **顺序保证** | 需要 `Idx` 重排序 | KCP 保证顺序，无需 `Idx` |
 | **延迟** | 低 | 中等（KCP 开销）|
 | **吞吐量** | 高 | 中等（KCP 开销）|
 | **适用场景** | 可靠网络 | 不可靠网络 |
@@ -245,7 +262,7 @@ trunk_kcp 默认使用快速模式：
 
 ```go
 kcp.NoDelay(1, 10, 2, 1)
-kcp.WndSize(128, 128)
+kcp.WndSize(1024, 1024)
 ```
 
 可以根据网络环境调整：
@@ -253,11 +270,11 @@ kcp.WndSize(128, 128)
 ```go
 // 普通模式（延迟较高，CPU 开销低）
 kcp.NoDelay(0, 10, 0, 1)
-kcp.WndSize(128, 128)
+kcp.WndSize(1024, 1024)
 
 // 快速模式（默认，平衡延迟和 CPU）
 kcp.NoDelay(1, 10, 2, 1)
-kcp.WndSize(128, 128)
+kcp.WndSize(1024, 1024)
 
 // 超快模式（最低延迟，CPU 开销高）
 kcp.NoDelay(1, 5, 2, 1)
@@ -290,7 +307,7 @@ ticker := time.NewTicker(20 * time.Millisecond)
 1. **Conv ID 一致性**: 通信双方必须使用相同的 `conv` 参数
 2. **ConnID 范围**: 虚拟连接 ID 范围为 0-32767（15 位）
 3. **MTU 限制**: 默认 MTU 为 1400 字节，大数据会被 KCP 自动分片
-4. **内存使用**: 每个 TrunkKCP 实例会维护两个 KCP 实例和多个通道
+4. **内存使用**: 每个 TrunkKCP 实例维护一个双向 KCP 实例、多个通道和虚拟连接队列
 5. **并发安全**: 所有 API 都是并发安全的
 6. **关闭顺序**: 建议先关闭虚拟连接，再关闭 TrunkKCP
 

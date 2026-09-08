@@ -49,12 +49,15 @@ type Method interface {
 }
 
 type Codec struct {
-	cancel context.CancelFunc
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeErr  error
 	// chDone <-chan struct{}
 	ctx context.Context
 
-	// rwcLock sync.Mutex
+	rwcLock   sync.RWMutex
 	rwc       io.ReadWriteCloser
+	writeLock sync.Mutex
 	tmpCallSN uint32
 
 	upgradeLock sync.Mutex
@@ -89,6 +92,24 @@ type post struct {
 	key   uint64
 	Codec *Codec
 	done  chan error
+}
+
+func writeFull(w io.Writer, p []byte) (int, error) {
+	total := 0
+	for total < len(p) {
+		n, err := w.Write(p[total:])
+		if n < 0 || n > len(p)-total {
+			return total, io.ErrShortWrite
+		}
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
 }
 
 func (d post) Post() {
@@ -143,56 +164,86 @@ func NewCodec(ctx context.Context, rwc io.ReadWriteCloser, callers []Method, ctx
 	return
 }
 
+func (c *Codec) currentRWC() io.ReadWriteCloser {
+	if c == nil {
+		return nil
+	}
+	c.rwcLock.RLock()
+	rwc := c.rwc
+	c.rwcLock.RUnlock()
+	return rwc
+}
+
+func (c *Codec) takeRWC() io.ReadWriteCloser {
+	if c == nil {
+		return nil
+	}
+	c.rwcLock.Lock()
+	rwc := c.rwc
+	c.rwc = nil
+	c.rwcLock.Unlock()
+	return rwc
+}
+
 func (c *Codec) Close() (err error) {
 	if c == nil {
 		return
 	}
+	c.closeOnce.Do(func() {
+		if c.cancel != nil {
+			c.cancel()
+		}
+		if c.delay != nil {
+			c.delay.Range(func(t post) {
+				t.Post()
+			})
+			c.delay.Close()
+		}
 
-	if c.cancel != nil {
-		c.cancel()
-		c.cancel = nil
-	}
-	if c.delay != nil {
-		c.delay.Range(func(t post) {
-			t.Post()
-		})
-		c.delay.Close()
-		c.delay = nil
-	}
-
-	if c.streams != nil {
 		func() {
 			c.streamsLock.Lock()
 			defer c.streamsLock.Unlock()
-			for _, s := range c.streams {
-				s.close()
+			if c.streams != nil {
+				for _, s := range c.streams {
+					s.close()
+				}
+				c.streams = nil
 			}
 		}()
-		c.streams = nil
-	}
 
-	if atomic.LoadUint32(&c.status) == 0 {
-		c.SendCloseMsg(c.ctx)
-		time.Sleep(time.Millisecond * 10)
-	}
-
-	c.respsLock.Lock()
-	defer c.respsLock.Unlock()
-	if c.rwc != nil {
-		if tcpConn, ok := c.rwc.(*net.TCPConn); ok {
-			// 不能直接直接调用 conn.Close()，会发送RST 直接断开tcp 链接
-			tcpConn.CloseWrite()
-			log.Ctx(context.TODO()).Info().Caller().Msg("Codec.Close(), Copy CloseWrite, Send FIN")
-		} else {
-			err = c.rwc.Close()
+		if rwc := c.currentRWC(); rwc != nil {
+			if dl, ok := rwc.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				// Closing must not wait forever behind a blocked writer. The
+				// connection is discarded after this best-effort close frame.
+				_ = dl.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			}
 		}
-		c.rwc = nil
-	}
-	return
+		if atomic.LoadUint32(&c.status) == 0 {
+			_ = c.SendCloseMsg(c.ctx)
+		}
+
+		rwc := c.takeRWC()
+		if rwc != nil {
+			if tcpConn, ok := rwc.(*net.TCPConn); ok {
+				// 先发 FIN，再关闭整个连接释放底层 socket。仅 CloseWrite
+				// 会遗留读半边和文件描述符，长期运行会累积连接资源。
+				if closeErr := tcpConn.CloseWrite(); closeErr != nil {
+					c.closeErr = closeErr
+				}
+				if closeErr := tcpConn.Close(); c.closeErr == nil && closeErr != nil {
+					c.closeErr = closeErr
+				}
+				log.Ctx(context.TODO()).Info().Caller().Msg("Codec.Close(), CloseWrite then Close")
+			} else {
+				c.closeErr = rwc.Close()
+			}
+		}
+	})
+	return c.closeErr
 }
 
 func (c *Codec) IsClosed() (yes bool) {
-	return c == nil || c.rwc == nil
+	return c == nil || c.currentRWC() == nil
 }
 
 func (rpc *Codec) Done() <-chan struct{} {
@@ -295,8 +346,10 @@ func (c *Codec) ReadLoop() {
 		}
 
 		if isUpgrade {
-			c.delay.Close()
-		} else if c.rwc != nil {
+			if c.delay != nil {
+				c.delay.Close()
+			}
+		} else if c.currentRWC() != nil {
 			c.Close()
 		}
 	}()
@@ -311,11 +364,19 @@ func (c *Codec) ReadLoop() {
 
 		var header Header
 		var bsBody []byte
-		if atomic.LoadUint32(&c.status) != 0 {
+		// During an upgrade the reader must stay alive until it consumes the
+		// upgrade response. A status of 1 is the in-flight state, not a closed
+		// codec; returning here races with the response and leaves callers stuck.
+		if atomic.LoadUint32(&c.status) > 1 {
 			err = ErrHasBeenClosed.Clonef("ReadLoop c.status: %d", c.status)
 			return
 		}
-		header, bsBody, err = ReadPack(ctx, c.rwc, rbuf) // TODO: 设置读超时？？
+		rwc := c.currentRWC()
+		if rwc == nil {
+			err = ErrHasBeenClosed.Clone()
+			return
+		}
+		header, bsBody, err = ReadPack(ctx, rwc, rbuf) // TODO: 设置读超时？？
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return
@@ -492,7 +553,8 @@ func (c *Codec) SendCloseMsg(ctx context.Context) (err error) {
 		CallSN:       0,
 	}
 	h.Format(wbuf)
-	if c.rwc == nil {
+	rwc := c.currentRWC()
+	if rwc == nil {
 		err = errors.Errorf("has been closed")
 		return
 	}
@@ -500,7 +562,9 @@ func (c *Codec) SendCloseMsg(ctx context.Context) (err error) {
 		err = ErrHasBeenClosed.Clonef("SendCloseMsg c.status: %d", c.status)
 		return
 	}
-	_, err = c.rwc.Write(wbuf)
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+	_, err = writeFull(rwc, wbuf)
 	if err != nil {
 		err = errors.New(err.Error())
 		return
@@ -523,11 +587,14 @@ func (c *Codec) SendHeartbeatMsg(ctx context.Context) (err error) {
 		CallSN:       0,
 	}
 	h.FormatRaw(wbuf)
-	if c.rwc == nil {
+	rwc := c.currentRWC()
+	if rwc == nil {
 		err = ErrHasBeenClosed.Clone("SendHeartbeatMsg rwc is nil")
 		return
 	}
-	_, err = c.rwc.Write(wbuf)
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+	_, err = writeFull(rwc, wbuf)
 	if err != nil {
 		err = errors.New(err.Error())
 	}
@@ -636,6 +703,8 @@ func (c *Codec) SendMsg(ctx context.Context, ver, callID uint16, callSN uint32, 
 }
 
 func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint16, callSN uint32) (err error) {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
 	defer func() {
 		if e := recover(); e != nil {
 			err = errors.Errorf("%+v", e)
@@ -652,7 +721,8 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 			CallSN:       callSN,
 		}
 		h.FormatCall(wbuf)
-		if c.rwc == nil {
+		rwc := c.currentRWC()
+		if rwc == nil {
 			err = ErrHasBeenClosed.Clone()
 			return
 		}
@@ -661,7 +731,7 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 			err = ErrHasBeenUpgraded.Clonef("Send c.status: %d, callID: %d, ver:%d", c.status, callID, ver)
 			return
 		}
-		_, err = c.rwc.Write(wbuf)
+		_, err = writeFull(rwc, wbuf)
 		if err != nil {
 			err = errors.New(err.Error())
 		}
@@ -681,7 +751,8 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 			CallSN:       callSN,
 		}
 		h.FormatCall(wbuf0)
-		if c.rwc == nil {
+		rwc := c.currentRWC()
+		if rwc == nil {
 			err = errors.Errorf("has been closed")
 			return
 		}
@@ -689,7 +760,7 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 			err = ErrHasBeenClosed.Clonef("Send c.status: %d", c.status)
 			return
 		}
-		_, err = c.rwc.Write(wbuf0[:math.MaxUint16]) // 原子写，内部有锁
+		_, err = writeFull(rwc, wbuf0[:math.MaxUint16]) // 原子写，内部有锁
 		if err != nil {
 			err = errors.New(err.Error())
 		}
@@ -712,7 +783,8 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 		CallSN:       callSN,
 	}
 	h.FormatCall(wbuf0)
-	if c.rwc == nil {
+	rwc := c.currentRWC()
+	if rwc == nil {
 		err = errors.Errorf("has been closed")
 		return
 	}
@@ -720,7 +792,7 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 		err = ErrHasBeenClosed.Clonef("SendHeartbeatMsg c.status: %d", c.status)
 		return
 	}
-	_, err = c.rwc.Write(wbuf0)
+	_, err = writeFull(rwc, wbuf0)
 	if err != nil {
 		err = errors.New(err.Error())
 	}

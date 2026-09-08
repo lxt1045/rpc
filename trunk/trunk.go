@@ -237,6 +237,11 @@ func NewTrunk(rws ...io.ReadWriteCloser) (t *Trunk) {
 	return
 }
 
+// IsClosed reports whether the Trunk has been closed.
+func (t *Trunk) IsClosed() bool {
+	return t.closed.Load()
+}
+
 func (t *Trunk) Close() (err error) {
 	if t.closed.CompareAndSwap(false, true) {
 		close(t.done)

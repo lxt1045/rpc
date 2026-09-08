@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
-	"os"
 	"os/signal"
 	"syscall"
 
@@ -16,103 +14,53 @@ import (
 	_ "go.uber.org/automaxprocs"
 )
 
-/*
-$env:CGO_ENABLED=0; $env:GOOS="linux"; $env:GOARCH="amd64"; go build ./
-*/
-
 type Config struct {
-	Debug      bool
-	Pprof      bool
-	Dev        bool
-	Conn       config.Conn
 	ClientConn config.Conn
 	Log        config.Log
 	TCPProxy   []TCPProxy
 }
+
 type TCPProxy struct {
 	From string
 	To   string
 }
 
 func main() {
-	var flags struct {
-		Client  string
-		Server  string
-		Verbose bool
-		Socks   string // 有则是 peerCli， 无则是 peerSvc
-		Proxy   bool
-	}
-
-	flag.BoolVar(&flags.Verbose, "verbose", true, "verbose mode")
-	flag.BoolVar(&flags.Proxy, "proxy", false, "verbose mode")
-	flag.StringVar(&flags.Server, "s", "", "server listen address or url")
-	flag.StringVar(&flags.Client, "c", "client-952700", "client connect address or url")
-	// flag.StringVar(&flags.Socks, "socks", ":10086", "(client-only) SOCKS listen address")
-	flag.StringVar(&flags.Socks, "socks", ":10080", "(client-only) SOCKS listen address")
-	flag.Parse()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// 解析配置文件
-	conf := &Config{}
-	file := "static/conf/default.yml"
-	err := config.UnmarshalFS(file, filesystem.Static, conf)
-	if err != nil {
-		log.Ctx(ctx).Fatal().Caller().Err(err).Send()
-		return
-	}
-	// 初始化Log
-	err = log.Init(ctx, conf.Log)
-	if err != nil {
-		log.Ctx(ctx).Fatal().Caller().Err(err).Send()
-		return
-	}
-	// log.Init()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 	ctx, _ = log.WithLogid(ctx, gid.New())
 
-	cmtls := conf.ClientConn.TLS
-	tlsConfig, err := config.LoadTLSConfig(filesystem.Static, cmtls.ClientCert, cmtls.ClientKey, cmtls.CACert)
+	conf := &Config{}
+	if err := config.UnmarshalFS("static/conf/default.yml", filesystem.Static, conf); err != nil {
+		log.Ctx(ctx).Error().Caller().Err(err).Send()
+		return
+	}
+	if err := log.Init(ctx, conf.Log); err != nil {
+		log.Ctx(ctx).Error().Caller().Err(err).Send()
+		return
+	}
+
+	tlsConf := conf.ClientConn.TLS
+	tlsConfig, err := config.LoadTLSConfig(filesystem.Static, tlsConf.ClientCert, tlsConf.ClientKey, tlsConf.CACert)
 	if err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
 	tlsConfig.ServerName = conf.ClientConn.Host
 
-	cli := &proxy.SocksCli{
-		Name:         flags.Client,
-		SocksAddr:    flags.Socks,
-		ChPeer:       make(chan *proxy.Peer, 1),
-		ChPeerReuser: make(chan *proxy.Peer, 8),
-
-		TlsConf:  tlsConfig,
-		PeerAddr: conf.ClientConn.Addr,
-	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cli := &proxy.SocksCli{ChPeer: make(chan *proxy.Peer, 1)}
 	var _ pb.SocksCliServer = cli
-	for range 1 {
-		go cli.RunConnLoop(ctx, cancel, conf.ClientConn.Addr, tlsConfig)
-	}
+	go cli.RunConnLoop(ctx, cancel, conf.ClientConn.Addr, tlsConfig)
 
-	//
-
-	for _, proxy := range conf.TCPProxy {
+	for _, mapping := range conf.TCPProxy {
 		go func() {
-			err := cli.RunTCP(ctx, proxy.From, proxy.To)
-			if err != nil {
-				log.Ctx(ctx).Error().Caller().Err(err).Msg("cli.RunTCP")
+			if err := cli.RunTCP(ctx, mapping.From, mapping.To); err != nil {
+				log.Ctx(ctx).Error().Caller().Err(err).Msg("TCP proxy stopped")
 				cancel()
 			}
 		}()
 	}
-
-	log.Ctx(ctx).Info().Caller().Str("cli.RunTCP", "60935").Send()
-
-	//
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case <-sigCh:
-	case <-ctx.Done():
-	}
+	<-ctx.Done()
 }

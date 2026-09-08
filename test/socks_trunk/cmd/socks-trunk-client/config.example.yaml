@@ -1,0 +1,27 @@
+debug: true
+token: "replace-with-a-long-random-token"
+trunk:
+  min-conns: 4
+  max-conns: 32
+  reconnect-sec: 3
+  health-check-sec: 10
+socks: "127.0.0.1:10080"
+http: "127.0.0.1:18083"
+client-conn:
+  addr: "127.0.0.1:18086"
+  host: "speedtest.cn"
+  enable-tls: true
+  read-concurrency: 1
+  write-concurrency: 1
+  tls:
+    ca-cert: "static/ca/root-cert.pem"
+    client-cert: "static/ca/client-cert.pem"
+    client-key: "static/ca/client-key.pem"
+log:
+  log-level: info
+  to-console: true
+  filename: ""
+  max-size: 20
+  max-backups: 10
+  max-age: 30
+  compress: true
