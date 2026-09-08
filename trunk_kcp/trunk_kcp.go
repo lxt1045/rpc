@@ -73,10 +73,17 @@ func NewTrunkKCP(conv uint32, rws ...io.ReadWriteCloser) *TrunkKCP {
 
 // Run 启动 TrunkKCP 的所有协程
 func (t *TrunkKCP) Run(ctx context.Context) error {
+	defer t.Close()
+	if len(t.rws) == 0 {
+		return errors.New("no physical connections")
+	}
+	stop := context.AfterFunc(ctx, func() { t.Close() })
+	defer stop()
 	var g errgroup.Group
 
 	// 启动 KCP 更新协程
 	g.Go(func() error {
+		defer t.Close()
 		return t.kcpUpdateLoop(ctx)
 	})
 
@@ -84,6 +91,7 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 	for i := range t.rws {
 		idx := i
 		g.Go(func() error {
+			defer t.Close()
 			return t.sendLoop(ctx, idx)
 		})
 	}
@@ -92,12 +100,14 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 	for i := range t.rws {
 		idx := i
 		g.Go(func() error {
+			defer t.Close()
 			return t.recvLoop(ctx, idx)
 		})
 	}
 
 	// 启动 KCP 输入处理协程
 	g.Go(func() error {
+		defer t.Close()
 		return t.kcpInputLoop(ctx)
 	})
 
@@ -106,7 +116,7 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 
 // sendLoop 从 sendChan 读取 KCP 输出的数据包，轮询发送到物理连接
 func (t *TrunkKCP) sendLoop(ctx context.Context, idx int) error {
-	log.Ctx(ctx).Error().Msgf("sendLoop conn %d", idx)
+	log.Ctx(ctx).Info().Msgf("sendLoop conn %d", idx)
 	rw := t.rws[idx]
 	for {
 		select {
@@ -115,7 +125,10 @@ func (t *TrunkKCP) sendLoop(ctx context.Context, idx int) error {
 		case <-t.done:
 			return nil
 		case packet := <-t.sendChan:
-			_, err := rw.Write(packet)
+			n, err := rw.Write(packet)
+			if err == nil && n != len(packet) {
+				err = io.ErrShortWrite
+			}
 			if err != nil {
 				log.Ctx(ctx).Error().Err(err).
 					Msgf("sendLoop conn %d write error", idx)
@@ -139,13 +152,7 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 		default:
 		}
 
-		n, err := rw.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
+		n, readErr := rw.Read(buf)
 
 		pending = append(pending, buf[:n]...)
 		for {
@@ -153,7 +160,11 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 				break
 			}
 
-			packetLen := kcpHeaderSize + int(binary.LittleEndian.Uint32(pending[20:24]))
+			payloadLen := binary.LittleEndian.Uint32(pending[20:24])
+			if payloadLen > 1400-kcpHeaderSize {
+				return errors.Errorf("invalid KCP segment length: %d", payloadLen)
+			}
+			packetLen := kcpHeaderSize + int(payloadLen)
 			if len(pending) < packetLen {
 				break
 			}
@@ -165,6 +176,9 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 			case <-t.done:
 				return nil
 			}
+		}
+		if readErr != nil {
+			return readErr
 		}
 	}
 }
@@ -200,7 +214,7 @@ func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 				if len(pending) < HeaderSize {
 					break
 				}
-				if pending[4]&0x80 != 0 && len(pending) < CmdHeaderSize {
+				if binary.LittleEndian.Uint16(pending[4:6])&0x8000 != 0 && len(pending) < CmdHeaderSize {
 					break
 				}
 
@@ -230,8 +244,8 @@ func (t *TrunkKCP) demuxData(header Header, data []byte) {
 		// 普通数据
 		select {
 		case conn.readChan <- data:
-		default:
-			// 通道满，丢弃
+		case <-conn.readDone:
+		case <-t.done:
 		}
 	} else {
 		// 命令处理
@@ -251,12 +265,8 @@ func (t *TrunkKCP) kcpUpdateLoop(ctx context.Context) error {
 		case <-t.done:
 			return nil
 		case <-ticker.C:
-			now := uint32(time.Now().UnixMilli())
-
 			t.kcpLock.Lock()
-			if t.kcp.Check() <= now {
-				t.kcp.Update()
-			}
+			t.kcp.Update()
 			t.kcpLock.Unlock()
 		}
 	}
@@ -264,6 +274,9 @@ func (t *TrunkKCP) kcpUpdateLoop(ctx context.Context) error {
 
 // GetConn 获取或创建虚拟连接
 func (t *TrunkKCP) GetConn(connID uint16) *VirtualConn {
+	if connID > math.MaxInt16 || t.closed.Load() {
+		return nil
+	}
 	t.connLock.RLock()
 	if int(connID) < len(t.conns) && t.conns[connID] != nil {
 		conn := t.conns[connID]
@@ -274,10 +287,13 @@ func (t *TrunkKCP) GetConn(connID uint16) *VirtualConn {
 
 	t.connLock.Lock()
 	defer t.connLock.Unlock()
+	if t.closed.Load() {
+		return nil
+	}
 
 	// 扩展切片
 	if int(connID) >= len(t.conns) {
-		newConns := make([]*VirtualConn, connID+1)
+		newConns := make([]*VirtualConn, int(connID)+1)
 		copy(newConns, t.conns)
 		t.conns = newConns
 	}
@@ -287,6 +303,7 @@ func (t *TrunkKCP) GetConn(connID uint16) *VirtualConn {
 			TrunkKCP: t,
 			connID:   connID,
 			readChan: make(chan []byte, 64),
+			readDone: make(chan struct{}),
 		}
 	}
 
@@ -299,17 +316,16 @@ func (t *TrunkKCP) Close() error {
 		return errors.New("already closed")
 	}
 
+	close(t.done)
+
 	// 关闭所有虚拟连接
 	t.connLock.Lock()
 	for _, conn := range t.conns {
 		if conn != nil {
-			conn.Close()
+			conn.closeLocal()
 		}
 	}
 	t.connLock.Unlock()
-
-	// 发送信号关闭所有协程
-	close(t.done)
 
 	// 关闭物理连接
 	for _, rw := range t.rws {

@@ -41,7 +41,8 @@ type Conn struct {
 
 	// reader
 	chReader chan []byte // 等待队列
-	rBuf     []byte      // 一次没读完的数据
+	readDone chan struct{}
+	rBuf     []byte // 一次没读完的数据
 	rl       sync.Mutex
 
 	// 发送数据时需要，只支持一个消息并发
@@ -76,27 +77,30 @@ func (p *Trunk) SetEventHandler(handler func(uint16, []byte) error) {
 }
 
 func (p *Conn) Close() (err error) {
+	if err = p.close(); err != nil {
+		return err
+	}
 	header := Header{
 		ConnID: p.connID,
 		Cmd:    CmdCloseConn,
 	}
 	_, err = p.write(header, nil)
-	if err != nil {
-		return
-	}
-	return p.close()
+	return err
 }
 
 func (p *Conn) close() (err error) {
 	if p.closed.CompareAndSwap(false, true) {
 		p.Trunk.RemoveConn(int(p.connID))
-		close(p.chReader) // 只执行一次
+		close(p.readDone)
 		return
 	}
 	return errors.New("has been closed")
 }
 
 func (p *Conn) Read(bs []byte) (n int, err error) {
+	if len(bs) == 0 {
+		return 0, nil
+	}
 	p.rl.Lock()
 	defer p.rl.Unlock()
 
@@ -110,11 +114,16 @@ func (p *Conn) Read(bs []byte) (n int, err error) {
 				return
 			}
 		}
-		var ok bool
-		p.rBuf, ok = <-p.chReader
-		if !ok {
-			err = errors.New("has been closed")
-			return
+		// Drain buffered data before reporting the ordered close.
+		select {
+		case p.rBuf = <-p.chReader:
+			continue
+		default:
+		}
+		select {
+		case p.rBuf = <-p.chReader:
+		case <-p.readDone:
+			return n, io.EOF
 		}
 	}
 }
@@ -138,6 +147,8 @@ func (p *Conn) SendEvent(data []byte) (err error) {
 
 	select {
 	case err = <-info.done:
+	case <-p.readDone:
+		err = io.ErrClosedPipe
 	case <-time.After(time.Second * 10):
 		err = errors.Errorf("time out, connID: %d", p.connID)
 	}
@@ -175,44 +186,46 @@ func (p *Conn) Write(bs []byte) (n int, err error) {
 }
 
 func (p *Conn) write(header Header, bs []byte) (n int, err error) {
-	if p.closed.Load() {
-		err = errors.New("has been closed")
-		return
-	}
 	p.Trunk.lRws.Lock()
 	defer p.Trunk.lRws.Unlock()
 
-	const MTU = 1460
-	m := 0
-	// for i := 0; i < len(bs); i += MTU {
-	idx := p.Trunk.wIdx % len(p.Trunk.rws)
-	p.Trunk.wIdx++
-
-	if header.Cmd > 0 {
-		header.Len = uint16(len(bs) + CmdHeaderSize)
-	} else {
-		header.Len = uint16(len(bs) + HeaderSize)
+	if p.Trunk.closed.Load() || (p.closed.Load() && header.Cmd != CmdCloseConn) {
+		return 0, io.ErrClosedPipe
 	}
-	header.Idx = p.idxPkg
-	p.idxPkg++
-
-	bsH := make([]byte, CmdHeaderSize)
-	bsH = header.Format(bsH)
-
-	_, err = p.Trunk.rws[idx].Write(bsH)
-	if err != nil {
-		return
+	if len(p.Trunk.rws) == 0 {
+		return 0, errors.New("no physical connections")
 	}
-	if len(bs) == 0 {
-		return
+	headerSize := HeaderSize
+	if header.Cmd != 0 {
+		headerSize = CmdHeaderSize
+		if len(bs) > math.MaxUint16-headerSize {
+			return 0, errors.New("event exceeds frame size")
+		}
 	}
-	m, err = p.Trunk.rws[idx].Write(bs)
-	if err != nil {
-		return
+	for {
+		chunkSize := min(len(bs)-n, math.MaxUint16-headerSize)
+		header.Len = uint16(chunkSize + headerSize)
+		header.Idx = p.idxPkg
+		p.idxPkg++
+		frame := make([]byte, headerSize+chunkSize)
+		header.Format(frame)
+		copy(frame[headerSize:], bs[n:n+chunkSize])
+		idx := p.Trunk.wIdx
+		p.Trunk.wIdx = (idx + 1) % len(p.Trunk.rws)
+		written, writeErr := p.Trunk.rws[idx].Write(frame)
+		if writeErr == nil && written != len(frame) {
+			writeErr = io.ErrShortWrite
+		}
+		if writeErr != nil {
+			// A partial frame cannot be retried without corrupting the stream.
+			p.Trunk.Close()
+			return n + max(0, written-headerSize), writeErr
+		}
+		n += chunkSize
+		if n == len(bs) {
+			return n, nil
+		}
 	}
-	n += m
-	// }
-	return
 }
 
 func NewTrunk(rws ...io.ReadWriteCloser) (t *Trunk) {
@@ -226,24 +239,25 @@ func NewTrunk(rws ...io.ReadWriteCloser) (t *Trunk) {
 
 func (t *Trunk) Close() (err error) {
 	if t.closed.CompareAndSwap(false, true) {
-		func() {
-			t.lPayloads.Lock()
-			defer t.lPayloads.Unlock()
-			for _, p := range t.payloads {
-				if p == nil {
-					continue
-				}
-				p.Close()
+		close(t.done)
+		t.lPayloads.Lock()
+		conns := append([]*Conn(nil), t.payloads...)
+		t.lPayloads.Unlock()
+		for _, p := range conns {
+			if p != nil {
+				p.close()
 			}
-		}()
-		close(t.done) // 只执行一次
+		}
+		for _, rw := range t.rws {
+			rw.Close()
+		}
 		return
 	}
 	return errors.New("has been closed")
 }
 
 func (t *Trunk) RemoveConn(connID int) {
-	if connID > math.MaxInt16 {
+	if connID < 0 || connID > math.MaxInt16 {
 		return
 	}
 	t.lPayloads.Lock()
@@ -255,7 +269,7 @@ func (t *Trunk) RemoveConn(connID int) {
 	t.payloads[connID] = nil
 }
 func (t *Trunk) GetConn(connID uint16) (conn *Conn) {
-	if connID > math.MaxInt16 {
+	if connID > math.MaxInt16 || t.closed.Load() {
 		return nil
 	}
 	conn = func(connID uint16) (conn *Conn) {
@@ -275,6 +289,9 @@ func (t *Trunk) GetConn(connID uint16) (conn *Conn) {
 		t.lPayloads.Lock()
 		defer t.lPayloads.Unlock()
 
+		if t.closed.Load() {
+			return nil
+		}
 		if int(connID) >= len(t.payloads) {
 			// t.payloads = append(t.payloads, make([]*Payload, connID+1-len(t.payloads))...)
 			t.payloads = slices.Grow(t.payloads, int(connID)+1-len(t.payloads))[:connID+1]
@@ -288,6 +305,7 @@ func (t *Trunk) GetConn(connID uint16) (conn *Conn) {
 			Trunk:    t,
 			connID:   uint16(connID),
 			chReader: make(chan []byte, 64),
+			readDone: make(chan struct{}),
 		}
 		t.payloads[connID] = conn
 		return
@@ -302,60 +320,39 @@ func (t *Trunk) GetReadWriter(connID uint16) io.ReadWriter {
 }
 
 func (t *Trunk) Run(ctx context.Context) {
-	var g errgroup.Group
+	defer t.Close()
+	stop := context.AfterFunc(ctx, func() { t.Close() })
+	defer stop()
+	var readers errgroup.Group
 	ch := make(chan Package, 64)
-
-	defer close(ch) // close ch SavePackLoop 才会退出
-	go func() {
-		var err error
-		defer func() {
-			if e := recover(); e != nil {
-				err = errors.Errorf("recove:%v", e)
-			}
-			if err != nil {
-				log.Ctx(ctx).Info().Caller().Err(err).Msg("SavePackLoop defer")
-			}
-			t.Close()
-		}()
-		err = t.SavePackLoop(ch)
-	}()
-
-	for i, rw := range t.rws {
-		func(idx int, rw io.ReadWriteCloser) {
-			g.Go(func() (err error) {
-				defer func() {
-					if e := recover(); e != nil {
-						err = errors.Errorf("recove:%v", e)
-					}
-				}()
-				log.Ctx(ctx).Trace().Caller().Msgf("[Trunk.Run] idx:%d", idx)
-
-				rbuf := make([]byte, 0, math.MaxUint16)
-				for {
-					if t.closed.Load() {
-						return
-					}
-					header, bsBody, err := ReadPack(rw, rbuf)
-					if err != nil {
-						if err == io.EOF || err == io.ErrUnexpectedEOF {
-							return err
-						}
-						return err
-					}
-
-					pkg := Package{
-						Header: header,
-						Body:   append(bsBody[:0:0], bsBody...),
-					}
-					ch <- pkg
+	for _, rw := range t.rws {
+		readers.Go(func() error {
+			defer t.Close()
+			buf := make([]byte, math.MaxUint16)
+			for {
+				header, body, err := ReadPack(rw, buf)
+				if err != nil {
+					return err
 				}
-			})
-		}(i, rw)
+				select {
+				case ch <- Package{Header: header, Body: append([]byte(nil), body...)}:
+				case <-t.done:
+					return nil
+				}
+			}
+		})
 	}
-	err := g.Wait()
-	if err != nil {
-		log.Ctx(ctx).Info().Caller().Err(err).Msg("ReadLoop defer")
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		readers.Wait()
+		close(ch)
+	}()
+	if err := t.SavePackLoop(ch); err != nil {
+		log.Ctx(ctx).Info().Err(err).Msg("SavePackLoop")
 	}
+	t.Close()
+	<-finished
 }
 
 func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
@@ -364,6 +361,8 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 	tsNextClean := time.Now().Unix() + 30*60
 	for {
 		select {
+		case <-t.done:
+			return nil
 		case <-ticker.C:
 			tsNow := time.Now().Unix()
 			if tsNow > tsNextClean {
@@ -392,19 +391,14 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 			}
 			conn.packages[i] = pkg
 
-			// 如果 payload.chReader 当前不可写入，则不尝试了
-			if cap(conn.chReader) == len(conn.chReader) {
-				continue
-			}
-
 			// 看一下可以有多少个body移动到 chReader
 			lNeedMove := 0
-			cmds := []Package{}
-			for _, pkg := range conn.packages {
+			for j, pkg := range conn.packages {
 				if pkg.Len == 0 {
 					break
 				}
 				lNeedMove++
+				conn.packages[j] = Package{}
 
 				// 最高位位类型, 0: ConnID(数据包), 1: 命令类型(命令数据包)
 				if pkg.Header.Cmd == 0 {
@@ -412,19 +406,19 @@ func (t *Trunk) SavePackLoop(ch chan Package) (err error) {
 					if conn.closed.Load() {
 						continue
 					}
-					conn.chReader <- pkg.Body
+					select {
+					case conn.chReader <- pkg.Body:
+					case <-conn.readDone:
+					}
 					pkg.Body = nil
 					continue
 				} else {
-					cmds = append(cmds, pkg)
+					conn.DoCmd(pkg)
 				}
 			}
 			if lNeedMove > 0 {
 				conn.packages = conn.packages[lNeedMove:]
 				conn.startIdx += uint16(lNeedMove)
-			}
-			for _, pkg := range cmds {
-				conn.DoCmd(pkg)
 			}
 
 		}

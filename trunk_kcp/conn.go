@@ -17,6 +17,7 @@ type VirtualConn struct {
 	// 读缓冲
 	readBuf  []byte
 	readChan chan []byte
+	readDone chan struct{}
 	readLock sync.Mutex
 
 	// 写缓冲
@@ -36,6 +37,9 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 
 	vc.writeLock.Lock()
 	defer vc.writeLock.Unlock()
+	if vc.closed.Load() || vc.TrunkKCP.closed.Load() {
+		return 0, io.ErrClosedPipe
+	}
 
 	// 由于 Header.Len 是 uint16，单次最大只能发送 65535 - HeaderSize 字节
 	// 对于大数据需要分块发送
@@ -62,6 +66,10 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 
 		// 发送到 KCP（需要加锁）
 		vc.TrunkKCP.kcpLock.Lock()
+		if vc.TrunkKCP.closed.Load() {
+			vc.TrunkKCP.kcpLock.Unlock()
+			return totalWritten, io.ErrClosedPipe
+		}
 		ret := vc.TrunkKCP.kcp.Send(buf)
 		vc.TrunkKCP.kcp.Update() // 立即更新触发发送，保持低延迟
 		vc.TrunkKCP.kcpLock.Unlock()
@@ -78,6 +86,9 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 
 // Read 从虚拟连接读取数据
 func (vc *VirtualConn) Read(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	vc.readLock.Lock()
 	defer vc.readLock.Unlock()
 
@@ -88,50 +99,54 @@ func (vc *VirtualConn) Read(p []byte) (n int, err error) {
 			return n, nil
 		}
 
-		data, ok := <-vc.readChan
-		if !ok {
+		// Drain data queued before the ordered remote close.
+		select {
+		case vc.readBuf = <-vc.readChan:
+			continue
+		default:
+		}
+		select {
+		case vc.readBuf = <-vc.readChan:
+		case <-vc.readDone:
 			return 0, io.EOF
 		}
-		vc.readBuf = data
 	}
 }
 
 // Close 关闭虚拟连接
 func (vc *VirtualConn) Close() error {
-	if !vc.closed.CompareAndSwap(false, true) {
+	if !vc.closeLocal() {
 		return errors.New("already closed")
 	}
-
-	// 发送关闭命令到对端
-	header := Header{
-		ConnID: vc.connID,
-		Cmd:    CmdCloseConn,
+	// Serialize the close frame after any in-flight Write.
+	vc.writeLock.Lock()
+	defer vc.writeLock.Unlock()
+	vc.kcpLock.Lock()
+	defer vc.kcpLock.Unlock()
+	if vc.TrunkKCP.closed.Load() {
+		return nil
 	}
-
+	header := Header{ConnID: vc.connID, Cmd: CmdCloseConn}
 	buf := make([]byte, CmdHeaderSize)
 	header.Format(buf)
-
-	vc.TrunkKCP.kcpLock.Lock()
-	vc.TrunkKCP.kcp.Send(buf)
-	vc.TrunkKCP.kcp.Update()
-	vc.TrunkKCP.kcpLock.Unlock()
-
-	// 不关闭本地的 readChan，等待对端的关闭命令
-	// 当对端收到我们的关闭命令并回复关闭命令时，handleCmd 会关闭本地的 readChan
+	if ret := vc.kcp.Send(buf); ret < 0 {
+		return errors.Errorf("kcp send failed: %d", ret)
+	}
+	vc.kcp.Update()
 	return nil
 }
 
-// handleCmd 处理命令
+func (vc *VirtualConn) closeLocal() bool {
+	if !vc.closed.CompareAndSwap(false, true) {
+		return false
+	}
+	close(vc.readDone)
+	return true
+}
+
 func (vc *VirtualConn) handleCmd(header Header, data []byte) {
 	switch header.Cmd {
 	case CmdCloseConn:
-		// 对端关闭连接
-		if vc.closed.CompareAndSwap(false, true) {
-			close(vc.readChan)
-		}
-	case CmdAddConn:
-		// 添加连接命令（保留用于扩展）
-	default:
-		// 未知命令，忽略
+		vc.closeLocal()
 	}
 }

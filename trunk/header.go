@@ -23,7 +23,7 @@ const (
 type Header struct {
 	Len    uint16 // 包大小
 	Idx    uint16 // 包的序号
-	ConnID uint16 // conn的序号; 最高位位类型, 0: ConnID(数据包), 1: 命令类型(命令数据包)
+	ConnID uint16 // conn的序号; 0x8000 位为命令标志，低 15 位为连接编号
 
 	// 拓展部分 ConnID 高位bit: 1 时才有
 	Cmd uint16
@@ -41,8 +41,8 @@ func ParseHeader(bs []byte) (h Header, l int) {
 	h.Idx = binary.LittleEndian.Uint16(bs[2:])
 	h.ConnID = binary.LittleEndian.Uint16(bs[4:])
 	l = HeaderSize
-	if h.ConnID&0x80 > 0 {
-		h.ConnID &= 0x7f
+	if h.ConnID&0x8000 != 0 {
+		h.ConnID &= 0x7fff
 		h.Cmd = binary.LittleEndian.Uint16(bs[6:])
 		l = CmdHeaderSize
 	}
@@ -54,45 +54,40 @@ func (h *Header) Format(bs []byte) (out []byte) {
 	binary.LittleEndian.PutUint16(bs[0:], h.Len)
 	binary.LittleEndian.PutUint16(bs[2:], h.Idx)
 	if h.Cmd > 0 {
-		binary.LittleEndian.PutUint16(bs[4:], h.ConnID|0x80)
+		binary.LittleEndian.PutUint16(bs[4:], h.ConnID|0x8000)
 		binary.LittleEndian.PutUint16(bs[6:], h.Cmd)
 		return bs[:CmdHeaderSize]
 	}
-	binary.LittleEndian.PutUint16(bs[4:], h.ConnID&0x7f)
+	binary.LittleEndian.PutUint16(bs[4:], h.ConnID&0x7fff)
 	return bs[:HeaderSize]
 }
 
 // ReadPack 读一个裸消息
 func ReadPack(r io.ReadCloser, buf []byte) (header Header, bsBody []byte, err error) {
-	n, err := io.ReadFull(r, buf[:2]) // 先读长度
-	if err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return
-		}
-		err = errors.Errorf("%d: %s", n, err.Error())
+	if cap(buf) < 2 {
+		buf = make([]byte, 2)
+	}
+	buf = buf[:2]
+	if _, err = io.ReadFull(r, buf); err != nil {
 		return
 	}
-	if n != 2 {
-		err = errors.Errorf("n != 2,%d", n)
+	length := int(ParseHeaderLen(buf))
+	if length < HeaderSize {
+		return header, nil, errors.Errorf("invalid packet length: %d", length)
+	}
+	if cap(buf) < length {
+		next := make([]byte, length)
+		copy(next, buf)
+		buf = next
+	} else {
+		buf = buf[:length]
+	}
+	if _, err = io.ReadFull(r, buf[2:]); err != nil {
 		return
 	}
-	lenNeed := ParseHeaderLen(buf[:2])
-	if cap(buf) < int(lenNeed) {
-		bufnew := make([]byte, lenNeed)
-		bufnew[0], bufnew[1] = buf[0], buf[1] // copy(bufnew, bsHeader[:2])
-		buf = bufnew
+	if binary.LittleEndian.Uint16(buf[4:])&0x8000 != 0 && length < CmdHeaderSize {
+		return header, nil, errors.Errorf("invalid command packet length: %d", length)
 	}
-	n, err = io.ReadFull(r, buf[2:lenNeed]) // 读取剩下的部分
-	if err != nil {
-		err = errors.Errorf(err.Error())
-		return
-	}
-	if n != int(lenNeed-2) {
-		err = errors.Errorf("n != 2,%d", n)
-		return
-	}
-
-	header, lHeader := ParseHeader(buf[:CmdHeaderSize])
-	bsBody = buf[lHeader:lenNeed]
-	return
+	header, headerLen := ParseHeader(buf)
+	return header, buf[headerLen:], nil
 }
