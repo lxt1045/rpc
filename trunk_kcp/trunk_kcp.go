@@ -214,7 +214,7 @@ func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 				if len(pending) < HeaderSize {
 					break
 				}
-				if binary.LittleEndian.Uint16(pending[4:6])&0x8000 != 0 && len(pending) < CmdHeaderSize {
+				if binary.LittleEndian.Uint16(pending[2:4])&0x8000 != 0 && len(pending) < CmdHeaderSize {
 					break
 				}
 

@@ -1,6 +1,7 @@
 package trunk_kcp
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -16,6 +17,23 @@ func TestReviewHeaderID(t *testing.T) {
 			if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
 				t.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
 			}
+		}
+	}
+}
+
+func TestReviewReadPack(t *testing.T) {
+	for _, tc := range []Header{
+		{Len: 3, ConnID: 129},
+		{Len: 3, ConnID: 32767, Cmd: CmdEventReq},
+	} {
+		header := tc.Format(make([]byte, CmdHeaderSize))
+		frame := append(append([]byte(nil), header...), []byte("abc")...)
+		got, body, err := ReadPack(io.NopCloser(bytes.NewReader(frame)), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc || string(body) != "abc" {
+			t.Fatalf("got header %+v and body %q, want header %+v and body abc", got, body, tc)
 		}
 	}
 }
