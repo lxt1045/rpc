@@ -7,7 +7,7 @@
 ## 当前执行进度（首轮）
 
 - [x] 清理运行日志、未使用 `peer_proxy.go`/`service/service.go`、补充 `.gitignore`/README。
-- [x] 外部 `-config` 配置加载、环境变量 token、服务端真实认证、`SessionManager` 会话隔离、ACL、基础 metrics/healthz。
+- [x] 配置已改回基于 embed `fs.FS` 编译进二进制；保留环境变量 token、认证、`SessionManager`、ACL、基础 metrics/healthz。
 - [x] SOCKS5 TCP 改走 Trunk；HTTP CONNECT 使用 Trunk 模式。
 - [x] 新增 `config_test.go` 与 `session_test.go`，`go test ./test/socks_trunk/...` 通过。
 - [x] 目录迁移：已在本目录内创建 `socks_trunk/`、`cmd/socks-trunk-client`、`cmd/socks-trunk-server`。
@@ -99,13 +99,9 @@ socks_trunk/                        # 或使用现有模块下更正式的名字
 └── *_test.go
 cmd/
 ├── socks-trunk-client/
-│   ├── main.go
-│   ├── config.example.yaml
-│   └── Dockerfile
+│   └── main.go
 └── socks-trunk-server/
-    ├── main.go
-    ├── config.example.yaml
-    └── Dockerfile
+    └── main.go
 deploy/socks-trunk/
 ├── Makefile
 ├── systemd/
@@ -139,7 +135,7 @@ deploy/socks-trunk/
 
 **目标：去掉“代码写死 + embed 私有文件”的 demo 方式。**
 
-- [ ] 定义生产配置结构（`Config`），支持 YAML 文件路径参数 `-config` 和基础环境变量覆盖：
+- [x] 定义生产配置结构（`Config`），配置使用 `filesystem.Static` 的 `config.UnmarshalFS` 在编译期嵌入，不再依赖独立 YAML 文件：
   ```yaml
   server:
     listen: ":18086"
@@ -189,7 +185,7 @@ deploy/socks-trunk/
   - 密钥文件权限 0600，容器内用 Secret 挂载。
 - [ ] README 增加“证书生成与部署”章节（README 已初步补充运行说明）。
 
-**退出条件**：同一份二进制通过 `-config` 在不同环境启动，未配置 token 直接报错退出。
+**退出条件**：修改嵌入的 `static/conf/default.yml` 后重新 `go build`，二进制自带配置；未配置 token 时非 debug 模式拒绝启动。
 
 ---
 

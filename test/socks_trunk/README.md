@@ -12,17 +12,17 @@ export SOCKS_TRUNK_TOKEN=dev-insecure-token
 
 # 服务端
 cd test/socks_trunk/service
-go run . -config static/conf/default.yml   # 或 config.example.yaml
+go run .
 
 # 客户端（另一个终端）
 cd test/socks_trunk/client
-go run . -config static/conf/default.yml   # 或 config.example.yaml
+go run .
 ```
 
 ## 当前已落地
 
 - 删除未使用的 `peer_proxy.go` 和 `service/service.go`
-- 外部配置加载（`-config`）与 token 校验
+- 配置重新改为基于 embed `fs.FS` 编译进二进制
 - 服务端 `Auth` 真实校验
 - 会话级 SessionManager，替代包级 `mTrunkConn`
 - SOCKS5 TCP 优先走 Trunk 数据面
@@ -53,4 +53,4 @@ make fmt vet test build
 test/socks_trunk/scripts/local_integration_test.sh
 ```
 
-CI 示例见仓库根目录 `.github/workflows/socks-trunk.yml`。
+CI 示例见仓库根目录 `.github/workflows/socks-trunk.yaml`。

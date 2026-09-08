@@ -14,11 +14,11 @@ go build ./test/socks_trunk/socks_trunk/... ./test/socks_trunk/cmd/...
 
 ## 本地运行
 
-先配置证书与 token（参考 `test/socks_trunk/plan.md` 或各 `config.example.yaml`）：
+先修改编译期嵌入的配置 `test/socks_trunk/socks_trunk/filesystem/static/conf/default.yml`，再重新构建；运行不需要独立 `-config` 文件。
 
 ```bash
-SOCKS_TRUNK_TOKEN=your-token go run ./test/socks_trunk/cmd/socks-trunk-server -config ./test/socks_trunk/cmd/socks-trunk-server/config.example.yaml
-SOCKS_TRUNK_TOKEN=your-token go run ./test/socks_trunk/cmd/socks-trunk-client -config ./test/socks_trunk/cmd/socks-trunk-client/config.example.yaml
+SOCKS_TRUNK_TOKEN=your-token go run ./test/socks_trunk/cmd/socks-trunk-server
+SOCKS_TRUNK_TOKEN=your-token go run ./test/socks_trunk/cmd/socks-trunk-client
 ```
 
 ## 测试

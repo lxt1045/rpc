@@ -1,8 +1,6 @@
 package socks
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -35,32 +33,6 @@ func TestValidateClientConfig(t *testing.T) {
 	}
 	if err := ValidateClientConfig(&ClientConfig{}); err == nil {
 		t.Fatalf("empty token should be rejected")
-	}
-}
-
-func TestLoadConfig(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.yaml")
-	content := `
-token: test-token
-trunk:
-  min_conns: 2
-  max_conns: 8
-metrics_addr: "127.0.0.1:6060"
-`
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	var conf struct {
-		Token       string      `mapstructure:"token"`
-		Trunk       TrunkConfig `mapstructure:"trunk"`
-		MetricsAddr string      `mapstructure:"metrics_addr"`
-	}
-	if err := LoadConfig(path, &conf); err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	if conf.Token != "test-token" || conf.Trunk.MinConns != 2 || conf.Trunk.MaxConns != 8 {
-		t.Fatalf("unexpected loaded config: %+v", conf)
 	}
 }
 

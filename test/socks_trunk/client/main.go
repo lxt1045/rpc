@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"flag"
 	"os"
 	"os/signal"
@@ -36,10 +35,8 @@ type Config struct {
 }
 
 func main() {
-	var configPath string
 	var socksAddr string
 	var httpAddr string
-	flag.StringVar(&configPath, "config", "static/conf/default.yml", "config file path")
 	flag.StringVar(&socksAddr, "socks", "", "SOCKS5 TCP listen address")
 	flag.StringVar(&httpAddr, "http", "", "HTTP CONNECT listen address")
 	flag.Parse()
@@ -48,8 +45,8 @@ func main() {
 	defer cancel()
 
 	conf := &Config{}
-	if err := loadClientConfig(configPath, conf); err != nil {
-		log.Ctx(ctx).Error().Caller().Err(err).Str("config", configPath).Send()
+	if err := config.UnmarshalFS("static/conf/default.yml", filesystem.Static, conf); err != nil {
+		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
 	if err := log.Init(ctx, conf.Log); err != nil {
@@ -68,7 +65,7 @@ func main() {
 	}
 
 	cmtls := conf.ClientConn.TLS
-	tlsConfig, err := loadClientTLS(cmtls.CACert, cmtls.ClientCert, cmtls.ClientKey)
+	tlsConfig, err := config.LoadTLSConfig(filesystem.Static, cmtls.ClientCert, cmtls.ClientKey, cmtls.CACert)
 	if err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
@@ -119,22 +116,4 @@ func main() {
 	<-sigCh
 	cancel()
 	cli.Close(ctx, &pb.CloseReq{})
-}
-
-// loadClientConfig supports both an external production config file and the
-// embedded demo config that was used by the original demo binaries.
-func loadClientConfig(path string, conf interface{}) error {
-	if path == "static/conf/default.yml" {
-		if err := config.UnmarshalFS(path, filesystem.Static, conf); err == nil {
-			return nil
-		}
-	}
-	return socks.LoadConfig(path, conf)
-}
-
-func loadClientTLS(caFile, certFile, keyFile string) (*tls.Config, error) {
-	if _, err := os.Stat(certFile); err == nil {
-		return socks.LoadTLSConfigFromFiles(caFile, certFile, keyFile)
-	}
-	return config.LoadTLSConfig(filesystem.Static, certFile, keyFile, caFile)
 }

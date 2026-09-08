@@ -1,15 +1,11 @@
 package socks
 
 import (
-	"crypto/tls"
 	"fmt"
 	"net"
 	"net/netip"
-	"os"
 	"strings"
 	"sync"
-
-	"github.com/lxt1045/utils/config"
 )
 
 var acl = struct {
@@ -65,7 +61,6 @@ func (c *TrunkConfig) defaults() {
 		c.HealthCheckSec = 10
 	}
 }
-
 func (c *ServerConfig) defaults() {
 	if c.MaxClients <= 0 {
 		c.MaxClients = 1024
@@ -76,19 +71,6 @@ func (c *ServerConfig) defaults() {
 	if c.DialTimeoutSec <= 0 {
 		c.DialTimeoutSec = 30
 	}
-}
-
-// LoadConfig reads and decodes a YAML file into the provided struct.
-// It keeps external production config outside the embedded demo FS.
-func LoadConfig(path string, conf interface{}) error {
-	if path == "" {
-		return fmt.Errorf("config path is empty")
-	}
-	bs, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read config %s: %w", path, err)
-	}
-	return config.Unmarshal(bs, conf)
 }
 
 // ValidateServerConfig applies defaults and checks required security fields.
@@ -137,14 +119,12 @@ func CheckACL(hostport string) bool {
 	}
 	host = strings.Trim(host, "[]")
 	host = strings.ToLower(host)
-
 	acl.RLock()
 	defer acl.RUnlock()
 	cfg := acl.cfg
 	if !cfg.Enabled {
 		return true
 	}
-
 	// Explicit deny host/domain suffix check.
 	for _, deny := range cfg.DenyHosts {
 		d := strings.TrimSuffix(strings.ToLower(deny), ".")
@@ -153,7 +133,6 @@ func CheckACL(hostport string) bool {
 			return false
 		}
 	}
-
 	// If an IP/CIDR allow list exists, an IP target must be inside it.
 	addr, perr := netip.ParseAddr(host)
 	if perr == nil {
@@ -167,29 +146,7 @@ func CheckACL(hostport string) bool {
 		}
 		return true
 	}
-
 	// Domain targets are allowed unless denied above. For stricter control,
 	// add domain allow lists in a future iteration.
 	return len(cfg.AllowNetworks) == 0
-}
-
-// LoadTLSConfigFromFiles reads PEM files from the real filesystem.
-// Production deployments should keep certs/keys outside the embedded FS.
-func LoadTLSConfigFromFiles(caFile, certFile, keyFile string) (c *tls.Config, err error) {
-	var caPEM, certPEM, keyPEM []byte
-	if caFile != "" {
-		caPEM, err = os.ReadFile(caFile)
-		if err != nil {
-			return nil, fmt.Errorf("read ca %s: %w", caFile, err)
-		}
-	}
-	certPEM, err = os.ReadFile(certFile)
-	if err != nil {
-		return nil, fmt.Errorf("read cert %s: %w", certFile, err)
-	}
-	keyPEM, err = os.ReadFile(keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("read key %s: %w", keyFile, err)
-	}
-	return config.BytesToTLSConfig(certPEM, keyPEM, caPEM)
 }

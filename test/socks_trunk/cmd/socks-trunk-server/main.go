@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"expvar"
-	"flag"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -41,17 +40,13 @@ type Config struct {
 }
 
 func main() {
-	var configPath string
-	flag.StringVar(&configPath, "config", "static/conf/default.yml", "config file path")
-	flag.Parse()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	conf := &Config{}
-	if err := loadServerConfig(configPath, conf); err != nil {
-		log.Ctx(ctx).Error().Caller().Err(err).Str("config", configPath).Send()
+	if err := config.UnmarshalFS("static/conf/default.yml", filesystem.Static, conf); err != nil {
+		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
 	if err := log.Init(ctx, conf.Log); err != nil {
@@ -81,7 +76,7 @@ func main() {
 		return
 	}
 
-	tlsConfig, err := loadServerTLS(conf.Conn.TLS.CACert, conf.Conn.TLS.ServerCert, conf.Conn.TLS.ServerKey)
+	tlsConfig, err := config.LoadTLSConfig(filesystem.Static, conf.Conn.TLS.ServerCert, conf.Conn.TLS.ServerKey, conf.Conn.TLS.CACert)
 	if err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
@@ -187,22 +182,4 @@ func main() {
 	if err := g.Wait(); err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 	}
-}
-
-// loadServerConfig supports both an external production config file and the
-// embedded demo config that was used by the original demo binaries.
-func loadServerConfig(path string, conf interface{}) error {
-	if path == "static/conf/default.yml" {
-		if err := config.UnmarshalFS(path, filesystem.Static, conf); err == nil {
-			return nil
-		}
-	}
-	return socks.LoadConfig(path, conf)
-}
-
-func loadServerTLS(caFile, certFile, keyFile string) (*tls.Config, error) {
-	if _, err := os.Stat(certFile); err == nil {
-		return socks.LoadTLSConfigFromFiles(caFile, certFile, keyFile)
-	}
-	return config.LoadTLSConfig(filesystem.Static, certFile, keyFile, caFile)
 }

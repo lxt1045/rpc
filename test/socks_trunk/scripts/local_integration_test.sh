@@ -10,6 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
 WORK="$(mktemp -d)"
+EMBED_CONF="$REPO_ROOT/test/socks_trunk/socks_trunk/filesystem/static/conf/default.yml"
 TOKEN="integration-test-token-$(date +%s)"
 SERVER_ADDR="127.0.0.1:18086"
 SOCKS_ADDR="127.0.0.1:11080"
@@ -24,15 +25,22 @@ cleanup() {
   [[ -n "$CLIENT_PID" ]] && kill "$CLIENT_PID" 2>/dev/null
   [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" 2>/dev/null
   [[ -n "$ECHO_PID" ]] && kill "$ECHO_PID" 2>/dev/null
+  if [[ -n "${EMBED_CONF_SAVED:-}" && -f "$WORK/default.yml.bak" ]]; then
+    cp "$WORK/default.yml.bak" "$EMBED_CONF"
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
-# Build binaries.
-(cd "$REPO_ROOT" && go build -o "$WORK/server" ./test/socks_trunk/cmd/socks-trunk-server)
-(cd "$REPO_ROOT" && go build -o "$WORK/client" ./test/socks_trunk/cmd/socks-trunk-client)
+# Save and replace embedded demo config so the binaries embed a local-test config.
+if [[ ! -f "$EMBED_CONF" ]]; then
+  echo "embedded config not found: $EMBED_CONF" >&2
+  exit 1
+fi
+cp "$EMBED_CONF" "$WORK/default.yml.bak"
+EMBED_CONF_SAVED=1
 
-cat > "$WORK/server.yaml" <<EOF
+cat > "$EMBED_CONF" <<EOF
 debug: true
 token: "$TOKEN"
 max-clients: 16
@@ -48,21 +56,6 @@ conn:
     ca-cert: "static/ca/root-cert.pem"
     server-cert: "static/ca/server-cert.pem"
     server-key: "static/ca/server-key.pem"
-log:
-  log-level: error
-  to-console: true
-EOF
-
-cat > "$WORK/client.yaml" <<EOF
-debug: true
-token: "$TOKEN"
-trunk:
-  min-conns: 2
-  max-conns: 4
-  reconnect-sec: 2
-  health-check-sec: 2
-socks: "$SOCKS_ADDR"
-http: ""
 client-conn:
   addr: "$SERVER_ADDR"
   host: "speedtest.cn"
@@ -73,10 +66,21 @@ client-conn:
     ca-cert: "static/ca/root-cert.pem"
     client-cert: "static/ca/client-cert.pem"
     client-key: "static/ca/client-key.pem"
+trunk:
+  min-conns: 2
+  max-conns: 4
+  reconnect-sec: 2
+  health-check-sec: 2
+socks: "$SOCKS_ADDR"
+http: ""
 log:
   log-level: error
   to-console: true
 EOF
+
+# Build binaries after the embedded config is in place.
+(cd "$REPO_ROOT" && go build -o "$WORK/server" ./test/socks_trunk/cmd/socks-trunk-server)
+(cd "$REPO_ROOT" && go build -o "$WORK/client" ./test/socks_trunk/cmd/socks-trunk-client)
 
 # HTTP echo server.
 python3 - "$ECHO_ADDR" <<'PY' &
@@ -98,8 +102,8 @@ PY
 ECHO_PID=$!
 
 # Start server and client.
-"$WORK/server" -config "$WORK/server.yaml" & SERVER_PID=$!
-"$WORK/client" -config "$WORK/client.yaml" & CLIENT_PID=$!
+"$WORK/server" & SERVER_PID=$!
+"$WORK/client" & CLIENT_PID=$!
 
 # Wait for health endpoint.
 for _ in $(seq 1 50); do
