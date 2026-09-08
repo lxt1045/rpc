@@ -155,4 +155,6 @@ service SocksSvc {
   
   rpc TrunkUpgrade(TrunkUpgradeReq) returns (TrunkUpgradeRsp) {}
   rpc TrunkStart(TrunkStartReq) returns (TrunkStartRsp) {}
+  // 优雅剔除一条已运行的底层物理连接
+  rpc TrunkRemoveConn(TrunkUpgradeReq) returns (TrunkUpgradeRsp) {}
 }

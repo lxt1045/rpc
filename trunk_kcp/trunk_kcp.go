@@ -17,9 +17,20 @@ import (
 
 // TrunkKCP 基于 KCP 协议的链路聚合
 // 将多个网络连接聚合成一个逻辑连接，通过 KCP 提供可靠传输保障
+type activeConn struct {
+	id   int
+	rw   io.ReadWriteCloser
+	stop chan struct{}
+}
+
 type TrunkKCP struct {
 	// 底层物理连接
 	rws []io.ReadWriteCloser
+
+	// 动态物理连接管理
+	connMu     sync.Mutex
+	nextConnID int
+	active     map[int]*activeConn
 
 	// KCP 实例（单实例处理双向通信）
 	kcp     *kcp.KCP
@@ -47,6 +58,7 @@ type TrunkKCP struct {
 func NewTrunkKCP(conv uint32, rws ...io.ReadWriteCloser) *TrunkKCP {
 	t := &TrunkKCP{
 		rws:      rws,
+		active:   make(map[int]*activeConn),
 		sendChan: make(chan []byte, 1024),
 		recvChan: make(chan []byte, 1024),
 		done:     make(chan struct{}),
@@ -79,88 +91,87 @@ func NewTrunkKCP(conv uint32, rws ...io.ReadWriteCloser) *TrunkKCP {
 	return t
 }
 
-// Run 启动 TrunkKCP 的所有协程
+// Run 启动 TrunkKCP 的更新协程和输入协程，并启动初始物理连接。
+// 单个物理连接断开不会关闭整个 TrunkKCP；可通过 RemoveConn 剔除，
+// 并通过 AddConn 加入新的物理连接。
 func (t *TrunkKCP) Run(ctx context.Context) error {
 	defer t.Close()
-	if len(t.rws) == 0 {
-		return errors.New("no physical connections")
-	}
 	stop := context.AfterFunc(ctx, func() { t.Close() })
 	defer stop()
-	var g errgroup.Group
 
-	// 启动 KCP 更新协程
+	var g errgroup.Group
 	g.Go(func() error {
 		defer t.Close()
 		return t.kcpUpdateLoop(ctx)
 	})
-
-	// 启动发送协程
-	for i := range t.rws {
-		idx := i
-		g.Go(func() error {
-			defer t.Close()
-			return t.sendLoop(ctx, idx)
-		})
-	}
-
-	// 启动接收协程（每个物理连接一个）
-	for i := range t.rws {
-		idx := i
-		g.Go(func() error {
-			defer t.Close()
-			return t.recvLoop(ctx, idx)
-		})
-	}
-
-	// 启动 KCP 输入处理协程
 	g.Go(func() error {
 		defer t.Close()
 		return t.kcpInputLoop(ctx)
 	})
 
-	return g.Wait()
+	for _, rw := range t.rws {
+		if _, err := t.AddConn(rw); err != nil {
+			return err
+		}
+	}
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if t.ConnCount() == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.done:
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
 
-// sendLoop 从 sendChan 读取 KCP 输出的数据包，轮询发送到物理连接
-func (t *TrunkKCP) sendLoop(ctx context.Context, idx int) error {
-	log.Ctx(ctx).Info().Msgf("sendLoop conn %d", idx)
-	rw := t.rws[idx]
+// sendLoop 从 sendChan 读取 KCP 输出的数据包并写到指定物理连接。
+func (t *TrunkKCP) sendLoop(ctx context.Context, ac *activeConn) {
+	log.Ctx(ctx).Info().Msgf("sendLoop conn %d", ac.id)
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return
 		case <-t.done:
-			return nil
+			return
+		case <-ac.stop:
+			return
 		case packet := <-t.sendChan:
-			n, err := rw.Write(packet)
+			n, err := ac.rw.Write(packet)
 			if err == nil && n != len(packet) {
 				err = io.ErrShortWrite
 			}
 			if err != nil {
-				log.Ctx(ctx).Error().Err(err).
-					Msgf("sendLoop conn %d write error", idx)
-				return err
+				log.Ctx(ctx).Warn().Err(err).Msgf("sendLoop conn %d write error, remove", ac.id)
+				t.RemoveConn(ac.id)
+				return
 			}
 		}
 	}
 }
 
-// recvLoop 从物理连接读取数据包，发送到 recvChan
-func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
+// recvLoop 从物理连接读取 KCP 数据包并交给 KCP 输入协程。
+func (t *TrunkKCP) recvLoop(ctx context.Context, ac *activeConn) {
 	buf := make([]byte, math.MaxUint16)
 	pending := make([]byte, 0, math.MaxUint16)
-	rw := t.rws[connIdx]
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return
 		case <-t.done:
-			return nil
+			return
+		case <-ac.stop:
+			return
 		default:
 		}
 
-		n, readErr := rw.Read(buf)
+		n, readErr := ac.rw.Read(buf)
 
 		pending = append(pending, buf[:n]...)
 		for {
@@ -170,7 +181,9 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 
 			payloadLen := binary.LittleEndian.Uint32(pending[20:24])
 			if payloadLen > 1400-kcpHeaderSize {
-				return errors.Errorf("invalid KCP segment length: %d", payloadLen)
+				log.Ctx(ctx).Warn().Msgf("recvLoop conn %d invalid KCP segment length: %d", ac.id, payloadLen)
+				t.RemoveConn(ac.id)
+				return
 			}
 			packetLen := kcpHeaderSize + int(payloadLen)
 			if len(pending) < packetLen {
@@ -182,11 +195,15 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, connIdx int) error {
 			select {
 			case t.recvChan <- packet:
 			case <-t.done:
-				return nil
+				return
+			case <-ac.stop:
+				return
 			}
 		}
 		if readErr != nil {
-			return readErr
+			log.Ctx(ctx).Warn().Err(readErr).Msgf("recvLoop conn %d read error, remove", ac.id)
+			t.RemoveConn(ac.id)
+			return
 		}
 	}
 }
@@ -318,6 +335,65 @@ func (t *TrunkKCP) GetConn(connID uint16) *VirtualConn {
 	return t.conns[connID]
 }
 
+// AddConn 动态加入一条物理连接。返回该连接在本 TrunkKCP 中的 ID。
+func (t *TrunkKCP) AddConn(rw io.ReadWriteCloser) (int, error) {
+	if rw == nil {
+		return -1, errors.New("nil conn")
+	}
+	t.connMu.Lock()
+	if t.closed.Load() {
+		t.connMu.Unlock()
+		return -1, errors.New("trunk closed")
+	}
+	id := t.nextConnID
+	t.nextConnID++
+	ac := &activeConn{id: id, rw: rw, stop: make(chan struct{})}
+	t.active[id] = ac
+	ctx := context.Background()
+	t.connMu.Unlock()
+
+	go t.sendLoop(ctx, ac)
+	go t.recvLoop(ctx, ac)
+	return id, nil
+}
+
+// RemoveConn 剔除一条物理连接并关闭它。
+func (t *TrunkKCP) RemoveConn(id int) error {
+	t.connMu.Lock()
+	ac := t.active[id]
+	if ac != nil {
+		delete(t.active, id)
+		close(ac.stop)
+	}
+	t.connMu.Unlock()
+	if ac == nil {
+		return errors.New("conn not found")
+	}
+	_ = ac.rw.Close()
+	return nil
+}
+
+// CloseWriteConn 对指定物理连接执行半关闭（发送 FIN/close_notify）。
+func (t *TrunkKCP) CloseWriteConn(id int) error {
+	t.connMu.Lock()
+	ac := t.active[id]
+	t.connMu.Unlock()
+	if ac == nil {
+		return errors.New("conn not found")
+	}
+	if cw, ok := ac.rw.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// ConnCount 返回当前活跃的物理连接数。
+func (t *TrunkKCP) ConnCount() int {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	return len(t.active)
+}
+
 // Close 关闭 TrunkKCP
 func (t *TrunkKCP) Close() error {
 	if !t.closed.CompareAndSwap(false, true) {
@@ -325,6 +401,14 @@ func (t *TrunkKCP) Close() error {
 	}
 
 	close(t.done)
+
+	t.connMu.Lock()
+	for _, ac := range t.active {
+		close(ac.stop)
+		_ = ac.rw.Close()
+	}
+	t.active = make(map[int]*activeConn)
+	t.connMu.Unlock()
 
 	// 关闭所有虚拟连接
 	t.connLock.Lock()
@@ -335,9 +419,8 @@ func (t *TrunkKCP) Close() error {
 	}
 	t.connLock.Unlock()
 
-	// 关闭物理连接
 	for _, rw := range t.rws {
-		rw.Close()
+		_ = rw.Close()
 	}
 
 	return nil

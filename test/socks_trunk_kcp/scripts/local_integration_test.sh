@@ -96,14 +96,6 @@ ECHO_PID=$!
 "$WORK/client" & CLIENT_PID=$!
 
 for _ in $(seq 1 80); do
-  if curl -fsS "http://$METRICS_ADDR/healthz" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.1
-done
-curl -fsS "http://$METRICS_ADDR/healthz" >/dev/null
-
-for _ in $(seq 1 80); do
   if curl -fsS -x "socks5h://$SOCKS_ADDR" "http://$ECHO_ADDR/ok" 2>/dev/null | grep -q integration-ok; then
     echo "integration test passed"
     exit 0

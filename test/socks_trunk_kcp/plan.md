@@ -117,6 +117,9 @@ message OpenReq {
 - [x] 控制面使用 RPC/Proto 完成认证与 Trunk 协商
 - [x] client 到 server 建立 `TrunkKCP`（多条底层连接，KCP conv 两端一致）
 - [x] server 接受底层连接并建立对应 `TrunkKCP`
+- [x] 底层连接断开后自动剔除（trunk_kcp.RemoveConn/对端同步剔除）
+- [x] 底层连接不足时自动补一条（TrunkUpgrade + trunk_kcp.AddConn）
+- [x] 新增 RPC/Proto 方法 `TrunkRemoveConn`
 - [x] 使用 `VirtualConn` + Proto 消息传输“目标地址 + 数据”
 - [x] server 外连目标 TCP
 - [x] 双向 `Copy` 与关闭传播
@@ -195,13 +198,13 @@ message OpenReq {
 
 ## 7. 验收标准
 
-- [ ] client 能通过 SOCKS5 TCP 访问 server 能访问的地址
-- [ ] 多个并发用户连接互不干扰
-- [ ] 未带正确 token 的请求被 server 拒绝
-- [ ] 任一用户连接断开，不泄漏 goroutine
-- [ ] server/client 都能优雅退出
-- [ ] 配置通过 embed fs.FS 编译进二进制
-- [ ] 代码中不存在验证性分支/重复数据通道
+- [x] client 能通过 SOCKS5 TCP 访问 server 能访问的地址（集成脚本通过）
+- [ ] 多个并发用户连接互不干扰（代码已按 VirtualConn 并发设计，尚未完成并发压测）
+- [x] 未带正确 token 的请求被 server 拒绝（auth_test 覆盖）
+- [ ] 任一用户连接断开，不泄漏 goroutine（尚未做泄漏压测）
+- [x] server/client 都能优雅退出（代码已实现；集成脚本会触发退出）
+- [x] 配置通过 embed fs.FS 编译进二进制
+- [ ] 代码中不存在验证性分支/重复数据通道（基本清理，仍保留未使用的 Conn/ConnUpgrade stub）
 
 ---
 

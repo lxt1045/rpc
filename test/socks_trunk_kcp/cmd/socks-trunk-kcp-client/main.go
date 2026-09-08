@@ -100,6 +100,7 @@ func main() {
 			}
 			break
 		}
+		go cli.MaintainTrunk(ctx)
 		if socksAddr != "" {
 			go func() {
 				if err := cli.RunSocks(ctx, socksAddr); err != nil && err != context.Canceled {

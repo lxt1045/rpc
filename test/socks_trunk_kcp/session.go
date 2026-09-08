@@ -163,12 +163,40 @@ func (p *SocksSvc) TrunkUpgrade(ctx context.Context, req *pb.TrunkUpgradeReq) (*
 	}
 	sess.mu.Lock()
 	if sess.trunk != nil {
+		trunk := sess.trunk
 		sess.mu.Unlock()
-		upgrade.Close()
-		return nil, fmt.Errorf("trunk already started")
+		if _, err := trunk.AddConn(upgrade); err != nil {
+			upgrade.Close()
+			return nil, err
+		}
+		return &pb.TrunkUpgradeRsp{}, nil
 	}
 	sess.conns = append(sess.conns, sessionConn{rw: upgrade})
 	sess.mu.Unlock()
+	return &pb.TrunkUpgradeRsp{}, nil
+}
+
+// TrunkRemoveConn 由对端发起，优雅剔除一条底层物理连接。
+func (p *SocksSvc) TrunkRemoveConn(ctx context.Context, req *pb.TrunkUpgradeReq) (*pb.TrunkUpgradeRsp, error) {
+	if req == nil {
+		return nil, fmt.Errorf("nil request")
+	}
+	if !p.isAuthorized() {
+		return nil, fmt.Errorf("not authenticated")
+	}
+	sess, err := p.session()
+	if err != nil {
+		return nil, err
+	}
+	sess.mu.Lock()
+	trunk := sess.trunk
+	sess.mu.Unlock()
+	if trunk == nil {
+		return &pb.TrunkUpgradeRsp{}, nil
+	}
+	id := int(req.UpgradeId)
+	_ = trunk.CloseWriteConn(id)
+	_ = trunk.RemoveConn(id)
 	return &pb.TrunkUpgradeRsp{}, nil
 }
 

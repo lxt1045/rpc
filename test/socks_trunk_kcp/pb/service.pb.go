@@ -1768,6 +1768,7 @@ type SocksSvcClient interface {
 	ConnUpgrade(ctx context.Context, in *ConnUpgradeReq, opts ...grpc.CallOption) (*ConnUpgradeRsp, error)
 	TrunkUpgrade(ctx context.Context, in *TrunkUpgradeReq, opts ...grpc.CallOption) (*TrunkUpgradeRsp, error)
 	TrunkStart(ctx context.Context, in *TrunkStartReq, opts ...grpc.CallOption) (*TrunkStartRsp, error)
+	TrunkRemoveConn(ctx context.Context, in *TrunkUpgradeReq, opts ...grpc.CallOption) (*TrunkUpgradeRsp, error)
 }
 
 type socksSvcClient struct {
@@ -1832,6 +1833,15 @@ func (c *socksSvcClient) TrunkStart(ctx context.Context, in *TrunkStartReq, opts
 	return out, nil
 }
 
+func (c *socksSvcClient) TrunkRemoveConn(ctx context.Context, in *TrunkUpgradeReq, opts ...grpc.CallOption) (*TrunkUpgradeRsp, error) {
+	out := new(TrunkUpgradeRsp)
+	err := c.cc.Invoke(ctx, "/pb.SocksSvc/TrunkRemoveConn", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SocksSvcServer is the server API for SocksSvc service.
 type SocksSvcServer interface {
 	Close(context.Context, *CloseReq) (*CloseRsp, error)
@@ -1840,6 +1850,7 @@ type SocksSvcServer interface {
 	ConnUpgrade(context.Context, *ConnUpgradeReq) (*ConnUpgradeRsp, error)
 	TrunkUpgrade(context.Context, *TrunkUpgradeReq) (*TrunkUpgradeRsp, error)
 	TrunkStart(context.Context, *TrunkStartReq) (*TrunkStartRsp, error)
+	TrunkRemoveConn(context.Context, *TrunkUpgradeReq) (*TrunkUpgradeRsp, error)
 }
 
 // UnimplementedSocksSvcServer can be embedded to have forward compatible implementations.
@@ -1863,6 +1874,9 @@ func (*UnimplementedSocksSvcServer) TrunkUpgrade(ctx context.Context, req *Trunk
 }
 func (*UnimplementedSocksSvcServer) TrunkStart(ctx context.Context, req *TrunkStartReq) (*TrunkStartRsp, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method TrunkStart not implemented")
+}
+func (*UnimplementedSocksSvcServer) TrunkRemoveConn(ctx context.Context, req *TrunkUpgradeReq) (*TrunkUpgradeRsp, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TrunkRemoveConn not implemented")
 }
 
 func RegisterSocksSvcServer(s *grpc.Server, srv SocksSvcServer) {
@@ -1977,6 +1991,24 @@ func _SocksSvc_TrunkStart_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SocksSvc_TrunkRemoveConn_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TrunkUpgradeReq)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SocksSvcServer).TrunkRemoveConn(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/pb.SocksSvc/TrunkRemoveConn",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SocksSvcServer).TrunkRemoveConn(ctx, req.(*TrunkUpgradeReq))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 var _SocksSvc_serviceDesc = grpc.ServiceDesc{
 	ServiceName: "pb.SocksSvc",
 	HandlerType: (*SocksSvcServer)(nil),
@@ -2004,6 +2036,10 @@ var _SocksSvc_serviceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "TrunkStart",
 			Handler:    _SocksSvc_TrunkStart_Handler,
+		},
+		{
+			MethodName: "TrunkRemoveConn",
+			Handler:    _SocksSvc_TrunkRemoveConn_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

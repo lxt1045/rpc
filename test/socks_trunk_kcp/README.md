@@ -20,9 +20,248 @@ go build ./test/socks_trunk_kcp/cmd/...
 ./socks-trunk-kcp-client
 ```
 
+## 动态底层连接
+
+- `trunk_kcp.RemoveConn(id)` / `TrunkRemoveConn` RPC：优雅剔除断开的底层连接
+- `trunk_kcp.AddConn(rw)` / `TrunkUpgrade` RPC：自动补充新的底层连接
+- client `MaintainTrunk` 会周期性检查底层连接数量并自动补足
+
 ## 测试
 
 ```bash
 go test -count=1 ./test/socks_trunk_kcp/... ./trunk_kcp
 test/socks_trunk_kcp/scripts/local_integration_test.sh
 ```
+
+## 代码架构
+
+```text
+                     SOCKS5 / HTTP CONNECT 用户
+                                  │
+                                  ▼
+                        ┌─────────────────────┐
+                        │   cmd/client main    │
+                        └─────────────────────┘
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │       peer_client.go       │
+                    │ - RunSocks / RunHTTPProxy  │
+                    │ - InitTrunk / MaintainTrunk│
+                    └─────────────┬─────────────┘
+                                  │
+                     ┌────────────▼─────────────┐
+                     │   RPC 控制面（pb.SocksSvc） │
+                     │ Auth / TrunkUpgrade /     │
+                     │ TrunkStart / RemoveConn   │
+                     └────────────┬─────────────┘
+                                  │ 底层连接
+                     ┌────────────▼─────────────┐
+                     │      trunk_kcp.TrunkKCP   │
+                     │  多个 io.ReadWriteCloser  │
+                     │  KCP 可靠传输 / 聚合        │
+                     └────────────┬─────────────┘
+                                  │ VirtualConn
+                     ┌────────────▼─────────────┐
+                     │      peer/session 服务端  │
+                     │ 解析地址头 -> Dial 目标    │
+                     └────────────┬─────────────┘
+                                  ▼
+                           目标 TCP 服务
+```
+
+### 文件职责
+
+| 文件 | 职责 |
+|------|------|
+| `cmd/socks-trunk-kcp-client/main.go` | 客户端入口、启动连接、重试、优雅退出 |
+| `cmd/socks-trunk-kcp-server/main.go` | 服务端入口、TLS/RPC 监听、会话清理 |
+| `config.go` | 配置结构、默认值、ACL |
+| `protocol.go` | VirtualConn 首包协议：长度前缀 + protobuf 地址 |
+| `peer_client.go` | 客户端代理逻辑、Trunk 建立/补链 |
+| `session.go` | 服务端会话、认证、TrunkUpgrade/Start/Remove |
+| `copy.go` | 双向 Copy 与关闭传播 |
+| `pb/service.proto` | RPC/Proto 接口定义 |
+| `trunk_kcp` | 底层 KCP 链路聚合模块 |
+
+## 核心算法
+
+### 1. 建连流程
+
+1. client 启动 2 条控制 RPC 连接，每条先 `Auth`。
+2. client 建立 N 条底层连接，每条先 `Auth`，再调用 `TrunkUpgrade`。
+3. 服务端把 Upgrade 得到的原始连接收进当前 session。
+4. client 通过控制 RPC 调用 `TrunkStart`。
+5. 服务端确认 N 条连接已到齐后：
+   - 创建 `trunk_kcp.NewTrunkKCP(conv, rws...)`
+   - `go trunk.Run(ctx)`
+   - 为虚拟连接池启动读取协程
+6. client 也创建同一个 `conv` 的 `TrunkKCP` 并 `Run`。
+
+### 2. 代理数据流
+
+```text
+用户 TCP
+   │
+   ▼
+SOCKS5/HTTP CONNECT 解析得到 addr
+   │
+   ▼
+TrunkKCP.GetConn(virtualID)
+   │
+   ▼
+WriteOpenHeader: [4B len][protobuf addr/head]
+   │
+   ▼
+server serveVirtualConn:
+   ReadOpenHeader
+   → CheckACL(addr)
+   → net.Dial(addr)
+   → 若 head 非空先发给目标
+   → relay(vconn, remote)
+```
+
+### 3. 底层连接动态剔除与补充
+
+剔除：
+
+```text
+发起方检测到连接异常
+   │
+   ├─ trunk.CloseWriteConn(id)   // 发起方先关闭发送
+   ├─ RPC TrunkRemoveConn(id)    // 通知对端
+   │      └─ 对端 CloseWriteConn(id)
+   │      └─ 对端 RemoveConn(id)
+   └─ trunk.RemoveConn(id)       // 发起方最终移除
+```
+
+补充：
+
+```text
+client MaintainTrunk 周期检查
+   │
+   └─ ConnCount() < target
+        │
+        ├─ 建立新底层 RPC/Upgrade 连接
+        ├─ 服务端 TrunkUpgrade 动态 trunk.AddConn(rw)
+        └─ 客户端 trunk.AddConn(raw)
+```
+
+### 4. 并发模型
+
+- 每个用户连接独占一个 `VirtualConn`，互不共享读写锁。
+- `VirtualConn.Read` / `Write` 各自有锁，避免同连接并发读写竞态。
+- server 为每个虚拟连接启动一个阻塞读协程；连接关闭后协程退出。
+- 物理连接层每个 `activeConn` 有独立 send/recv loop；单条断开只影响该条。
+- 所有 RPC handler 与 listener 都带有 recover / 关闭保护。
+
+### 5. 优雅退出
+
+```text
+SIGTERM/SIGINT
+   │
+   ├─ cancel context
+   ├─ 关闭 listener
+   ├─ 关闭 TrunkKCP（虚拟连接、物理连接）
+   ├─ CloseAllSessions()
+   └─ errgroup.Wait()
+```
+
+## trunk_kcp 动态能力
+
+### 目标
+
+在 `TrunkKCP` 运行期间，底层物理连接可以：
+
+- 动态加入：`AddConn(rw)`
+- 动态剔除：`RemoveConn(id)`
+- 优雅半关闭：`CloseWriteConn(id)`
+- 查询当前数量：`ConnCount()`
+
+这样上层代理在 N 条底层连接中某一条断开时，不需要重启整个 Trunk。
+
+### 内部状态
+
+```text
+TrunkKCP
+├── kcp             // 全局唯一 KCP 实例，所有物理连接共享
+├── sendChan        // KCP output -> 物理连接发送协程
+├── recvChan        // 物理连接接收协程 -> KCP input
+├── active          // map[int]*activeConn
+│   └── activeConn  // 每条底层连接的运行时状态
+│       ├── id      // 在本 TrunkKCP 内的编号
+│       ├── rw      // 原始 RPC/Upgrade 连接
+│       └── stop    // 停止该连接 send/recv loop 的信号
+└── connMu          // 保护 active map
+```
+
+### 动态加入算法
+
+```text
+AddConn(rw)
+  ├─ 加锁检查 Trunk 未关闭
+  ├─ 分配新 id
+  ├─ 创建 activeConn
+  ├─ 写入 active map
+  ├─ 解锁
+  ├─ go sendLoop(ac)   // 从 sendChan 取数据并写 rw
+  └─ go recvLoop(ac)   // 从 rw 读数据并喂 recvChan
+```
+
+### 动态剔除算法
+
+```text
+RemoveConn(id)
+  ├─ 加锁
+  ├─ 从 active map 删除
+  ├─ close(ac.stop)     // 通知该连接的 send/recv loop 退出
+  ├─ 解锁
+  └─ ac.rw.Close()
+```
+
+### 优雅剔除流程
+
+```text
+发起方
+  │
+  ├─ trunk.CloseWriteConn(id)   // 先关闭本地发送方向
+  ├─ RPC TrunkRemoveConn(id)    // 通知对端
+  │    └─ 对端 trunk.CloseWriteConn(id)
+  │    └─ 对端 trunk.RemoveConn(id)
+  └─ trunk.RemoveConn(id)       // 最后本地剔除
+```
+
+### 断线自动剔除
+
+```text
+sendLoop / recvLoop
+  ├─ 读或写返回错误
+  ├─ 记录 warn 日志
+  └─ trunk.RemoveConn(id)
+```
+
+单条物理连接出错时，只会移除该 `activeConn`，不会关闭整个 `TrunkKCP`。
+
+### 自动补足
+
+```text
+client MaintainTrunk
+  │
+  └─ 每 1 秒检查
+      │
+      └─ ConnCount() < target
+          │
+          ├─ 新建 N 条 RPC/Upgrade 连接
+          ├─ 服务端 TrunkUpgrade 收到后 trunk.AddConn(rw)
+          └─ 客户端 trunk.AddConn(raw)
+```
+
+### 运行退出条件
+
+```text
+TrunkKCP.Run 在以下情况退出：
+  ├─ ctx 被取消
+  ├─ Trunk.Close() 被调用
+  └─ ConnCount() == 0   // 所有底层连接都丢失
+```
+
+只要还有至少 1 条活跃底层连接，`Run` 就会保持运行，并允许继续 AddConn / RemoveConn。

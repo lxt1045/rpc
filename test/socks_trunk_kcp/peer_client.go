@@ -149,6 +149,76 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 	return nil
 }
 
+// RemoveTrunkConn 优雅剔除一条底层物理连接：先本地 CloseWrite，
+// 再通知服务端也 CloseWrite/RemoveConn，最后本地 RemoveConn。
+func (p *SocksCli) RemoveTrunkConn(ctx context.Context, id int) error {
+	p.mu.Lock()
+	trunk := p.trunk
+	peer := p.trunkPeer
+	p.mu.Unlock()
+	if trunk == nil || peer == nil {
+		return errors.New("trunk or control peer not ready")
+	}
+	_ = trunk.CloseWriteConn(id)
+	_ = peer.Invoke(ctx, "TrunkRemoveConn", &pb.TrunkUpgradeReq{TrunkId: p.TrunkCfg.Conv, UpgradeId: uint32(id)}, &pb.TrunkUpgradeRsp{})
+	_ = trunk.RemoveConn(id)
+	return nil
+}
+
+// AddTrunkConn 向已运行的 trunk_kcp 动态加入一条新的底层连接。
+func (p *SocksCli) AddTrunkConn(ctx context.Context, n int) error {
+	p.mu.Lock()
+	trunk := p.trunk
+	p.mu.Unlock()
+	if trunk == nil {
+		return errors.New("trunk not ready")
+	}
+	conns, err := p.TrunkConn(ctx, p.TrunkCfg.Conv, n)
+	if err != nil {
+		return err
+	}
+	for _, c := range conns {
+		if _, err := trunk.AddConn(c); err != nil {
+			_ = c.Close()
+			return err
+		}
+	}
+	return nil
+}
+
+// MaintainTrunk 检查底层连接数量，低于目标时自动补充。
+func (p *SocksCli) MaintainTrunk(ctx context.Context) {
+	p.TrunkCfg.defaults()
+	target := p.TrunkCfg.MaxConns
+	if target <= 0 {
+		target = p.TrunkCfg.MinConns
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.mu.Lock()
+			trunk := p.trunk
+			p.mu.Unlock()
+			if trunk == nil {
+				continue
+			}
+			cur := trunk.ConnCount()
+			if cur >= target {
+				continue
+			}
+			add := target - cur
+			log.Ctx(ctx).Info().Int("current", cur).Int("target", target).Int("add", add).Msg("trunk conn missing, adding")
+			if err := p.AddTrunkConn(ctx, add); err != nil {
+				log.Ctx(ctx).Warn().Err(err).Msg("add trunk conn failed")
+			}
+		}
+	}
+}
+
 func (p *SocksCli) TrunkConn(ctx context.Context, conv uint32, n int) ([]io.ReadWriteCloser, error) {
 	g := errgroup.Group{}
 	var mu sync.Mutex
