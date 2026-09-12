@@ -3,10 +3,7 @@ package codec
 import (
 	"context"
 	stderr "errors"
-	"io"
-	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/lxt1045/errors"
 )
@@ -24,81 +21,39 @@ var (
 
 type Upgrade struct {
 	codec  *Codec
-	rwc    io.ReadWriteCloser
 	callSN uint32
 	callID uint16
 
-	ready     chan struct{}
-	readyOnce sync.Once
-	closeOnce sync.Once
-	closeErr  error
-	closed    uint32
+	closed uint32
 }
 
 func (s *Upgrade) Read(p []byte) (n int, err error) {
-	if s == nil || atomic.LoadUint32(&s.closed) != 0 || s.rwc == nil {
+	if s == nil || atomic.LoadUint32(&s.closed) != 0 {
 		return 0, ErrUpgradeClosed.Clone()
 	}
-	return s.rwc.Read(p)
+	return s.codec.Read(p)
 }
 
 func (s *Upgrade) Write(p []byte) (n int, err error) {
-	if s == nil || atomic.LoadUint32(&s.closed) != 0 || s.rwc == nil {
+	if s == nil || atomic.LoadUint32(&s.closed) != 0 {
 		return 0, ErrUpgradeClosed.Clone()
 	}
-	return writeFull(s.rwc, p)
+	return s.codec.writeFull(p)
 }
 
 func (s *Upgrade) Close() error {
 	if s == nil {
 		return nil
 	}
-	s.closeOnce.Do(func() {
-		atomic.StoreUint32(&s.closed, 1)
-		s.readyOnce.Do(func() { close(s.ready) })
-		if dl, ok := s.rwc.(interface{ SetDeadline(time.Time) error }); ok {
-			// Wake blocked tunnel reads and prevent TLS close_notify from
-			// waiting indefinitely on a peer that stopped reading.
-			_ = dl.SetDeadline(time.Now())
-		}
-		if s.codec != nil {
-			s.closeErr = s.codec.Close()
-		}
-	})
-	return s.closeErr
-}
-
-func (s *Upgrade) markReady() {
-	if s != nil {
-		s.readyOnce.Do(func() { close(s.ready) })
-	}
-}
-
-// WaitReady blocks until the upgrade response has been written. Raw tunnel
-// bytes must not be sent before that response, otherwise the peer's frame
-// decoder can interpret them as an RPC header.
-func (s *Upgrade) WaitReady(ctx context.Context) error {
-	if s == nil {
-		return ErrUpgradeClosed.Clone()
-	}
-	select {
-	case <-s.ready:
-		if atomic.LoadUint32(&s.closed) != 0 {
-			return ErrUpgradeClosed.Clone()
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	atomic.StoreUint32(&s.closed, 1)
+	return s.codec.Close()
 }
 
 func newUpgrade(c *Codec, callID uint16, callSN uint32) *Upgrade {
 	return &Upgrade{
 		codec:  c,
-		rwc:    c.currentRWC(),
 		callID: callID,
 		callSN: callSN,
-		ready:  make(chan struct{}),
 	}
 }
 
@@ -150,10 +105,8 @@ func (c *Codec) VerUpgradeResp(ctx context.Context, header Header, bsBody []byte
 		atomic.StoreUint32(&c.status, 2)
 	}
 	err = c.VerCallResp(ctx, header, bsBody)
-	if upgrade != nil {
-		if err == nil {
-			upgrade.markReady()
-		} else {
+	if err != nil {
+		if upgrade != nil {
 			_ = upgrade.Close()
 		}
 	}

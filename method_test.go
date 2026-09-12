@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"math/rand"
 	"testing"
 
 	"github.com/lxt1045/rpc/base"
@@ -53,4 +54,29 @@ func TestClientEm(t *testing.T) {
 		t.Fatal("!ok")
 	}
 	t.Logf("resp.Msg:\"%s\"", resp.Msg)
+}
+
+func TestPassword(t *testing.T) {
+	t.Logf("RandPwd:%s", RandPwd(8))
+	t.Logf("RandPwd:%s", RandPwd(16))
+}
+
+func RandPwd(l int) (salt string) {
+	const Bytes = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-=_+"
+	bs := make([]byte, 0, l)
+	for ; l > 0; l-- {
+		idx := rand.Int31n(int32(len(Bytes)))
+		bs = append(bs, Bytes[idx])
+	}
+	return string(bs)
+}
+
+func RandPwd2(l int) (salt string) {
+	const Bytes = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-=_+"
+	bs := make([]byte, 0, l)
+	for ; l > 0; l-- {
+		idx := rand.Int31n(int32(len(Bytes)))
+		bs = append(bs, Bytes[idx])
+	}
+	return string(bs)
 }

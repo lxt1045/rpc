@@ -51,13 +51,12 @@ type Method interface {
 type Codec struct {
 	cancel    context.CancelFunc
 	closeOnce sync.Once
-	closeErr  error
 	// chDone <-chan struct{}
 	ctx context.Context
 
-	rwcLock   sync.RWMutex
 	rwc       io.ReadWriteCloser
 	writeLock sync.Mutex
+	// readLock  sync.Mutex
 	tmpCallSN uint32
 
 	upgradeLock sync.Mutex
@@ -94,7 +93,18 @@ type post struct {
 	done  chan error
 }
 
-func writeFull(w io.Writer, p []byte) (int, error) {
+func (c *Codec) Read(p []byte) (n int, err error) {
+	// c.readLock.Lock()
+	// defer c.readLock.Unlock()
+	return c.rwc.Read(p)
+}
+func (c *Codec) writeFull(p []byte) (int, error) {
+	c.writeLock.Lock()
+	defer c.writeLock.Unlock()
+	w := c.rwc
+	if w == nil {
+		return 0, ErrHasBeenClosed.Clone()
+	}
 	total := 0
 	for total < len(p) {
 		n, err := w.Write(p[total:])
@@ -164,27 +174,6 @@ func NewCodec(ctx context.Context, rwc io.ReadWriteCloser, callers []Method, ctx
 	return
 }
 
-func (c *Codec) currentRWC() io.ReadWriteCloser {
-	if c == nil {
-		return nil
-	}
-	c.rwcLock.RLock()
-	rwc := c.rwc
-	c.rwcLock.RUnlock()
-	return rwc
-}
-
-func (c *Codec) takeRWC() io.ReadWriteCloser {
-	if c == nil {
-		return nil
-	}
-	c.rwcLock.Lock()
-	rwc := c.rwc
-	c.rwc = nil
-	c.rwcLock.Unlock()
-	return rwc
-}
-
 func (c *Codec) Close() (err error) {
 	if c == nil {
 		return
@@ -198,6 +187,7 @@ func (c *Codec) Close() (err error) {
 				t.Post()
 			})
 			c.delay.Close()
+			c.delay = nil
 		}
 
 		func() {
@@ -211,7 +201,11 @@ func (c *Codec) Close() (err error) {
 			}
 		}()
 
-		if rwc := c.currentRWC(); rwc != nil {
+		c.writeLock.Lock()
+		rwc := c.rwc
+		c.rwc = nil
+		c.writeLock.Unlock()
+		if rwc != nil {
 			if dl, ok := rwc.(interface{ SetWriteDeadline(time.Time) error }); ok {
 				// Closing must not wait forever behind a blocked writer. The
 				// connection is discarded after this best-effort close frame.
@@ -222,28 +216,27 @@ func (c *Codec) Close() (err error) {
 			_ = c.SendCloseMsg(c.ctx)
 		}
 
-		rwc := c.takeRWC()
 		if rwc != nil {
 			if tcpConn, ok := rwc.(*net.TCPConn); ok {
 				// 先发 FIN，再关闭整个连接释放底层 socket。仅 CloseWrite
 				// 会遗留读半边和文件描述符，长期运行会累积连接资源。
 				if closeErr := tcpConn.CloseWrite(); closeErr != nil {
-					c.closeErr = closeErr
+					err = closeErr
 				}
-				if closeErr := tcpConn.Close(); c.closeErr == nil && closeErr != nil {
-					c.closeErr = closeErr
+				if closeErr := tcpConn.Close(); err == nil && closeErr != nil {
+					err = closeErr
 				}
 				log.Ctx(context.TODO()).Info().Caller().Msg("Codec.Close(), CloseWrite then Close")
 			} else {
-				c.closeErr = rwc.Close()
+				err = rwc.Close()
 			}
 		}
 	})
-	return c.closeErr
+	return err
 }
 
 func (c *Codec) IsClosed() (yes bool) {
-	return c == nil || c.currentRWC() == nil
+	return c == nil || c.rwc == nil
 }
 
 func (rpc *Codec) Done() <-chan struct{} {
@@ -349,7 +342,7 @@ func (c *Codec) ReadLoop() {
 			if c.delay != nil {
 				c.delay.Close()
 			}
-		} else if c.currentRWC() != nil {
+		} else if c.rwc != nil {
 			c.Close()
 		}
 	}()
@@ -371,12 +364,7 @@ func (c *Codec) ReadLoop() {
 			err = ErrHasBeenClosed.Clonef("ReadLoop c.status: %d", c.status)
 			return
 		}
-		rwc := c.currentRWC()
-		if rwc == nil {
-			err = ErrHasBeenClosed.Clone()
-			return
-		}
-		header, bsBody, err = ReadPack(ctx, rwc, rbuf) // TODO: 设置读超时？？
+		header, bsBody, err = ReadPack(ctx, c.rwc, rbuf) // TODO: 设置读超时？？
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return
@@ -505,6 +493,10 @@ func (c *Codec) ReadLoop() {
 
 // ReadPack 读一个裸消息
 func ReadPack(ctx context.Context, r io.ReadCloser, buf []byte) (header Header, bsBody []byte, err error) {
+	if r == nil {
+		err = ErrHasBeenClosed.Clone()
+		return
+	}
 	n, err := io.ReadFull(r, buf[:2]) // 先读长度
 	if err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -553,18 +545,12 @@ func (c *Codec) SendCloseMsg(ctx context.Context) (err error) {
 		CallSN:       0,
 	}
 	h.Format(wbuf)
-	rwc := c.currentRWC()
-	if rwc == nil {
-		err = errors.Errorf("has been closed")
-		return
-	}
 	if atomic.LoadUint32(&c.status) != 0 {
 		err = ErrHasBeenClosed.Clonef("SendCloseMsg c.status: %d", c.status)
 		return
 	}
-	c.writeLock.Lock()
-	defer c.writeLock.Unlock()
-	_, err = writeFull(rwc, wbuf)
+
+	_, err = c.writeFull(wbuf)
 	if err != nil {
 		err = errors.New(err.Error())
 		return
@@ -572,8 +558,8 @@ func (c *Codec) SendCloseMsg(ctx context.Context) (err error) {
 	return
 }
 
-var ErrHasBeenClosed = errors.NewCode(0, 0x1111, "has been closed")
-var ErrHasBeenUpgraded = errors.NewCode(0, 0x1111, "has been upgraded")
+var ErrHasBeenClosed = errors.NewCode(-1, 0x1111, "has been closed")
+var ErrHasBeenUpgraded = errors.NewCode(-1, 0x1111, "has been upgraded")
 
 func (c *Codec) SendHeartbeatMsg(ctx context.Context) (err error) {
 	wbuf := make([]byte, HeaderSize)
@@ -587,14 +573,8 @@ func (c *Codec) SendHeartbeatMsg(ctx context.Context) (err error) {
 		CallSN:       0,
 	}
 	h.FormatRaw(wbuf)
-	rwc := c.currentRWC()
-	if rwc == nil {
-		err = ErrHasBeenClosed.Clone("SendHeartbeatMsg rwc is nil")
-		return
-	}
-	c.writeLock.Lock()
-	defer c.writeLock.Unlock()
-	_, err = writeFull(rwc, wbuf)
+
+	_, err = c.writeFull(wbuf)
 	if err != nil {
 		err = errors.New(err.Error())
 	}
@@ -703,8 +683,6 @@ func (c *Codec) SendMsg(ctx context.Context, ver, callID uint16, callSN uint32, 
 }
 
 func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint16, callSN uint32) (err error) {
-	c.writeLock.Lock()
-	defer c.writeLock.Unlock()
 	defer func() {
 		if e := recover(); e != nil {
 			err = errors.Errorf("%+v", e)
@@ -721,17 +699,14 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 			CallSN:       callSN,
 		}
 		h.FormatCall(wbuf)
-		rwc := c.currentRWC()
-		if rwc == nil {
-			err = ErrHasBeenClosed.Clone()
-			return
-		}
+
 		if status := atomic.LoadUint32(&c.status); status > 1 ||
 			(status == 1 && ver != VerUpgradeReq && ver != VerUpgradeResp) { // 升级过程中允许发送 UpgradeReq 和 UpgradeResp
 			err = ErrHasBeenUpgraded.Clonef("Send c.status: %d, callID: %d, ver:%d", c.status, callID, ver)
 			return
 		}
-		_, err = writeFull(rwc, wbuf)
+
+		_, err = c.writeFull(wbuf)
 		if err != nil {
 			err = errors.New(err.Error())
 		}
@@ -751,16 +726,12 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 			CallSN:       callSN,
 		}
 		h.FormatCall(wbuf0)
-		rwc := c.currentRWC()
-		if rwc == nil {
-			err = errors.Errorf("has been closed")
-			return
-		}
 		if atomic.LoadUint32(&c.status) != 0 {
 			err = ErrHasBeenClosed.Clonef("Send c.status: %d", c.status)
 			return
 		}
-		_, err = writeFull(rwc, wbuf0[:math.MaxUint16]) // 原子写，内部有锁
+
+		_, err = c.writeFull(wbuf0[:math.MaxUint16]) // 原子写，内部有锁
 		if err != nil {
 			err = errors.New(err.Error())
 		}
@@ -783,16 +754,12 @@ func (c *Codec) Send(ctx context.Context, wbuf []byte, ver, callID, ctxlen uint1
 		CallSN:       callSN,
 	}
 	h.FormatCall(wbuf0)
-	rwc := c.currentRWC()
-	if rwc == nil {
-		err = errors.Errorf("has been closed")
-		return
-	}
 	if atomic.LoadUint32(&c.status) != 0 {
 		err = ErrHasBeenClosed.Clonef("SendHeartbeatMsg c.status: %d", c.status)
 		return
 	}
-	_, err = writeFull(rwc, wbuf0)
+
+	_, err = c.writeFull(wbuf0)
 	if err != nil {
 		err = errors.New(err.Error())
 	}
