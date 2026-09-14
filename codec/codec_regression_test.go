@@ -21,11 +21,18 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	}
 	return w.Buffer.Write(p)
 }
+func (w *limitedWriter) Read(p []byte) (n int, err error) {
+	return
+}
+func (w *limitedWriter) Close() error {
+	return nil
+}
 
 func TestWriteFullHandlesShortWrites(t *testing.T) {
 	w := &limitedWriter{limit: 3}
 	payload := []byte("complete frame")
-	n, err := writeFull(w, payload)
+	c := Codec{rwc: w}
+	n, err := c.writeFull(payload)
 	if err != nil {
 		t.Fatalf("writeFull returned error: %v", err)
 	}
@@ -35,13 +42,21 @@ func TestWriteFullHandlesShortWrites(t *testing.T) {
 }
 
 func TestWriteFullRejectsZeroProgress(t *testing.T) {
-	n, err := writeFull(zeroWriter{}, []byte("frame"))
+	c := Codec{rwc: &zeroWriter{}}
+	n, err := c.writeFull([]byte("frame"))
 	if !errors.Is(err, io.ErrShortWrite) || n != 0 {
 		t.Fatalf("writeFull = (%d, %v), want (0, io.ErrShortWrite)", n, err)
 	}
 }
 
 type zeroWriter struct{}
+
+func (w *zeroWriter) Read(p []byte) (n int, err error) {
+	return
+}
+func (w *zeroWriter) Close() error {
+	return nil
+}
 
 func (zeroWriter) Write([]byte) (int, error) { return 0, nil }
 
