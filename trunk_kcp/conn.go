@@ -64,14 +64,13 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 		header.Format(buf)
 		copy(buf[HeaderSize:], chunk)
 
-		// 发送到 KCP（需要加锁）
-		vc.TrunkKCP.kcpLock.Lock()
 		if vc.TrunkKCP.closed.Load() {
 			vc.TrunkKCP.kcpLock.Unlock()
 			return totalWritten, io.ErrClosedPipe
 		}
+		// 发送到 KCP（需要加锁）
+		vc.TrunkKCP.kcpLock.Lock()
 		ret := vc.TrunkKCP.kcp.Send(buf)
-		vc.TrunkKCP.kcp.Update() // 立即更新触发发送，保持低延迟
 		vc.TrunkKCP.kcpLock.Unlock()
 
 		if ret < 0 {
@@ -80,6 +79,9 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 
 		totalWritten += chunkSize
 	}
+	vc.TrunkKCP.kcpLock.Lock()
+	vc.TrunkKCP.kcp.Update() // 只 Update 一次，保持高吞吐量
+	vc.TrunkKCP.kcpLock.Unlock()
 
 	return totalWritten, nil
 }

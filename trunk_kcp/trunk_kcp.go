@@ -15,12 +15,32 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+const KcpMtu = 1400
+
 // TrunkKCP 基于 KCP 协议的链路聚合
 // 将多个网络连接聚合成一个逻辑连接，通过 KCP 提供可靠传输保障
 type activeConn struct {
 	id   int
 	rw   io.ReadWriteCloser
 	stop chan struct{}
+}
+
+func (c *activeConn) writeFull(p []byte) (int, error) {
+	total := 0
+	for total < len(p) {
+		n, err := c.rw.Write(p[total:])
+		if n < 0 || n > len(p)-total {
+			return total, io.ErrShortWrite
+		}
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrShortWrite
+		}
+	}
+	return total, nil
 }
 
 type TrunkKCP struct {
@@ -77,7 +97,7 @@ func NewTrunkKCP(conv uint32, rws ...io.ReadWriteCloser) *TrunkKCP {
 	t.kcp.WndSize(1024, 1024)
 	// 设置 MTU 为 1400（典型以太网 MTU 1500 - IP/UDP 头部）
 	// MSS = MTU - KCP头部(24) = 1376，更大的 MSS 减少分片
-	t.kcp.SetMtu(1400)
+	t.kcp.SetMtu(KcpMtu)
 
 	// 第1个参数 nodelay-启用以后若干常规加速将启动
 	// 第2个参数 interval为内部处理时钟，默认设置为 10ms
@@ -102,10 +122,6 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 	var g errgroup.Group
 	g.Go(func() error {
 		defer t.Close()
-		return t.kcpUpdateLoop(ctx)
-	})
-	g.Go(func() error {
-		defer t.Close()
 		return t.kcpInputLoop(ctx)
 	})
 
@@ -115,23 +131,12 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 		}
 	}
 
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if t.ConnCount() == 0 {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-t.done:
-			return nil
-		case <-ticker.C:
-		}
-	}
+	defer t.Close()
+	return t.kcpUpdateLoop(ctx)
 }
 
 // sendLoop 从 sendChan 读取 KCP 输出的数据包并写到指定物理连接。
+// 用 sendChan 做中介，起到了主动负载均衡的目的，发的快的消费的也快
 func (t *TrunkKCP) sendLoop(ctx context.Context, ac *activeConn) {
 	log.Ctx(ctx).Info().Msgf("sendLoop conn %d", ac.id)
 	for {
@@ -143,7 +148,7 @@ func (t *TrunkKCP) sendLoop(ctx context.Context, ac *activeConn) {
 		case <-ac.stop:
 			return
 		case packet := <-t.sendChan:
-			n, err := ac.rw.Write(packet)
+			n, err := ac.writeFull(packet)
 			if err == nil && n != len(packet) {
 				err = io.ErrShortWrite
 			}
@@ -179,8 +184,9 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, ac *activeConn) {
 				break
 			}
 
+			// KCP 的 len 在 20~24 Byte, 直接解析即可
 			payloadLen := binary.LittleEndian.Uint32(pending[20:24])
-			if payloadLen > 1400-kcpHeaderSize {
+			if payloadLen > KcpMtu-kcpHeaderSize {
 				log.Ctx(ctx).Warn().Msgf("recvLoop conn %d invalid KCP segment length: %d", ac.id, payloadLen)
 				t.RemoveConn(ac.id)
 				return
@@ -341,8 +347,9 @@ func (t *TrunkKCP) AddConn(rw io.ReadWriteCloser) (int, error) {
 		return -1, errors.New("nil conn")
 	}
 	t.connMu.Lock()
+	defer t.connMu.Unlock()
+
 	if t.closed.Load() {
-		t.connMu.Unlock()
 		return -1, errors.New("trunk closed")
 	}
 	id := t.nextConnID
@@ -350,7 +357,6 @@ func (t *TrunkKCP) AddConn(rw io.ReadWriteCloser) (int, error) {
 	ac := &activeConn{id: id, rw: rw, stop: make(chan struct{})}
 	t.active[id] = ac
 	ctx := context.Background()
-	t.connMu.Unlock()
 
 	go t.sendLoop(ctx, ac)
 	go t.recvLoop(ctx, ac)
