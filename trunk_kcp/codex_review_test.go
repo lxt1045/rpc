@@ -10,15 +10,81 @@ import (
 )
 
 func TestReviewHeaderID(t *testing.T) {
-	for _, connID := range []uint16{0, 127, 128, 129, 32767} {
-		for _, cmd := range []uint16{0, CmdCloseConn} {
-			h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
-			got, _ := ParseHeader(h.Format(make([]byte, CmdHeaderSize)))
-			if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
-				t.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
+	t.Run("ParseHeader1", func(t *testing.T) {
+		for _, connID := range []uint16{0, 127, 128, 129, 32767} {
+			for _, cmd := range []uint16{0, CmdCloseConn} {
+				h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
+				got, _ := ParseHeader1(h.Format1(make([]byte, CmdHeaderSize)))
+				if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
+					t.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
+				}
 			}
 		}
-	}
+	})
+
+	t.Run("ParseHeader", func(t *testing.T) {
+		for _, connID := range []uint16{0, 127, 128, 129, 32767} {
+			for _, cmd := range []uint16{0, CmdCloseConn} {
+				h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
+				bs := h.Format(make([]byte, CmdHeaderSize))
+				got, _ := ParseHeader(bs[:CmdHeaderSize])
+				if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
+					t.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
+				}
+			}
+		}
+	})
+}
+func BenchmarkReviewHeaderID(b *testing.B) {
+	b.Run("Format1", func(b *testing.B) {
+		for range b.N {
+			for _, connID := range []uint16{0, 127, 128, 129, 32767} {
+				for _, cmd := range []uint16{0, CmdCloseConn} {
+					h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
+					h.Format1(make([]byte, CmdHeaderSize))
+				}
+			}
+		}
+	})
+	b.Run("ParseHeader1", func(b *testing.B) {
+		for range b.N {
+			for _, connID := range []uint16{0, 127, 128, 129, 32767} {
+				for _, cmd := range []uint16{0, CmdCloseConn} {
+					h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
+					got, _ := ParseHeader1(h.Format1(make([]byte, CmdHeaderSize)))
+					if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
+						b.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
+					}
+				}
+			}
+		}
+	})
+
+	b.Run("Format", func(b *testing.B) {
+		for range b.N {
+			for _, connID := range []uint16{0, 127, 128, 129, 32767} {
+				for _, cmd := range []uint16{0, CmdCloseConn} {
+					h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
+					h.Format(make([]byte, CmdHeaderSize))
+				}
+			}
+		}
+	})
+	b.Run("ParseHeader", func(b *testing.B) {
+		for range b.N {
+			for _, connID := range []uint16{0, 127, 128, 129, 32767} {
+				for _, cmd := range []uint16{0, CmdCloseConn} {
+					h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
+					bs := h.Format(make([]byte, CmdHeaderSize))
+					got, _ := ParseHeader(bs[:CmdHeaderSize])
+					if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
+						b.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
+					}
+				}
+			}
+		}
+	})
+
 }
 
 func TestReviewReadPack(t *testing.T) {

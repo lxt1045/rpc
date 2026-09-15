@@ -33,7 +33,7 @@ func ParseHeaderLen(bs []byte) (l uint16) {
 	return
 }
 
-func ParseHeader(bs []byte) (h Header, l int) {
+func ParseHeader1(bs []byte) (h Header, l int) {
 	_ = bs[HeaderSize-1]
 	h.Len = binary.LittleEndian.Uint16(bs[0:])
 	h.ConnID = binary.LittleEndian.Uint16(bs[2:])
@@ -46,7 +46,30 @@ func ParseHeader(bs []byte) (h Header, l int) {
 	return
 }
 
+// 6.985 ns/op -> 4.593 ns/op
+func ParseHeader(bs []byte) (h Header, l int) {
+	_ = bs[CmdHeaderSize-1]
+	h.Len = binary.LittleEndian.Uint16(bs[0:])
+	h.ConnID = binary.LittleEndian.Uint16(bs[2:])
+
+	l = HeaderSize + int(h.ConnID>>15)<<1
+	h.ConnID &= 0x7fff
+	h.Cmd = binary.LittleEndian.Uint16(bs[4:])
+	return
+}
+
+// 21.255 ns/op -> 16.947 ns/op
 func (h *Header) Format(bs []byte) (out []byte) {
+	_ = bs[CmdHeaderSize-1]
+	binary.LittleEndian.PutUint16(bs[0:], h.Len)
+
+	ConnIDMask := uint16(0x8000 << (0x8000 << h.Cmd))
+	binary.LittleEndian.PutUint16(bs[2:], h.ConnID|ConnIDMask)
+	binary.LittleEndian.PutUint16(bs[4:], h.Cmd)
+	return bs[:HeaderSize+(ConnIDMask>>15)<<1]
+}
+
+func (h *Header) Format1(bs []byte) (out []byte) {
 	_ = bs[HeaderSize-1]
 	binary.LittleEndian.PutUint16(bs[0:], h.Len)
 	if h.Cmd > 0 {
