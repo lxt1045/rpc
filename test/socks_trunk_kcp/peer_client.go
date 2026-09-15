@@ -146,23 +146,58 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	p.trunkPeer = p.GetPeer()
+
+	// 获取一个新的控制连接peer
+	trunkPeer := p.GetPeer()
 
 	req := &pb.TrunkStartReq{
 		TrunkId:      conv,
 		UpgradeCount: uint32(n),
 	}
-	if err := p.trunkPeer.Invoke(ctx, "TrunkStart", req, &pb.TrunkStartRsp{}); err != nil {
+	if err := trunkPeer.Invoke(ctx, "TrunkStart", req, &pb.TrunkStartRsp{}); err != nil {
 		return err
 	}
 
 	trunk := trunk_kcp.NewTrunkKCP(conv, nil, conns...)
 	p.mu.Lock()
 	p.trunk = trunk
+	p.trunkPeer = trunkPeer
 	p.mu.Unlock()
-	go trunk.Run(ctx)
+
+	// 启动trunk并监控其状态
+	go func() {
+		trunk.Run(ctx)
+		log.Ctx(ctx).Warn().Msg("trunk stopped, will attempt to reconnect")
+
+		// trunk停止后，清理状态
+		p.mu.Lock()
+		if p.trunk == trunk {
+			p.trunk = nil
+			// 将控制连接放回，让它继续被其他地方使用或被心跳检测关闭
+			if p.trunkPeer == trunkPeer && !trunkPeer.IsClosed() {
+				select {
+				case p.ChPeer <- trunkPeer:
+				default:
+					_ = trunkPeer.Close(ctx)
+				}
+			}
+			p.trunkPeer = nil
+		}
+		p.mu.Unlock()
+
+		// 延迟后尝试重连
+		time.Sleep(3 * time.Second)
+		log.Ctx(ctx).Info().Msg("attempting to reconnect trunk")
+		if err := p.InitTrunk(ctx); err != nil {
+			log.Ctx(ctx).Error().Err(err).Msg("failed to reconnect trunk")
+		} else {
+			log.Ctx(ctx).Info().Msg("trunk reconnected successfully")
+		}
+	}()
+
 	return nil
 }
+
 
 // RemoveTrunkConn 优雅剔除一条底层物理连接：先本地 CloseWrite，
 // 再通知服务端也 CloseWrite/RemoveConn，最后本地 RemoveConn。
