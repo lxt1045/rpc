@@ -13,7 +13,7 @@ func relay(ctx context.Context, left, right io.ReadWriteCloser) {
 
 	cp := func(dst, src io.ReadWriteCloser) {
 		defer wg.Done()
-		_, _ = io.Copy(dst, src)
+		_, _ = io.Copy(dst, src) // TODO: 使用带大缓存的Copy 函数
 		_ = dst.Close()
 		_ = src.Close()
 	}

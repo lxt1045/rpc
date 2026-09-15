@@ -136,7 +136,10 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 	}
 	p.trunkPeer = p.GetPeer()
 
-	req := &pb.TrunkStartReq{TrunkId: conv, UpgradeCount: uint32(n)}
+	req := &pb.TrunkStartReq{
+		TrunkId:      conv,
+		UpgradeCount: uint32(n),
+	}
 	if err := p.trunkPeer.Invoke(ctx, "TrunkStart", req, &pb.TrunkStartRsp{}); err != nil {
 		return err
 	}
@@ -243,7 +246,11 @@ func (p *SocksCli) TrunkConn(ctx context.Context, conv uint32, n int) ([]io.Read
 				_ = conn.Close()
 				return err
 			}
-			upgrade, err := peer.Upgrade(ctx, "TrunkUpgrade", &pb.TrunkUpgradeReq{TrunkId: conv, UpgradeId: uint32(i)}, &pb.TrunkUpgradeRsp{})
+			req := &pb.TrunkUpgradeReq{
+				TrunkId:   conv,
+				UpgradeId: uint32(i),
+			}
+			upgrade, err := peer.Upgrade(ctx, "TrunkUpgrade", req, &pb.TrunkUpgradeRsp{})
 			if err != nil {
 				_ = conn.Close()
 				return err

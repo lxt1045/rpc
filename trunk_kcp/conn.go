@@ -128,7 +128,10 @@ func (vc *VirtualConn) Close() error {
 	if vc.TrunkKCP.closed.Load() {
 		return nil
 	}
-	header := Header{ConnID: vc.connID, Cmd: CmdCloseConn}
+	header := Header{
+		ConnID: vc.connID,
+		Cmd:    CmdCloseConn,
+	}
 	buf := make([]byte, CmdHeaderSize)
 	header.Format(buf)
 	if ret := vc.kcp.Send(buf); ret < 0 {

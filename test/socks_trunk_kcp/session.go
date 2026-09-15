@@ -122,7 +122,11 @@ func (p *SocksSvc) Auth(ctx context.Context, req *pb.AuthReq) (*pb.AuthRsp, erro
 			sessionManager.mu.Unlock()
 			return &pb.AuthRsp{Status: pb.AuthRsp_Fail, Err: &pb.Err{Msg: "too many clients"}}, nil
 		}
-		sess = &session{clientID: clientID, svcs: make(map[*SocksSvc]struct{}), maxVConn: maxVConn}
+		sess = &session{
+			clientID: clientID,
+			svcs:     make(map[*SocksSvc]struct{}),
+			maxVConn: maxVConn,
+		}
 		sessionManager.sessions[clientID] = sess
 	}
 	sessionManager.mu.Unlock()

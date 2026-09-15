@@ -54,13 +54,13 @@ func main() {
 		return
 	}
 
-	token := conf.Token
+	token := os.Getenv("SOCKS_TRUNK_TOKEN")
 	if token == "" {
-		token = os.Getenv("SOCKS_TRUNK_TOKEN")
+		token = conf.Token
 	}
 	if token == "" {
 		if conf.Debug {
-			token = "dev-insecure-token"
+			token = "skdkfjjdklfkljdnmkjkl"
 			log.Ctx(ctx).Warn().Caller().Msg("using dev-insecure-token")
 		} else {
 			log.Ctx(ctx).Error().Caller().Msg("server token is required")
@@ -129,7 +129,10 @@ func main() {
 				return err
 			}
 			go func(conn net.Conn) {
-				svc := &socks.SocksSvc{RemoteAddr: conn.RemoteAddr().String(), LocalAddr: conn.LocalAddr().String()}
+				svc := &socks.SocksSvc{
+					RemoteAddr: conn.RemoteAddr().String(),
+					LocalAddr:  conn.LocalAddr().String(),
+				}
 				peer, err := gPeer.Clone(ctx, conn, svc)
 				if err != nil {
 					_ = conn.Close()

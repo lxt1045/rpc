@@ -51,9 +51,9 @@ func main() {
 		return
 	}
 
-	token := conf.Token
+	token := os.Getenv("SOCKS_TRUNK_TOKEN")
 	if token == "" {
-		token = os.Getenv("SOCKS_TRUNK_TOKEN")
+		token = conf.Token
 	}
 	if err := socks.ValidateClientConfig(&socks.ClientConfig{Token: token, Trunk: conf.TrunkKCP}); err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
