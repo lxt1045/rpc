@@ -17,6 +17,9 @@ import (
 
 const KcpMtu = 1400
 
+// OnNewConnFunc 当解析到一个新的 conn_id 时调用的回调函数
+type OnNewConnFunc func(conn *VirtualConn)
+
 // TrunkKCP 基于 KCP 协议的链路聚合
 // 将多个网络连接聚合成一个逻辑连接，通过 KCP 提供可靠传输保障
 type activeConn struct {
@@ -61,8 +64,9 @@ type TrunkKCP struct {
 	recvChan chan []byte // 网络接收 -> KCP 输入
 
 	// 虚拟连接管理
-	conns    []*VirtualConn
-	connLock sync.RWMutex
+	conns       []*VirtualConn
+	connLock    sync.RWMutex
+	onNewConnFn OnNewConnFunc // 新连接回调函数
 
 	// 写索引（轮询发送）
 	wIdx atomic.Int32
@@ -74,14 +78,16 @@ type TrunkKCP struct {
 
 // NewTrunkKCP 创建一个新的 TrunkKCP 实例
 // conv: KCP conversation ID，两端必须相同
+// onNewConn: 当解析到一个新的 conn_id 时调用的回调函数，可以为 nil
 // rws: 物理连接列表
-func NewTrunkKCP(conv uint32, rws ...io.ReadWriteCloser) *TrunkKCP {
+func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser) *TrunkKCP {
 	t := &TrunkKCP{
-		rws:      rws,
-		active:   make(map[int]*activeConn),
-		sendChan: make(chan []byte, 1024),
-		recvChan: make(chan []byte, 1024),
-		done:     make(chan struct{}),
+		rws:         rws,
+		active:      make(map[int]*activeConn),
+		sendChan:    make(chan []byte, 1024),
+		recvChan:    make(chan []byte, 1024),
+		done:        make(chan struct{}),
+		onNewConnFn: onNewConn,
 	}
 
 	// 创建 KCP 实例，output 回调写入 sendChan
@@ -336,6 +342,10 @@ func (t *TrunkKCP) GetConn(connID uint16) *VirtualConn {
 			readChan: make(chan []byte, 64),
 			readDone: make(chan struct{}),
 		}
+		// 调用回调函数
+		if t.onNewConnFn != nil {
+			go t.onNewConnFn(t.conns[connID])
+		}
 	}
 
 	return t.conns[connID]
@@ -371,11 +381,17 @@ func (t *TrunkKCP) RemoveConn(id int) error {
 		delete(t.active, id)
 		close(ac.stop)
 	}
+	remaining := len(t.active)
 	t.connMu.Unlock()
 	if ac == nil {
 		return errors.New("conn not found")
 	}
 	_ = ac.rw.Close()
+
+	// 如果没有剩余的物理连接，关闭整个 trunk
+	if remaining == 0 {
+		t.Close()
+	}
 	return nil
 }
 

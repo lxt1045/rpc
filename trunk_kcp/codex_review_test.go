@@ -14,7 +14,7 @@ func TestReviewHeaderID(t *testing.T) {
 		for _, connID := range []uint16{0, 127, 128, 129, 32767} {
 			for _, cmd := range []uint16{0, CmdCloseConn} {
 				h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
-				got, _ := ParseHeader1(h.Format1(make([]byte, CmdHeaderSize)))
+				got, _ := ParseHeader(h.Format(make([]byte, CmdHeaderSize)))
 				if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
 					t.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
 				}
@@ -22,12 +22,12 @@ func TestReviewHeaderID(t *testing.T) {
 		}
 	})
 
-	t.Run("ParseHeader", func(t *testing.T) {
+	t.Run("ParseHeader2", func(t *testing.T) {
 		for _, connID := range []uint16{0, 127, 128, 129, 32767} {
 			for _, cmd := range []uint16{0, CmdCloseConn} {
 				h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
-				bs := h.Format(make([]byte, CmdHeaderSize))
-				got, _ := ParseHeader(bs[:CmdHeaderSize])
+				bs := h.Format2(make([]byte, CmdHeaderSize))
+				got, _ := ParseHeader2(bs[:CmdHeaderSize])
 				if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
 					t.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
 				}
@@ -41,7 +41,7 @@ func BenchmarkReviewHeaderID(b *testing.B) {
 			for _, connID := range []uint16{0, 127, 128, 129, 32767} {
 				for _, cmd := range []uint16{0, CmdCloseConn} {
 					h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
-					h.Format1(make([]byte, CmdHeaderSize))
+					h.Format(make([]byte, CmdHeaderSize))
 				}
 			}
 		}
@@ -51,7 +51,7 @@ func BenchmarkReviewHeaderID(b *testing.B) {
 			for _, connID := range []uint16{0, 127, 128, 129, 32767} {
 				for _, cmd := range []uint16{0, CmdCloseConn} {
 					h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
-					got, _ := ParseHeader1(h.Format1(make([]byte, CmdHeaderSize)))
+					got, _ := ParseHeader(h.Format(make([]byte, CmdHeaderSize)))
 					if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
 						b.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
 					}
@@ -60,23 +60,23 @@ func BenchmarkReviewHeaderID(b *testing.B) {
 		}
 	})
 
-	b.Run("Format", func(b *testing.B) {
+	b.Run("Format2", func(b *testing.B) {
 		for range b.N {
 			for _, connID := range []uint16{0, 127, 128, 129, 32767} {
 				for _, cmd := range []uint16{0, CmdCloseConn} {
 					h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
-					h.Format(make([]byte, CmdHeaderSize))
+					h.Format2(make([]byte, CmdHeaderSize))
 				}
 			}
 		}
 	})
-	b.Run("ParseHeader", func(b *testing.B) {
+	b.Run("ParseHeader2", func(b *testing.B) {
 		for range b.N {
 			for _, connID := range []uint16{0, 127, 128, 129, 32767} {
 				for _, cmd := range []uint16{0, CmdCloseConn} {
 					h := Header{ConnID: connID, Cmd: cmd, Len: HeaderSize + 1}
-					bs := h.Format(make([]byte, CmdHeaderSize))
-					got, _ := ParseHeader(bs[:CmdHeaderSize])
+					bs := h.Format2(make([]byte, CmdHeaderSize))
+					got, _ := ParseHeader2(bs[:CmdHeaderSize])
 					if got.ConnID != h.ConnID || got.Cmd != h.Cmd {
 						b.Fatalf("header changed: ConnID %d -> %d, Cmd %d -> %d", h.ConnID, got.ConnID, h.Cmd, got.Cmd)
 					}
@@ -105,7 +105,9 @@ func TestReviewReadPack(t *testing.T) {
 }
 
 func TestReviewReceiveOverflow(t *testing.T) {
-	p := NewTrunkKCP(1)
+	a, b := net.Pipe()
+	defer b.Close()
+	p := NewTrunkKCP(1, nil, a)
 	c := p.GetConn(1)
 	done := make(chan struct{})
 	go func() {
@@ -133,7 +135,9 @@ func TestReviewReceiveOverflow(t *testing.T) {
 }
 
 func TestReviewLocalCloseUnblocksRead(t *testing.T) {
-	p := NewTrunkKCP(1)
+	a, b := net.Pipe()
+	defer b.Close()
+	p := NewTrunkKCP(1, nil, a)
 	c := p.GetConn(1)
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
@@ -158,7 +162,7 @@ func TestReviewLocalCloseUnblocksRead(t *testing.T) {
 func TestReviewCancelRun(t *testing.T) {
 	a, b := net.Pipe()
 	defer b.Close()
-	p := NewTrunkKCP(1, a)
+	p := NewTrunkKCP(1, nil, a)
 	defer p.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -177,7 +181,7 @@ func TestReviewCancelRun(t *testing.T) {
 
 func TestReviewRunAfterEOF(t *testing.T) {
 	a, b := net.Pipe()
-	p := NewTrunkKCP(1, a)
+	p := NewTrunkKCP(1, nil, a)
 	defer p.Close()
 	done := make(chan error, 1)
 	go func() { done <- p.Run(context.Background()) }()
@@ -197,5 +201,8 @@ func TestReviewMaxConnID(t *testing.T) {
 			t.Fatalf("GetConn(65535) panicked: %v", e)
 		}
 	}()
-	NewTrunkKCP(1).GetConn(65535)
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	NewTrunkKCP(1, nil, a).GetConn(65535)
 }

@@ -111,7 +111,6 @@ func ConfigureACL(c ACLConfig) error {
 
 // CheckACL 判断目标是否被允许。
 func CheckACL(hostport string) bool {
-	return true
 	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
 		host = hostport

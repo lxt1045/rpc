@@ -171,6 +171,32 @@ and addr↔conn registry), and UDP pseudo-connections. `socket/` handles listen/
 `SO_REUSEADDR`/`SO_REUSEPORT` set via `syscall.RawConn.Control`, with the fd type abstracted across
 `base_linux.go`/`base_windows.go`.
 
+### trunk_kcp: KCP-based link aggregation
+
+`trunk_kcp/` is a newer link-aggregation module that differs from `trunk` in providing
+**application-layer reliability via KCP**. While `trunk` requires reliable underlying connections
+(TCP, QUIC) and uses an `Idx` field to reorder frames, `trunk_kcp` embeds KCP protocol logic to
+handle retransmission and ordering automatically, making it suitable for unreliable transports like
+raw UDP or lossy networks.
+
+Key differences from `trunk`:
+
+- **Frame format incompatible**: `trunk_kcp` uses `[Len uint16][ConnID uint16][Body]` for normal
+  frames (4-byte header) and `[Len uint16][ConnID|0x8000 uint16][Cmd uint16][Body]` for command
+  frames (6-byte header), with no `Idx` field. Physical connections carry KCP segments (24-byte KCP
+  header), and the receiver reassembles complete KCP segments based on the length field at offset
+  20–24 before feeding them to KCP.
+- **Reliability**: KCP provides automatic retransmission and in-order delivery; `trunk` relies on
+  the underlying connection's reliability.
+- **Performance trade-off**: `trunk_kcp` has higher CPU overhead and moderate latency due to KCP
+  processing, while `trunk` is lower-latency and higher-throughput on reliable networks.
+- **Conv ID**: Both sides must use the same KCP conversation ID (`conv uint32`) when creating
+  `NewTrunkKCP`.
+
+Usage: `trunk := trunk_kcp.NewTrunkKCP(conv, conn1, conn2, ...); go trunk.Run(ctx); vconn :=
+trunk.GetConn(connID)`. See `trunk_kcp/README.md` for detailed API and tuning parameters. The
+`test/socks_trunk_kcp` example demonstrates it in action. Test with `go test ./trunk_kcp -v`.
+
 ### Middleware
 
 `middleware.go` gives Gin-style chains: `ClientUse(func(*CliParam))` on the outbound path,
@@ -196,8 +222,8 @@ the path before running one, and note the `socks` example is the one that actual
 ## Examples
 
 `test/` holds runnable `main` packages, not tests. Each of `socks`, `socks_nat`, `socks_quic`,
-`socks_stream`, `socks_trunk`, `test_broadcast` follows the same shape: peer logic (the
-`*Peer`/service struct, e.g. `SocksSvc`) lives at the example root in `peer_client.go` /
+`socks_stream`, `socks_trunk`, `socks_trunk_kcp`, `test_broadcast` follows the same shape: peer
+logic (the `*Peer`/service struct, e.g. `SocksSvc`) lives at the example root in `peer_client.go` /
 `peer_service.go` / `peer_proxy.go`, with thin `main.go` binaries under `client/`, `service/`, and
 (for `socks`, `socks_stream`) `proxy/`. Config is read from an embed-relative
 `static/conf/default.yml`, so run each from its own directory. `nat/` and `proxy/` are the two
@@ -205,5 +231,7 @@ other demo variants (NAT-traversal and reverse-proxy), and `webrtc/` holds an ex
 WebRTC data-channel transport.
 
 Run them from their own directory. Read `test/socks` first for the minimal shape (root
-`SocksSvc` + `service/main.go` client/server wiring), `socks_stream` for streaming, and `socks` for
-the full remote SOCKS5/HTTP proxy (including uTLS browser fingerprints under `chrome/`).
+`SocksSvc` + `service/main.go` client/server wiring), `socks_stream` for streaming, `socks_trunk`
+for basic link aggregation over reliable transports, `socks_trunk_kcp` for KCP-based link
+aggregation over unreliable networks, and `socks` for the full remote SOCKS5/HTTP proxy (including
+uTLS browser fingerprints under `chrome/`).

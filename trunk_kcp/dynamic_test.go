@@ -13,8 +13,8 @@ func TestTrunkKCP_DynamicRemoveAdd(t *testing.T) {
 	s0, c0 := rpc.NewFakeConnPipe()
 	s1, c1 := rpc.NewFakeConnPipe()
 
-	p1 := NewTrunkKCP(0x60000001, s0, s1)
-	p2 := NewTrunkKCP(0x60000001, c0, c1)
+	p1 := NewTrunkKCP(0x60000001, nil, s0, s1)
+	p2 := NewTrunkKCP(0x60000001, nil, c0, c1)
 	defer p1.Close()
 	defer p2.Close()
 

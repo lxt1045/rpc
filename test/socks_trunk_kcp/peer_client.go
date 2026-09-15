@@ -144,7 +144,7 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 		return err
 	}
 
-	trunk := trunk_kcp.NewTrunkKCP(conv, conns...)
+	trunk := trunk_kcp.NewTrunkKCP(conv, nil, conns...)
 	p.mu.Lock()
 	p.trunk = trunk
 	p.mu.Unlock()

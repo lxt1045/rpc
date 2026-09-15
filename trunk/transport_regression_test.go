@@ -25,7 +25,7 @@ var transportFactories = map[string]func(...io.ReadWriteCloser) transportPeer{
 		return transportPeer{p.Run, p.Close, func(id uint16) io.ReadWriteCloser { return p.GetConn(id) }}
 	},
 	"kcp": func(rws ...io.ReadWriteCloser) transportPeer {
-		p := trunk_kcp.NewTrunkKCP(42, rws...)
+		p := trunk_kcp.NewTrunkKCP(42, nil, rws...)
 		return transportPeer{func(ctx context.Context) { p.Run(ctx) }, p.Close, func(id uint16) io.ReadWriteCloser { return p.GetConn(id) }}
 	},
 }

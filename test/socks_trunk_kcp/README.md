@@ -33,6 +33,13 @@ go test -count=1 ./test/socks_trunk_kcp/... ./trunk_kcp
 test/socks_trunk_kcp/scripts/local_integration_test.sh
 ```
 
+### 单元测试说明
+
+- `TestOnDemandVirtualConn`：验证按需创建功能，只有被使用的虚拟连接 ID 才会触发回调
+- `TestNoCallbackBeforeUse`：验证在虚拟连接被使用之前不会预先创建任何 goroutine
+- `auth_test.go`：认证流程测试
+- `protocol_test.go`：地址协议序列化测试
+
 ## 代码架构
 
 ```text
@@ -92,10 +99,10 @@ test/socks_trunk_kcp/scripts/local_integration_test.sh
 3. 服务端把 Upgrade 得到的原始连接收进当前 session。
 4. client 通过控制 RPC 调用 `TrunkStart`。
 5. 服务端确认 N 条连接已到齐后：
-   - 创建 `trunk_kcp.NewTrunkKCP(conv, rws...)`
+   - 创建 `trunk_kcp.NewTrunkKCP(conv, onNewConn, rws...)`，传入回调函数
    - `go trunk.Run(ctx)`
-   - 为虚拟连接池启动读取协程
-6. client 也创建同一个 `conv` 的 `TrunkKCP` 并 `Run`。
+   - **按需创建**：只有当客户端真正使用某个虚拟连接 ID 时，回调才会被触发
+6. client 也创建同一个 `conv` 的 `TrunkKCP` 并 `Run`（客户端不需要回调）。
 
 ### 2. 代理数据流
 
@@ -150,7 +157,7 @@ client MaintainTrunk 周期检查
 
 - 每个用户连接独占一个 `VirtualConn`，互不共享读写锁。
 - `VirtualConn.Read` / `Write` 各自有锁，避免同连接并发读写竞态。
-- server 为每个虚拟连接启动一个阻塞读协程；连接关闭后协程退出。
+- **按需创建**：server 通过回调机制，仅在客户端首次使用某个虚拟连接 ID 时才创建对应的处理 goroutine，而非预先为所有可能的连接（如 1-256）创建协程。这大幅减少了资源占用。
 - 物理连接层每个 `activeConn` 有独立 send/recv loop；单条断开只影响该条。
 - 所有 RPC handler 与 listener 都带有 recover / 关闭保护。
 

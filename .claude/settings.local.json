@@ -39,7 +39,10 @@
       "Bash(echo \"EXIT:$?\")",
       "Bash(grep -E '\\\\.\\(pem|yml\\)$')",
       "Bash(go doc *)",
-      "Bash(cd *)"
+      "Bash(cd *)",
+      "Bash(awk *)",
+      "Bash(cat)",
+      "Read(//tmp/**)"
     ]
   }
 }

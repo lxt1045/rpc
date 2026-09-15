@@ -114,15 +114,13 @@ func (c *Zip) Close() (err error) {
 	}()
 	err = c.rwc.Close() // conn 关闭后， c.reader 和 c.writer 的阻塞点就会及时返回
 
+	// 不要在持有锁的情况下关闭 reader/writer，因为 Read/Write 可能正在阻塞
+	// rwc.Close() 已经会让阻塞的 Read/Write 返回，所以直接关闭即可
 	if c.reader != nil {
-		c.rLock.Lock()
-		defer c.rLock.Unlock()
 		c.reader.Close()
 	}
 
 	if c.writer != nil {
-		c.wLock.Lock()
-		defer c.wLock.Unlock()
 		err1 := c.writer.Close()
 		if err == nil && err1 != nil {
 			err = err1

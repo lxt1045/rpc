@@ -223,7 +223,13 @@ func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (*pb.T
 		rws = append(rws, c.rw)
 	}
 	maxVConn := p.maxVirtualConns()
-	trunk := trunk_kcp.NewTrunkKCP(req.TrunkId, rws...)
+
+	// 创建回调函数，按需处理新的虚拟连接
+	onNewConn := func(vconn *trunk_kcp.VirtualConn) {
+		p.serveVirtualConn(ctx, vconn)
+	}
+
+	trunk := trunk_kcp.NewTrunkKCP(req.TrunkId, onNewConn, rws...)
 	sess.mu.Lock()
 	sess.conv = req.TrunkId
 	sess.maxVConn = maxVConn
@@ -234,7 +240,6 @@ func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (*pb.T
 	p.mu.Unlock()
 
 	go trunk.Run(ctx)
-	p.serveVirtualConns(ctx, sess)
 	return &pb.TrunkStartRsp{}, nil
 }
 
@@ -268,23 +273,6 @@ func (p *SocksSvc) maxVirtualConns() int {
 		return 256
 	}
 	return sessionManager.maxVConn
-}
-
-func (p *SocksSvc) serveVirtualConns(ctx context.Context, sess *session) {
-	maxVConn := 256
-	sess.mu.Lock()
-	if sess.maxVConn > 0 {
-		maxVConn = sess.maxVConn
-	}
-	trunk := sess.trunk
-	sess.mu.Unlock()
-	if trunk == nil {
-		return
-	}
-	for i := 1; i <= maxVConn; i++ {
-		id := uint16(i)
-		go p.serveVirtualConn(ctx, trunk.GetConn(id))
-	}
 }
 
 func (p *SocksSvc) serveVirtualConn(ctx context.Context, vconn *trunk_kcp.VirtualConn) {

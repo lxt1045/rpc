@@ -19,8 +19,8 @@ func TestTrunkKCP_SingleConn(t *testing.T) {
 	s0, c0 := rpc.NewFakeConnPipe()
 
 	// 创建两个 TrunkKCP 实例（使用不同的 conv）
-	peer1 := NewTrunkKCP(0x11111111, s0)
-	peer2 := NewTrunkKCP(0x11111111, c0)
+	peer1 := NewTrunkKCP(0x11111111, nil, s0)
+	peer2 := NewTrunkKCP(0x11111111, nil, c0)
 
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)
@@ -71,8 +71,8 @@ func TestTrunkKCP_MultiConn(t *testing.T) {
 	s2, c2 := rpc.NewFakeConnPipe()
 
 	// 创建两个 TrunkKCP 实例
-	peer1 := NewTrunkKCP(0x22222222, s0, s1, s2)
-	peer2 := NewTrunkKCP(0x22222222, c0, c1, c2)
+	peer1 := NewTrunkKCP(0x22222222, nil, s0, s1, s2)
+	peer2 := NewTrunkKCP(0x22222222, nil, c0, c1, c2)
 
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)
@@ -135,8 +135,8 @@ func TestTrunkKCP_VirtualConn(t *testing.T) {
 	ctx := context.Background()
 
 	s0, c0 := rpc.NewFakeConnPipe()
-	peer1 := NewTrunkKCP(0x33333333, s0)
-	peer2 := NewTrunkKCP(0x33333333, c0)
+	peer1 := NewTrunkKCP(0x33333333, nil, s0)
+	peer2 := NewTrunkKCP(0x33333333, nil, c0)
 
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)
@@ -212,16 +212,16 @@ func TestTrunkKCP_LargeData(t *testing.T) {
 	}()
 
 	s0, c0 := rpc.NewFakeConnPipe()
-	peer1 := NewTrunkKCP(0x44444444, s0)
-	peer2 := NewTrunkKCP(0x44444444, c0)
+	peer1 := NewTrunkKCP(0x44444444, nil, s0)
+	peer2 := NewTrunkKCP(0x44444444, nil, c0)
 
 	// s0, c0 := rpc.NewFakeConnPipe()
 	// s1, c1 := rpc.NewFakeConnPipe()
 	// s2, c2 := rpc.NewFakeConnPipe()
 
 	// // 创建两个 TrunkKCP 实例
-	// peer1 := NewTrunkKCP(0x22222222, s0, s1, s2)
-	// peer2 := NewTrunkKCP(0x22222222, c0, c1, c2)
+	// peer1 := NewTrunkKCP(0x22222222, nil, s0, s1, s2)
+	// peer2 := NewTrunkKCP(0x22222222, nil, c0, c1, c2)
 
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)
@@ -300,8 +300,8 @@ func TestTrunkKCP_CloseHandling(t *testing.T) {
 	ctx := context.Background()
 
 	s0, c0 := rpc.NewFakeConnPipe()
-	peer1 := NewTrunkKCP(0x55555555, s0)
-	peer2 := NewTrunkKCP(0x55555555, c0)
+	peer1 := NewTrunkKCP(0x55555555, nil, s0)
+	peer2 := NewTrunkKCP(0x55555555, nil, c0)
 
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)
@@ -369,8 +369,8 @@ func BenchmarkTrunkKCP_Write(b *testing.B) {
 	ctx := context.Background()
 
 	s0, c0 := rpc.NewFakeConnPipe()
-	peer1 := NewTrunkKCP(0x66666666, s0)
-	peer2 := NewTrunkKCP(0x66666666, c0)
+	peer1 := NewTrunkKCP(0x66666666, nil, s0)
+	peer2 := NewTrunkKCP(0x66666666, nil, c0)
 
 	go peer1.Run(ctx)
 	go peer2.Run(ctx)

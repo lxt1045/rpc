@@ -29,6 +29,10 @@ type VirtualConn struct {
 
 var _ io.ReadWriteCloser = &VirtualConn{}
 
+func (vc *VirtualConn) ConnID() (connID uint16) {
+	return vc.connID
+}
+
 // Write 写入数据到虚拟连接
 func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 	if vc.closed.Load() {
