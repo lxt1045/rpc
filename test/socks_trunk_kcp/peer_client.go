@@ -124,6 +124,18 @@ func (p *SocksCli) RunConnLoop(ctx context.Context) {
 
 // InitTrunk 创建 N 条 trunk_kcp 底层连接并启动。
 func (p *SocksCli) InitTrunk(ctx context.Context) error {
+	// 先关闭旧的 trunk（如果存在）
+	p.mu.Lock()
+	if p.trunk != nil {
+		oldTrunk := p.trunk
+		p.trunk = nil
+		p.mu.Unlock()
+		log.Ctx(ctx).Info().Msg("closing old client trunk before creating new one")
+		_ = oldTrunk.Close()
+	} else {
+		p.mu.Unlock()
+	}
+
 	p.TrunkCfg.defaults()
 	conv := p.TrunkCfg.Conv
 	n := p.TrunkCfg.MaxConns

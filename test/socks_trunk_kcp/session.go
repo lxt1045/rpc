@@ -131,7 +131,16 @@ func (p *SocksSvc) Auth(ctx context.Context, req *pb.AuthReq) (*pb.AuthRsp, erro
 	}
 	sessionManager.mu.Unlock()
 
+	// 如果是重连，检查是否需要清理旧的 trunk
 	sess.mu.Lock()
+	if sess.trunk != nil && sess.trunk.ConnCount() == 0 {
+		// trunk 存在但没有活跃连接，说明是旧的，需要清理
+		oldTrunk := sess.trunk
+		sess.trunk = nil
+		sess.conns = nil
+		log.Ctx(ctx).Info().Msg("cleaning up stale trunk in Auth")
+		go func() { _ = oldTrunk.Close() }()
+	}
 	sess.svcs[p] = struct{}{}
 	sess.mu.Unlock()
 
@@ -169,11 +178,21 @@ func (p *SocksSvc) TrunkUpgrade(ctx context.Context, req *pb.TrunkUpgradeReq) (*
 	if sess.trunk != nil {
 		trunk := sess.trunk
 		sess.mu.Unlock()
-		if _, err := trunk.AddConn(upgrade); err != nil {
-			upgrade.Close()
-			return nil, err
+		// 检查 trunk 是否健康（有物理连接且有虚拟连接）
+		connCount := trunk.ConnCount()
+		virtualCount := trunk.VirtualConnCount()
+		if connCount > 0 && virtualCount > 0 {
+			if _, err := trunk.AddConn(upgrade); err != nil {
+				log.Ctx(ctx).Warn().Err(err).Msg("AddConn to existing trunk failed")
+				upgrade.Close()
+				return nil, err
+			}
+			log.Ctx(ctx).Info().Int("conn_count", connCount).Int("virtual_count", virtualCount).Msg("added conn to existing trunk")
+			return &pb.TrunkUpgradeRsp{}, nil
 		}
-		return &pb.TrunkUpgradeRsp{}, nil
+		// trunk 没有活跃连接或虚拟连接，说明正在关闭或已废弃，需要重新创建
+		log.Ctx(ctx).Warn().Int("conn_count", connCount).Int("virtual_count", virtualCount).Msg("trunk exists but is stale or closing, treating as new session")
+		sess.mu.Lock()
 	}
 	sess.conns = append(sess.conns, sessionConn{rw: upgrade})
 	sess.mu.Unlock()
@@ -213,7 +232,18 @@ func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (*pb.T
 		return nil, err
 	}
 	sess.mu.Lock()
+	// 如果已存在 trunk，先关闭旧的
+	if sess.trunk != nil {
+		oldTrunk := sess.trunk
+		sess.trunk = nil
+		sess.mu.Unlock()
+		log.Ctx(ctx).Info().Msg("closing old trunk before creating new one")
+		_ = oldTrunk.Close()
+		sess.mu.Lock()
+	}
 	conns := append([]sessionConn(nil), sess.conns...)
+	// 清空 conns 列表，防止重复使用
+	sess.conns = nil
 	sess.mu.Unlock()
 	if len(conns) != int(req.UpgradeCount) {
 		return nil, fmt.Errorf("upgrade count mismatch: have %d want %d", len(conns), req.UpgradeCount)

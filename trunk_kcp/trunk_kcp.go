@@ -416,6 +416,19 @@ func (t *TrunkKCP) ConnCount() int {
 	return len(t.active)
 }
 
+// VirtualConnCount 返回当前活跃的虚拟连接数。
+func (t *TrunkKCP) VirtualConnCount() int {
+	t.connLock.RLock()
+	defer t.connLock.RUnlock()
+	count := 0
+	for _, conn := range t.conns {
+		if conn != nil {
+			count++
+		}
+	}
+	return count
+}
+
 // Close 关闭 TrunkKCP
 func (t *TrunkKCP) Close() error {
 	if !t.closed.CompareAndSwap(false, true) {
