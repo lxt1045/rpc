@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/lxt1045/rpc"
@@ -42,7 +41,6 @@ type SocksCli struct {
 
 	trunk       *trunk_kcp.TrunkKCP
 	trunkPeer   *Peer
-	connID      atomic.Uint32
 	connInfos   []connInfo // 记录所有活跃连接的信息
 	stopRefresh chan struct{}
 	mu          sync.Mutex
@@ -234,7 +232,6 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 	return nil
 }
 
-
 // refreshConnLoop 定期刷新连接：每隔10秒删除最老的一条连接，同时加入一条新连接
 func (p *SocksCli) refreshConnLoop(ctx context.Context, stopRefresh chan struct{}) {
 	ticker := time.NewTicker(10 * time.Second)
@@ -319,20 +316,16 @@ func (p *SocksCli) refreshOldestConn(ctx context.Context) error {
 	return nil
 }
 
-// RemoveTrunkConn 优雅剔除一条底层物理连接：先本地 CloseWrite，
-// 再通知服务端也 CloseWrite/RemoveConn，最后本地 RemoveConn。
+// RemoveTrunkConn closes a local physical connection. The remote recvLoop
+// removes its matching connection on EOF; physical IDs are local to each trunk.
 func (p *SocksCli) RemoveTrunkConn(ctx context.Context, id int) error {
 	p.mu.Lock()
 	trunk := p.trunk
-	peer := p.trunkPeer
 	p.mu.Unlock()
-	if trunk == nil || peer == nil {
-		return errors.New("trunk or control peer not ready")
+	if trunk == nil {
+		return errors.New("trunk not ready")
 	}
-	_ = trunk.CloseWriteConn(id)
-	_ = peer.Invoke(ctx, "TrunkRemoveConn", &pb.TrunkUpgradeReq{TrunkId: p.TrunkCfg.Conv, UpgradeId: uint32(id)}, &pb.TrunkUpgradeRsp{})
-	_ = trunk.RemoveConn(id)
-	return nil
+	return trunk.RemoveConn(id)
 }
 
 // AddTrunkConn 向已运行的 trunk_kcp 动态加入一条新的底层连接。
@@ -461,7 +454,9 @@ func (p *SocksCli) handleSocks(ctx context.Context, rc net.Conn) {
 		log.Ctx(ctx).Debug().Err(err).Msg("socks handshake failed")
 		return
 	}
-	_ = p.openProxy(ctx, rc, addr.String(), nil)
+	if err := p.openProxy(ctx, rc, addr.String(), nil); err != nil {
+		log.Ctx(ctx).Warn().Err(err).Str("addr", addr.String()).Msg("open SOCKS proxy failed")
+	}
 }
 
 // RunHTTPProxy 启动 HTTP CONNECT 监听。
@@ -491,8 +486,12 @@ func (p *SocksCli) handleHTTP(ctx context.Context, inConn net.Conn) {
 		// 普通 HTTP 代理也需要目标地址；这里只保留 CONNECT 的清晰实现。
 		return
 	}
-	req.HTTPSReply()
-	_ = p.openProxy(ctx, inConn, req.Host, nil)
+	if err := req.HTTPSReply(); err != nil {
+		return
+	}
+	if err := p.openProxy(ctx, inConn, req.Host, nil); err != nil {
+		log.Ctx(ctx).Warn().Err(err).Str("addr", req.Host).Msg("open HTTP proxy failed")
+	}
 }
 
 func (p *SocksCli) openProxy(ctx context.Context, local net.Conn, addr string, head []byte) error {
@@ -506,11 +505,11 @@ func (p *SocksCli) openProxy(ctx context.Context, local net.Conn, addr string, h
 	if maxV <= 0 {
 		maxV = 256
 	}
-	id := int(p.connID.Add(1))%maxV + 1
-	vconn := trunk.GetConn(uint16(id))
-	if vconn == nil {
-		return errors.New("get virtual conn failed")
+	vconn, err := trunk.OpenConn(maxV)
+	if err != nil {
+		return err
 	}
+	defer vconn.Close()
 	if err := WriteOpenHeader(vconn, addr, head); err != nil {
 		_ = vconn.Close()
 		return err

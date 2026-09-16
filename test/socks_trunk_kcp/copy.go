@@ -19,10 +19,9 @@ func relay(ctx context.Context, left, right io.ReadWriteCloser) {
 
 	cp := func(dst, src io.ReadWriteCloser) {
 		defer wg.Done()
-		// _, _ = io.Copy(dst, src) // TODO: 使用带大缓存的Copy 函数
-		// _ = dst.Close()
-		// _ = src.Close()
 		Copy(ctx, dst, src)
+		_ = dst.Close()
+		_ = src.Close()
 	}
 	go cp(left, right)
 	go cp(right, left)
@@ -37,6 +36,7 @@ func relay(ctx context.Context, left, right io.ReadWriteCloser) {
 	case <-ctx.Done():
 		_ = left.Close()
 		_ = right.Close()
+		<-done
 	}
 }
 
@@ -53,8 +53,10 @@ func Copy(ctx context.Context, dst io.WriteCloser, src io.ReadCloser) (written i
 	defer cancel()
 
 	ch := make(chan []byte, 1024)
+	readerDone := make(chan struct{})
 
 	go func() {
+		defer close(readerDone)
 		defer func() {
 			if e := recover(); e != nil {
 				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("Copy reader")
@@ -89,6 +91,8 @@ func Copy(ctx context.Context, dst io.WriteCloser, src io.ReadCloser) (written i
 			err = errors.Errorf("recover : %v", e)
 		}
 		cancel()
+		_ = src.Close()
+		<-readerDone
 
 		// // 唤醒可能阻塞在 src.Read 的 reader 协程
 		// if dl, ok := src.(interface{ SetDeadline(t time.Time) error }); ok {

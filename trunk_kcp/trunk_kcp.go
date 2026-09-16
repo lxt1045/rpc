@@ -64,9 +64,10 @@ type TrunkKCP struct {
 	recvChan chan []byte // 网络接收 -> KCP 输入
 
 	// 虚拟连接管理
-	conns       []*VirtualConn
-	connLock    sync.RWMutex
-	onNewConnFn OnNewConnFunc // 新连接回调函数
+	conns         []*VirtualConn
+	connLock      sync.RWMutex
+	onNewConnFn   OnNewConnFunc // 新连接回调函数
+	nextVirtualID int
 
 	// 写索引（轮询发送）
 	wIdx atomic.Int32
@@ -271,22 +272,33 @@ func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 
 // demuxData 根据 ConnID 将数据分发到对应的虚拟连接
 func (t *TrunkKCP) demuxData(header Header, data []byte) {
+	if header.Cmd != 0 {
+		// A close acknowledges the existing stream, never a replacement stream.
+		t.connLock.Lock()
+		if header.ConnID > math.MaxInt16 || t.closed.Load() {
+			t.connLock.Unlock()
+			return
+		}
+		var conn *VirtualConn
+		if int(header.ConnID) < len(t.conns) {
+			conn = t.conns[header.ConnID]
+		}
+		if conn == nil {
+			conn = t.newConnLocked(header.ConnID, false)
+		}
+		t.connLock.Unlock()
+		conn.handleCmd(header, data)
+		return
+	}
 	conn := t.GetConn(header.ConnID)
 	if conn == nil || conn.closed.Load() {
 		return
 	}
 
-	// 根据 Cmd 类型处理
-	if header.Cmd == 0 {
-		// 普通数据
-		select {
-		case conn.readChan <- data:
-		case <-conn.readDone:
-		case <-t.done:
-		}
-	} else {
-		// 命令处理
-		conn.handleCmd(header, data)
+	select {
+	case conn.readChan <- data:
+	case <-conn.readDone:
+	case <-t.done:
 	}
 }
 
@@ -314,38 +326,59 @@ func (t *TrunkKCP) GetConn(connID uint16) *VirtualConn {
 	if connID > math.MaxInt16 || t.closed.Load() {
 		return nil
 	}
-	t.connLock.RLock()
-	if int(connID) < len(t.conns) && t.conns[connID] != nil {
-		conn := t.conns[connID]
-		t.connLock.RUnlock()
-		return conn
-	}
-	t.connLock.RUnlock()
-
 	t.connLock.Lock()
 	defer t.connLock.Unlock()
 	if t.closed.Load() {
 		return nil
 	}
 
-	// 扩展切片
+	if int(connID) < len(t.conns) {
+		if conn := t.conns[connID]; conn != nil && !conn.reusable() {
+			return conn
+		}
+	}
+	return t.newConnLocked(connID, true)
+}
+
+// OpenConn reserves an unused virtual connection in the range 1..maxConns.
+// Only one side of a trunk should allocate IDs with this method.
+func (t *TrunkKCP) OpenConn(maxConns int) (*VirtualConn, error) {
+	if maxConns <= 0 || maxConns > math.MaxInt16 {
+		return nil, errors.New("invalid virtual connection limit")
+	}
+	t.connLock.Lock()
+	defer t.connLock.Unlock()
+	if t.closed.Load() {
+		return nil, io.ErrClosedPipe
+	}
+	for i := 0; i < maxConns; i++ {
+		t.nextVirtualID = t.nextVirtualID%maxConns + 1
+		id := uint16(t.nextVirtualID)
+		if int(id) < len(t.conns) {
+			if conn := t.conns[id]; conn != nil && !conn.reusable() {
+				continue
+			}
+		}
+		return t.newConnLocked(id, true), nil
+	}
+	return nil, errors.New("virtual connection limit reached")
+}
+
+func (t *TrunkKCP) newConnLocked(connID uint16, notify bool) *VirtualConn {
 	if int(connID) >= len(t.conns) {
 		newConns := make([]*VirtualConn, int(connID)+1)
 		copy(newConns, t.conns)
 		t.conns = newConns
 	}
 
-	if t.conns[connID] == nil {
-		t.conns[connID] = &VirtualConn{
-			TrunkKCP: t,
-			connID:   connID,
-			readChan: make(chan []byte, 64),
-			readDone: make(chan struct{}),
-		}
-		// 调用回调函数
-		if t.onNewConnFn != nil {
-			go t.onNewConnFn(t.conns[connID])
-		}
+	t.conns[connID] = &VirtualConn{
+		TrunkKCP: t,
+		connID:   connID,
+		readChan: make(chan []byte, 64),
+		readDone: make(chan struct{}),
+	}
+	if notify && t.onNewConnFn != nil {
+		go t.onNewConnFn(t.conns[connID])
 	}
 
 	return t.conns[connID]
@@ -422,7 +455,7 @@ func (t *TrunkKCP) VirtualConnCount() int {
 	defer t.connLock.RUnlock()
 	count := 0
 	for _, conn := range t.conns {
-		if conn != nil {
+		if conn != nil && !conn.closed.Load() {
 			count++
 		}
 	}

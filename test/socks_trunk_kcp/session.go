@@ -178,10 +178,10 @@ func (p *SocksSvc) TrunkUpgrade(ctx context.Context, req *pb.TrunkUpgradeReq) (*
 	if sess.trunk != nil {
 		trunk := sess.trunk
 		sess.mu.Unlock()
-		// 检查 trunk 是否健康（有物理连接且有虚拟连接）
+		// An idle trunk is healthy too; refresh its physical connections.
 		connCount := trunk.ConnCount()
 		virtualCount := trunk.VirtualConnCount()
-		if connCount > 0 && virtualCount > 0 {
+		if connCount > 0 {
 			if _, err := trunk.AddConn(upgrade); err != nil {
 				log.Ctx(ctx).Warn().Err(err).Msg("AddConn to existing trunk failed")
 				upgrade.Close()
@@ -309,6 +309,7 @@ func (p *SocksSvc) serveVirtualConn(ctx context.Context, vconn *trunk_kcp.Virtua
 	if vconn == nil {
 		return
 	}
+	defer vconn.Close()
 	msg, err := ReadOpenHeader(vconn)
 	if err != nil {
 		if err != io.EOF {

@@ -23,7 +23,9 @@ type VirtualConn struct {
 	writeLock sync.Mutex
 
 	// 状态
-	closed atomic.Bool
+	closed       atomic.Bool
+	closeSent    atomic.Bool
+	remoteClosed atomic.Bool
 }
 
 var _ io.ReadWriteCloser = &VirtualConn{}
@@ -67,12 +69,12 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 		header.Format(buf)
 		copy(buf[HeaderSize:], chunk)
 
-		if vc.TrunkKCP.closed.Load() {
+		// 发送到 KCP（需要加锁）
+		vc.TrunkKCP.kcpLock.Lock()
+		if vc.closed.Load() || vc.TrunkKCP.closed.Load() {
 			vc.TrunkKCP.kcpLock.Unlock()
 			return totalWritten, io.ErrClosedPipe
 		}
-		// 发送到 KCP（需要加锁）
-		vc.TrunkKCP.kcpLock.Lock()
 		ret := vc.TrunkKCP.kcp.Send(buf)
 		vc.TrunkKCP.kcpLock.Unlock()
 
@@ -140,6 +142,7 @@ func (vc *VirtualConn) Close() error {
 	if ret := vc.kcp.Send(buf); ret < 0 {
 		return errors.Errorf("kcp send failed: %d", ret)
 	}
+	vc.closeSent.Store(true)
 	vc.kcp.Update()
 	return nil
 }
@@ -155,6 +158,14 @@ func (vc *VirtualConn) closeLocal() bool {
 func (vc *VirtualConn) handleCmd(header Header, data []byte) {
 	switch header.Cmd {
 	case CmdCloseConn:
-		vc.closeLocal()
+		// Reply once, even when the application has not closed its end yet.
+		_ = vc.Close()
+		vc.remoteClosed.Store(true)
 	}
+}
+
+func (vc *VirtualConn) reusable() bool {
+	// KCP orders each direction independently. Both close frames must pass
+	// before a new stream can safely reuse this ID without receiving old data.
+	return vc.closeSent.Load() && vc.remoteClosed.Load()
 }

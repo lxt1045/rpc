@@ -210,6 +210,12 @@ func main() {
 
 **返回** / **Returns**: VirtualConn 实例
 
+#### `OpenConn(maxConns int) (*VirtualConn, error)`
+
+在 `1..maxConns` 中原子分配空闲 ID，跳过活跃连接及等待关闭确认的连接；没有空闲 ID 时返回错误。`maxConns` 范围为 1-32767。同一 trunk 仅应由一端使用此接口分配 ID，另一端通过接收回调处理新连接。
+
+虚拟连接在双方交换 `CmdCloseConn` 后可复用，`GetConn` 会为可复用的 ID 创建新实例。双方都需升级到支持关闭确认的版本；报文头格式未变。
+
 #### `Close() error`
 
 关闭 TrunkKCP，包括所有虚拟连接和物理连接。

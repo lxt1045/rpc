@@ -22,9 +22,15 @@ go build ./test/socks_trunk_kcp/cmd/...
 
 ## 动态底层连接
 
-- `trunk_kcp.RemoveConn(id)` / `TrunkRemoveConn` RPC：优雅剔除断开的底层连接
+- `RemoveTrunkConn(id)`：关闭客户端对应的底层连接，服务端通过 EOF 清理同一条连接；两端的物理连接 ID 不保证一致，不能直接跨端使用
 - `trunk_kcp.AddConn(rw)` / `TrunkUpgrade` RPC：自动补充新的底层连接
 - client `MaintainTrunk` 会周期性检查底层连接数量并自动补足
+
+## 虚拟连接回收
+
+客户端从空闲 ID 中分配虚拟连接，双方交换 `CmdCloseConn` 后才允许复用 ID，避免旧数据进入新请求。`max_virtual_conn` 默认 256，限制同时占用（包括等待关闭确认）的 ID 数量，不限制累计请求数；全部占用时新请求会失败并记录日志。
+
+部署本次连接回收修复时，必须同时更新 client 和 server。帧格式不变，但旧版本不会回复关闭确认，混用版本无法正常回收连接。浏览器断开或转发结束时会关闭两端并回收转发协程。
 
 ## 测试
 
@@ -39,6 +45,9 @@ test/socks_trunk_kcp/scripts/local_integration_test.sh
 - `TestNoCallbackBeforeUse`：验证在虚拟连接被使用之前不会预先创建任何 goroutine
 - `auth_test.go`：认证流程测试
 - `protocol_test.go`：地址协议序列化测试
+- `TestHTTPProxyRepeatedConnections`：连续 300 次 HTTP CONNECT，保留活跃 ID 并轮换底层连接，验证回绕后仍可代理
+- `TestRelayClosesBothEnds`：验证浏览器断开及取消上下文后释放两端连接
+- `TestRemovePhysicalConnWithDifferentRemoteID`：验证两端物理连接编号不同时只删除对应连接
 
 ## 代码架构
 
