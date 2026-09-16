@@ -25,6 +25,7 @@ go build ./test/socks_trunk_kcp/cmd/...
 - `RemoveTrunkConn(id)`：关闭客户端对应的底层连接，服务端通过 EOF 清理同一条连接；两端的物理连接 ID 不保证一致，不能直接跨端使用
 - `trunk_kcp.AddConn(rw)` / `TrunkUpgrade` RPC：自动补充新的底层连接
 - client `MaintainTrunk` 会周期性检查底层连接数量并自动补足
+- **空闲连接检测**：client trunk 配置了 60 秒空闲超时检测，如果某条底层连接 60 秒内没有收到数据，会自动断开并创建新连接替换
 
 ## 虚拟连接回收
 

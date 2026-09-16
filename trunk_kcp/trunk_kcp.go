@@ -20,12 +20,18 @@ const KcpMtu = 1400
 // OnNewConnFunc 当解析到一个新的 conn_id 时调用的回调函数
 type OnNewConnFunc func(conn *VirtualConn)
 
+// OnIdleConnFunc 当检测到底层连接空闲超时时调用的回调函数
+// 参数 connID 是空闲连接的 ID
+// 返回新的连接用于替换，如果返回 nil 则只移除旧连接
+type OnIdleConnFunc func(connID int) io.ReadWriteCloser
+
 // TrunkKCP 基于 KCP 协议的链路聚合
 // 将多个网络连接聚合成一个逻辑连接，通过 KCP 提供可靠传输保障
 type activeConn struct {
-	id   int
-	rw   io.ReadWriteCloser
-	stop chan struct{}
+	id           int
+	rw           io.ReadWriteCloser
+	stop         chan struct{}
+	lastRecvTime atomic.Int64 // Unix timestamp in nanoseconds
 }
 
 func (c *activeConn) writeFull(p []byte) (int, error) {
@@ -66,11 +72,15 @@ type TrunkKCP struct {
 	// 虚拟连接管理
 	conns         []*VirtualConn
 	connLock      sync.RWMutex
-	onNewConnFn   OnNewConnFunc // 新连接回调函数
+	onNewConnFn   OnNewConnFunc  // 新连接回调函数
+	onIdleConnFn  OnIdleConnFunc // 连接空闲回调函数
 	nextVirtualID int
 
 	// 写索引（轮询发送）
 	wIdx atomic.Int32
+
+	// 空闲检测配置
+	idleTimeout time.Duration // 连接空闲超时时间，0 表示禁用
 
 	// 控制信号
 	done   chan struct{}
@@ -89,6 +99,7 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 		recvChan:    make(chan []byte, 1024),
 		done:        make(chan struct{}),
 		onNewConnFn: onNewConn,
+		idleTimeout: 0, // 默认禁用空闲检测
 	}
 
 	// 创建 KCP 实例，output 回调写入 sendChan
@@ -118,6 +129,16 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 	return t
 }
 
+// SetIdleTimeout 设置连接空闲超时时间和回调函数
+// idleTimeout: 连接空闲超时时间，例如 60*time.Second
+// onIdleConn: 当检测到连接空闲超时时的回调函数，返回新连接用于替换
+func (t *TrunkKCP) SetIdleTimeout(idleTimeout time.Duration, onIdleConn OnIdleConnFunc) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	t.idleTimeout = idleTimeout
+	t.onIdleConnFn = onIdleConn
+}
+
 // Run 启动 TrunkKCP 的更新协程和输入协程，并启动初始物理连接。
 // 单个物理连接断开不会关闭整个 TrunkKCP；可通过 RemoveConn 剔除，
 // 并通过 AddConn 加入新的物理连接。
@@ -131,6 +152,16 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 		defer t.Close()
 		return t.kcpInputLoop(ctx)
 	})
+
+	// 如果启用了空闲检测，启动检测协程
+	t.connMu.Lock()
+	idleTimeout := t.idleTimeout
+	t.connMu.Unlock()
+	if idleTimeout > 0 {
+		g.Go(func() error {
+			return t.idleCheckLoop(ctx)
+		})
+	}
 
 	for _, rw := range t.rws {
 		if _, err := t.AddConn(rw); err != nil {
@@ -172,6 +203,10 @@ func (t *TrunkKCP) sendLoop(ctx context.Context, ac *activeConn) {
 func (t *TrunkKCP) recvLoop(ctx context.Context, ac *activeConn) {
 	buf := make([]byte, math.MaxUint16)
 	pending := make([]byte, 0, math.MaxUint16)
+
+	// 初始化最后接收时间
+	ac.lastRecvTime.Store(time.Now().UnixNano())
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -184,6 +219,11 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, ac *activeConn) {
 		}
 
 		n, readErr := ac.rw.Read(buf)
+
+		// 只要收到数据就更新最后接收时间
+		if n > 0 {
+			ac.lastRecvTime.Store(time.Now().UnixNano())
+		}
 
 		pending = append(pending, buf[:n]...)
 		for {
@@ -398,6 +438,7 @@ func (t *TrunkKCP) AddConn(rw io.ReadWriteCloser) (int, error) {
 	id := t.nextConnID
 	t.nextConnID++
 	ac := &activeConn{id: id, rw: rw, stop: make(chan struct{})}
+	ac.lastRecvTime.Store(time.Now().UnixNano())
 	t.active[id] = ac
 	ctx := context.Background()
 
@@ -405,6 +446,72 @@ func (t *TrunkKCP) AddConn(rw io.ReadWriteCloser) (int, error) {
 	go t.recvLoop(ctx, ac)
 	return id, nil
 }
+
+// idleCheckLoop 定期检查所有连接的空闲状态
+func (t *TrunkKCP) idleCheckLoop(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Second) // 每10秒检查一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.done:
+			return nil
+		case <-ticker.C:
+			t.checkIdleConns(ctx)
+		}
+	}
+}
+
+// checkIdleConns 检查并处理空闲超时的连接
+func (t *TrunkKCP) checkIdleConns(ctx context.Context) {
+	t.connMu.Lock()
+	idleTimeout := t.idleTimeout
+	onIdleConnFn := t.onIdleConnFn
+	if idleTimeout == 0 {
+		t.connMu.Unlock()
+		return
+	}
+
+	now := time.Now()
+	var idleConns []int
+	for id, ac := range t.active {
+		lastRecv := time.Unix(0, ac.lastRecvTime.Load())
+		if now.Sub(lastRecv) > idleTimeout {
+			idleConns = append(idleConns, id)
+		}
+	}
+	t.connMu.Unlock()
+
+	// 处理空闲连接
+	for _, id := range idleConns {
+		log.Ctx(ctx).Info().Int("conn_id", id).Msg("connection idle timeout detected")
+
+		// 如果有回调函数，调用它获取新连接
+		var newConn io.ReadWriteCloser
+		if onIdleConnFn != nil {
+			newConn = onIdleConnFn(id)
+		}
+
+		// 先移除旧连接
+		if err := t.RemoveConn(id); err != nil {
+			log.Ctx(ctx).Warn().Err(err).Int("conn_id", id).Msg("failed to remove idle connection")
+		}
+
+		// 如果有新连接，添加它
+		if newConn != nil {
+			newID, err := t.AddConn(newConn)
+			if err != nil {
+				log.Ctx(ctx).Warn().Err(err).Msg("failed to add replacement connection")
+				_ = newConn.Close()
+			} else {
+				log.Ctx(ctx).Info().Int("old_conn_id", id).Int("new_conn_id", newID).Msg("idle connection replaced")
+			}
+		}
+	}
+}
+
 
 // RemoveConn 剔除一条物理连接并关闭它。
 func (t *TrunkKCP) RemoveConn(id int) error {

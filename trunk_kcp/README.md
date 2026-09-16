@@ -220,6 +220,44 @@ func main() {
 
 关闭 TrunkKCP，包括所有虚拟连接和物理连接。
 
+#### `SetIdleTimeout(idleTimeout time.Duration, onIdleConn OnIdleConnFunc)`
+
+配置空闲连接检测。当某条物理连接在指定时间内没有收到任何数据时，会调用回调函数获取新连接进行替换。
+
+**参数** / **Parameters**:
+- `idleTimeout`: 空闲超时时间，例如 `60*time.Second`。设置为 0 禁用空闲检测
+- `onIdleConn`: 回调函数，参数为空闲连接的 ID，返回新连接用于替换。返回 `nil` 则只移除旧连接不替换
+
+**使用场景** / **Use Cases**:
+- 自动清理长时间无流量的连接
+- 保持连接池活跃，避免 NAT 超时
+- 仅应在客户端配置，服务端应被动接受连接
+
+**示例** / **Example**:
+```go
+trunk.SetIdleTimeout(60*time.Second, func(connID int) io.ReadWriteCloser {
+    // 创建新连接替换空闲连接
+    newConn, err := createNewConnection()
+    if err != nil {
+        log.Warn("failed to create replacement conn:", err)
+        return nil
+    }
+    return newConn
+})
+```
+
+#### `AddConn(rw io.ReadWriteCloser) (int, error)`
+
+动态添加一条物理连接到运行中的 TrunkKCP。返回该连接的内部 ID。
+
+#### `RemoveConn(id int) error`
+
+移除并关闭指定 ID 的物理连接。如果移除后没有剩余连接，会关闭整个 TrunkKCP。
+
+#### `ConnCount() int`
+
+返回当前活跃的物理连接数量。
+
 ### VirtualConn
 
 #### `Write(p []byte) (n int, err error)`

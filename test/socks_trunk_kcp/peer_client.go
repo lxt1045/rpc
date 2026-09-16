@@ -25,12 +25,6 @@ type Peer struct {
 	rpc.Peer
 }
 
-// connInfo 记录连接的ID和创建时间
-type connInfo struct {
-	id        int
-	createdAt time.Time
-}
-
 type SocksCli struct {
 	Name     string
 	PeerAddr string
@@ -39,11 +33,9 @@ type SocksCli struct {
 	TrunkCfg TrunkKCPConfig
 	ChPeer   chan *Peer
 
-	trunk       *trunk_kcp.TrunkKCP
-	trunkPeer   *Peer
-	connInfos   []connInfo // 记录所有活跃连接的信息
-	stopRefresh chan struct{}
-	mu          sync.Mutex
+	trunk     *trunk_kcp.TrunkKCP
+	trunkPeer *Peer
+	mu        sync.Mutex
 }
 
 var _ pb.SocksCliServer = &SocksCli{}
@@ -135,11 +127,6 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 	if p.trunk != nil {
 		oldTrunk := p.trunk
 		p.trunk = nil
-		// 停止连接刷新
-		if p.stopRefresh != nil {
-			close(p.stopRefresh)
-			p.stopRefresh = nil
-		}
 		p.mu.Unlock()
 		log.Ctx(ctx).Info().Msg("closing old client trunk before creating new one")
 		_ = oldTrunk.Close()
@@ -171,22 +158,20 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 
 	trunk := trunk_kcp.NewTrunkKCP(conv, nil, conns...)
 
-	// 记录初始连接信息
-	now := time.Now()
-	connInfos := make([]connInfo, n)
-	for i := 0; i < n; i++ {
-		connInfos[i] = connInfo{
-			id:        i,
-			createdAt: now,
+	// 配置空闲连接检测：1分钟未收到数据则替换
+	trunk.SetIdleTimeout(60*time.Second, func(connID int) io.ReadWriteCloser {
+		// 创建新连接替换空闲的连接
+		conns, err := p.TrunkConn(ctx, conv, 1)
+		if err != nil {
+			log.Ctx(ctx).Warn().Err(err).Msg("failed to create replacement conn for idle detection")
+			return nil
 		}
-	}
+		return conns[0]
+	})
 
-	stopRefresh := make(chan struct{})
 	p.mu.Lock()
 	p.trunk = trunk
 	p.trunkPeer = trunkPeer
-	p.connInfos = connInfos
-	p.stopRefresh = stopRefresh
 	p.mu.Unlock()
 
 	// 启动trunk并监控其状态
@@ -198,11 +183,6 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 		p.mu.Lock()
 		if p.trunk == trunk {
 			p.trunk = nil
-			// 停止连接刷新
-			if p.stopRefresh != nil {
-				close(p.stopRefresh)
-				p.stopRefresh = nil
-			}
 			// 将控制连接放回，让它继续被其他地方使用或被心跳检测关闭
 			if p.trunkPeer == trunkPeer && !trunkPeer.IsClosed() {
 				select {
@@ -212,7 +192,6 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 				}
 			}
 			p.trunkPeer = nil
-			p.connInfos = nil
 		}
 		p.mu.Unlock()
 
@@ -226,93 +205,6 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 		}
 	}()
 
-	// 启动定期刷新连接的goroutine
-	go p.refreshConnLoop(ctx, stopRefresh)
-
-	return nil
-}
-
-// refreshConnLoop 定期刷新连接：每隔10秒删除最老的一条连接，同时加入一条新连接
-func (p *SocksCli) refreshConnLoop(ctx context.Context, stopRefresh chan struct{}) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-stopRefresh:
-			return
-		case <-ticker.C:
-			if err := p.refreshOldestConn(ctx); err != nil {
-				log.Ctx(ctx).Warn().Err(err).Msg("failed to refresh oldest connection")
-			}
-		}
-	}
-}
-
-// refreshOldestConn 删除最老的连接并添加一条新连接
-func (p *SocksCli) refreshOldestConn(ctx context.Context) error {
-	p.mu.Lock()
-	trunk := p.trunk
-	if trunk == nil || len(p.connInfos) == 0 {
-		p.mu.Unlock()
-		return errors.New("trunk not ready or no connections")
-	}
-
-	// 找到最老的连接
-	oldestIdx := 0
-	oldestTime := p.connInfos[0].createdAt
-	for i := 1; i < len(p.connInfos); i++ {
-		if p.connInfos[i].createdAt.Before(oldestTime) {
-			oldestIdx = i
-			oldestTime = p.connInfos[i].createdAt
-		}
-	}
-	oldestID := p.connInfos[oldestIdx].id
-	p.mu.Unlock()
-
-	log.Ctx(ctx).Info().Int("conn_id", oldestID).Time("created_at", oldestTime).Msg("refreshing oldest connection")
-
-	// 先创建新连接
-	conns, err := p.TrunkConn(ctx, p.TrunkCfg.Conv, 1)
-	if err != nil {
-		return errors.New("failed to create new connection: " + err.Error())
-	}
-	newConn := conns[0]
-
-	// 添加新连接到trunk
-	newID, err := trunk.AddConn(newConn)
-	if err != nil {
-		_ = newConn.Close()
-		return errors.New("failed to add new connection: " + err.Error())
-	}
-
-	// 添加新连接信息到列表
-	p.mu.Lock()
-	p.connInfos = append(p.connInfos, connInfo{
-		id:        newID,
-		createdAt: time.Now(),
-	})
-	p.mu.Unlock()
-
-	// 删除旧连接
-	if err := p.RemoveTrunkConn(ctx, oldestID); err != nil {
-		log.Ctx(ctx).Warn().Err(err).Int("old_conn_id", oldestID).Msg("failed to remove old connection")
-		// 即使删除失败，新连接也已经添加了，继续更新记录
-	}
-
-	// 从连接信息列表中移除旧连接
-	p.mu.Lock()
-	for i, info := range p.connInfos {
-		if info.id == oldestID {
-			p.connInfos = append(p.connInfos[:i], p.connInfos[i+1:]...)
-			break
-		}
-	}
-	p.mu.Unlock()
-
-	log.Ctx(ctx).Info().Int("old_conn_id", oldestID).Int("new_conn_id", newID).Msg("connection refreshed successfully")
 	return nil
 }
 
