@@ -2,7 +2,6 @@ package trunk_kcp
 
 import (
 	"io"
-	"math"
 	"sync"
 	"sync/atomic"
 
@@ -47,7 +46,7 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 
 	// 由于 Header.Len 是 uint16，单次最大只能发送 65535 - HeaderSize 字节
 	// 对于大数据需要分块发送
-	const maxChunkSize = math.MaxUint16 - HeaderSize
+	const maxChunkSize = 8*1024 - HeaderSize //math.MaxUint16 - HeaderSize
 	totalWritten := 0
 
 	for totalWritten < len(p) {

@@ -112,7 +112,7 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 	// conn.kcp.NoDelay(0, 10, 0, 0) // 默认模式
 	//conn.kcp.NoDelay(0, 10, 0, 1) // 普通模式，关闭流控等
 	//conn.kcp.NoDelay(1, 10, 2, 1) // 启动快速模式
-	t.kcp.NoDelay(1, 10, 2, 1) // 快速模式
+	t.kcp.NoDelay(1, 10, 32, 1)
 
 	return t
 }

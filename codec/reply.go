@@ -117,7 +117,8 @@ func (c *Codec) VerCallResp(ctx context.Context, header Header, bsBody []byte) (
 		return res
 	}()
 	if res.r == nil {
-		log.Ctx(ctx).Error().Caller().Interface("header", header).Msg("drop, res.r is nil")
+		// 响应可能因超时或连接刷新而丢失，记录警告但不影响系统运行
+		log.Ctx(ctx).Warn().Caller().Interface("header", header).Uint32("CallSN", header.CallSN).Msg("drop response, likely timed out or connection was refreshed")
 		return
 	}
 	if header.Ver == VerCallErrResp || header.Ver == VerUpgradeErrResp {
