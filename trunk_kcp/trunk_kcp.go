@@ -32,6 +32,16 @@ type activeConn struct {
 	rw           io.ReadWriteCloser
 	stop         chan struct{}
 	lastRecvTime atomic.Int64 // Unix timestamp in nanoseconds
+	createdAt    time.Time    // 连接创建时间
+
+	// 流量统计
+	sendBytes atomic.Int64 // 发送字节数
+	recvBytes atomic.Int64 // 接收字节数
+
+	// 速率采样
+	lastSampleTime atomic.Int64 // 上次采样时间 (nanoseconds)
+	lastSendBytes  atomic.Int64 // 上次采样时的发送字节数
+	lastRecvBytes  atomic.Int64 // 上次采样时的接收字节数
 }
 
 func (c *activeConn) writeFull(p []byte) (int, error) {
@@ -73,7 +83,7 @@ type TrunkKCP struct {
 	conns         []*VirtualConn
 	connLock      sync.RWMutex
 	onNewConnFn   OnNewConnFunc  // 新连接回调函数
-	onIdleConnFn  OnIdleConnFunc // 连接空闲回调函数
+	onIdleConnFn  OnIdleConnFunc // 连接空闲/慢速回调函数
 	nextVirtualID int
 
 	// 写索引（轮询发送）
@@ -81,6 +91,10 @@ type TrunkKCP struct {
 
 	// 空闲检测配置
 	idleTimeout time.Duration // 连接空闲超时时间，0 表示禁用
+
+	// 速率检测配置
+	slowConnThreshold float64       // 慢速连接阈值（相对于平均速率的比例，例如 0.1 表示 10%）
+	slowConnMinAge    time.Duration // 慢速连接最小存活时间，只检测超过此时间的连接
 
 	// 控制信号
 	done   chan struct{}
@@ -139,6 +153,21 @@ func (t *TrunkKCP) SetIdleTimeout(idleTimeout time.Duration, onIdleConn OnIdleCo
 	t.onIdleConnFn = onIdleConn
 }
 
+// SetSlowConnDetection 设置慢速连接检测参数和回调函数
+// threshold: 慢速连接阈值（相对于平均速率的比例），例如 0.1 表示速率低于平均值的 10% 视为慢速
+// minAge: 只检测创建时间超过此值的连接，例如 30*time.Minute
+// onSlowConn: 当检测到慢速连接时的回调函数，返回新连接用于替换（可以与 onIdleConn 使用同一个回调）
+func (t *TrunkKCP) SetSlowConnDetection(threshold float64, minAge time.Duration, onSlowConn OnIdleConnFunc) {
+	t.connMu.Lock()
+	defer t.connMu.Unlock()
+	t.slowConnThreshold = threshold
+	t.slowConnMinAge = minAge
+	// 使用与空闲检测相同的回调函数类型
+	if onSlowConn != nil {
+		t.onIdleConnFn = onSlowConn
+	}
+}
+
 // Run 启动 TrunkKCP 的更新协程和输入协程，并启动初始物理连接。
 // 单个物理连接断开不会关闭整个 TrunkKCP；可通过 RemoveConn 剔除，
 // 并通过 AddConn 加入新的物理连接。
@@ -156,10 +185,18 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 	// 如果启用了空闲检测，启动检测协程
 	t.connMu.Lock()
 	idleTimeout := t.idleTimeout
+	slowConnThreshold := t.slowConnThreshold
 	t.connMu.Unlock()
 	if idleTimeout > 0 {
 		g.Go(func() error {
 			return t.idleCheckLoop(ctx)
+		})
+	}
+
+	// 如果启用了速率检测，启动速率监控协程
+	if slowConnThreshold > 0 {
+		g.Go(func() error {
+			return t.rateMonitorLoop(ctx)
 		})
 	}
 
@@ -195,6 +232,8 @@ func (t *TrunkKCP) sendLoop(ctx context.Context, ac *activeConn) {
 				t.RemoveConn(ac.id)
 				return
 			}
+			// 统计发送字节数
+			ac.sendBytes.Add(int64(n))
 		}
 	}
 }
@@ -220,9 +259,10 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, ac *activeConn) {
 
 		n, readErr := ac.rw.Read(buf)
 
-		// 只要收到数据就更新最后接收时间
+		// 只要收到数据就更新最后接收时间和统计接收字节数
 		if n > 0 {
 			ac.lastRecvTime.Store(time.Now().UnixNano())
+			ac.recvBytes.Add(int64(n))
 		}
 
 		pending = append(pending, buf[:n]...)
@@ -437,7 +477,12 @@ func (t *TrunkKCP) AddConn(rw io.ReadWriteCloser) (int, error) {
 	}
 	id := t.nextConnID
 	t.nextConnID++
-	ac := &activeConn{id: id, rw: rw, stop: make(chan struct{})}
+	ac := &activeConn{
+		id:        id,
+		rw:        rw,
+		stop:      make(chan struct{}),
+		createdAt: time.Now(),
+	}
 	ac.lastRecvTime.Store(time.Now().UnixNano())
 	t.active[id] = ac
 	ctx := context.Background()
@@ -512,6 +557,191 @@ func (t *TrunkKCP) checkIdleConns(ctx context.Context) {
 	}
 }
 
+// rateMonitorLoop 定期检测连接的传输速率，并关闭速率过低的慢连接
+func (t *TrunkKCP) rateMonitorLoop(ctx context.Context) error {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.done:
+			return nil
+		case <-ticker.C:
+			t.checkSlowConns(ctx)
+		}
+	}
+}
+
+// checkSlowConns 检查并处理速率过低的连接
+func (t *TrunkKCP) checkSlowConns(ctx context.Context) {
+	t.connMu.Lock()
+	slowConnThreshold := t.slowConnThreshold
+	slowConnMinAge := t.slowConnMinAge
+	onIdleConnFn := t.onIdleConnFn
+	if slowConnThreshold <= 0 {
+		t.connMu.Unlock()
+		return
+	}
+
+	// 默认最小存活时间为30分钟
+	if slowConnMinAge == 0 {
+		slowConnMinAge = 30 * time.Minute
+	}
+
+	now := time.Now()
+	var stats []struct {
+		id          int
+		createdAt   time.Time
+		age         time.Duration
+		sendBytes   int64
+		recvBytes   int64
+		sendRate    float64 // bytes/s
+		recvRate    float64 // bytes/s
+		lastSample  int64
+		lastSendCnt int64
+		lastRecvCnt int64
+	}
+
+	// 收集统计信息并计算速率
+	for id, ac := range t.active {
+		age := now.Sub(ac.createdAt)
+		sendBytes := ac.sendBytes.Load()
+		recvBytes := ac.recvBytes.Load()
+
+		// 计算自上次采样以来的增量速率
+		var sendRate, recvRate float64
+		lastSample := ac.lastSampleTime.Load()
+		if lastSample > 0 {
+			interval := float64(now.UnixNano()-lastSample) / 1e9 // 秒
+			if interval > 0 {
+				sendDelta := sendBytes - ac.lastSendBytes.Load()
+				recvDelta := recvBytes - ac.lastRecvBytes.Load()
+				sendRate = float64(sendDelta) / interval
+				recvRate = float64(recvDelta) / interval
+			}
+		}
+
+		// 更新采样点
+		ac.lastSampleTime.Store(now.UnixNano())
+		ac.lastSendBytes.Store(sendBytes)
+		ac.lastRecvBytes.Store(recvBytes)
+
+		stats = append(stats, struct {
+			id          int
+			createdAt   time.Time
+			age         time.Duration
+			sendBytes   int64
+			recvBytes   int64
+			sendRate    float64
+			recvRate    float64
+			lastSample  int64
+			lastSendCnt int64
+			lastRecvCnt int64
+		}{
+			id:          id,
+			createdAt:   ac.createdAt,
+			age:         age,
+			sendBytes:   sendBytes,
+			recvBytes:   recvBytes,
+			sendRate:    sendRate,
+			recvRate:    recvRate,
+			lastSample:  lastSample,
+			lastSendCnt: ac.lastSendBytes.Load(),
+			lastRecvCnt: ac.lastRecvBytes.Load(),
+		})
+	}
+	t.connMu.Unlock()
+
+	if len(stats) == 0 {
+		return
+	}
+
+	// 计算平均速率（只计算有数据传输的连接）
+	var totalSendRate, totalRecvRate float64
+	var sendCount, recvCount int
+	for _, s := range stats {
+		if s.sendRate > 0 {
+			totalSendRate += s.sendRate
+			sendCount++
+		}
+		if s.recvRate > 0 {
+			totalRecvRate += s.recvRate
+			recvCount++
+		}
+	}
+
+	avgSendRate := float64(0)
+	avgRecvRate := float64(0)
+	if sendCount > 0 {
+		avgSendRate = totalSendRate / float64(sendCount)
+	}
+	if recvCount > 0 {
+		avgRecvRate = totalRecvRate / float64(recvCount)
+	}
+
+	// 打印速率统计
+	for _, s := range stats {
+		log.Ctx(ctx).Info().
+			Int("conn_id", s.id).
+			Dur("age", s.age).
+			Int64("send_bytes", s.sendBytes).
+			Int64("recv_bytes", s.recvBytes).
+			Float64("send_rate_bps", s.sendRate).
+			Float64("recv_rate_bps", s.recvRate).
+			Float64("avg_send_rate_bps", avgSendRate).
+			Float64("avg_recv_rate_bps", avgRecvRate).
+			Msg("conn rate stats")
+	}
+
+	// 检查并关闭慢连接
+	for _, s := range stats {
+		// 只检查创建时间超过指定时间的连接
+		if s.age < slowConnMinAge {
+			continue
+		}
+
+		// 检查是否有任一方向速率低于平均值的指定阈值
+		slowSend := avgSendRate > 0 && s.sendRate < avgSendRate*slowConnThreshold
+		slowRecv := avgRecvRate > 0 && s.recvRate < avgRecvRate*slowConnThreshold
+
+		if slowSend || slowRecv {
+			log.Ctx(ctx).Warn().
+				Int("conn_id", s.id).
+				Dur("age", s.age).
+				Float64("send_rate", s.sendRate).
+				Float64("recv_rate", s.recvRate).
+				Float64("avg_send_rate", avgSendRate).
+				Float64("avg_recv_rate", avgRecvRate).
+				Bool("slow_send", slowSend).
+				Bool("slow_recv", slowRecv).
+				Msg("slow connection detected, replacing")
+
+			// 如果有回调函数，调用它获取新连接
+			var newConn io.ReadWriteCloser
+			if onIdleConnFn != nil {
+				newConn = onIdleConnFn(s.id)
+			}
+
+			// 先移除旧连接
+			if err := t.RemoveConn(s.id); err != nil {
+				log.Ctx(ctx).Warn().Err(err).Int("conn_id", s.id).Msg("failed to remove slow connection")
+			}
+
+			// 如果有新连接，添加它
+			if newConn != nil {
+				newID, err := t.AddConn(newConn)
+				if err != nil {
+					log.Ctx(ctx).Warn().Err(err).Msg("failed to add replacement connection")
+					_ = newConn.Close()
+				} else {
+					log.Ctx(ctx).Info().Int("old_conn_id", s.id).Int("new_conn_id", newID).Msg("slow connection replaced")
+				}
+			}
+		}
+	}
+}
 
 // RemoveConn 剔除一条物理连接并关闭它。
 func (t *TrunkKCP) RemoveConn(id int) error {

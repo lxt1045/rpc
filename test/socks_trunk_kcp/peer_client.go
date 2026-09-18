@@ -169,6 +169,17 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 		return conns[0]
 	})
 
+	// 配置慢速连接检测：每30秒检测一次，连接创建超过30分钟且速率低于平均值的10%则替换
+	trunk.SetSlowConnDetection(0.1, 30*time.Minute, func(connID int) io.ReadWriteCloser {
+		// 创建新连接替换慢速连接
+		conns, err := p.TrunkConn(ctx, conv, 1)
+		if err != nil {
+			log.Ctx(ctx).Warn().Err(err).Msg("failed to create replacement conn for slow connection detection")
+			return nil
+		}
+		return conns[0]
+	})
+
 	p.mu.Lock()
 	p.trunk = trunk
 	p.trunkPeer = trunkPeer

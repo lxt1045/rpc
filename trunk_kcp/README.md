@@ -246,6 +246,64 @@ trunk.SetIdleTimeout(60*time.Second, func(connID int) io.ReadWriteCloser {
 })
 ```
 
+#### `SetSlowConnDetection(threshold float64, minAge time.Duration, onSlowConn OnIdleConnFunc)`
+
+配置慢速连接检测。当某条物理连接创建时间超过 `minAge` 且传输速率（发送或接收）低于所有连接平均速率的 `threshold` 倍时，会调用回调函数获取新连接进行替换。
+
+**参数** / **Parameters**:
+- `threshold`: 慢速连接阈值，相对于平均速率的比例。例如 `0.1` 表示速率低于平均值的 10% 视为慢速
+- `minAge`: 只检测创建时间超过此值的连接，避免误判新建立的连接。例如 `30*time.Minute`
+- `onSlowConn`: 回调函数，参数为慢速连接的 ID，返回新连接用于替换。返回 `nil` 则只移除旧连接不替换
+
+**使用场景** / **Use Cases**:
+- 自动替换性能下降的连接
+- 识别并剔除网络质量差的路径
+- 保持连接池的高吞吐量
+- 仅应在客户端配置，服务端应被动接受连接
+
+**检测机制** / **Detection Mechanism**:
+- 每 30 秒采样一次所有连接的传输速率
+- 计算每条连接的发送速率和接收速率（字节/秒）
+- 计算所有连接的平均发送速率和平均接收速率
+- 打印每条连接的速率统计到日志
+- 对于创建时间超过 `minAge` 的连接，如果任一方向的速率低于平均速率的 `threshold` 倍，则替换
+
+**示例** / **Example**:
+```go
+// 连接创建超过30分钟且速率低于平均值的10%则替换
+trunk.SetSlowConnDetection(0.1, 30*time.Minute, func(connID int) io.ReadWriteCloser {
+    newConn, err := createNewConnection()
+    if err != nil {
+        log.Warn("failed to create replacement conn:", err)
+        return nil
+    }
+    return newConn
+})
+```
+
+**速率统计日志** / **Rate Statistics Logs**:
+
+每 30 秒输出每条连接的统计信息：
+```json
+{"level":"info","conn_id":5,"age":"35m12s","send_bytes":1048576,"recv_bytes":2097152,
+ "send_rate_bps":34952.5,"recv_rate_bps":69905.1,"avg_send_rate_bps":52428.8,
+ "avg_recv_rate_bps":104857.6,"message":"conn rate stats"}
+```
+
+检测到慢速连接时输出警告：
+```json
+{"level":"warn","conn_id":5,"age":"35m12s","send_rate":3495.2,"recv_rate":6990.5,
+ "avg_send_rate":52428.8,"avg_recv_rate":104857.6,"slow_send":true,"slow_recv":true,
+ "message":"slow connection detected, replacing"}
+```
+
+**注意事项** / **Notes**:
+- 空闲检测和慢速检测可以同时启用，互不干扰
+- 空闲检测基于接收时间，慢速检测基于双向传输速率
+- 慢速检测只针对创建时间超过 `minAge` 的连接，避免误判
+- 当连接数较少（1-2 条）时，平均速率计算可能不准确，建议至少保持 3 条以上连接
+- 速率统计每 30 秒采样一次，计算的是最近 30 秒的平均速率
+
 #### `AddConn(rw io.ReadWriteCloser) (int, error)`
 
 动态添加一条物理连接到运行中的 TrunkKCP。返回该连接的内部 ID。
