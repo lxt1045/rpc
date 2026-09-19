@@ -554,11 +554,17 @@ func (p *SocksCli) connect(ctx context.Context, tgtAddr string, rc net.Conn) (er
 	}()
 
 	defer func() {
-		// // cancel()
-		// time.Sleep(time.Second * 3)
-		// rc.SetDeadline(time.Now()) // 唤醒因读写conn而阻塞的协程
-		// rc.Close()
-		// upgrade.Close()
+		if e := recover(); e != nil {
+			log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("connect")
+		}
+		// 主 Copy 结束时，对端残留数据可能还在 upgrade->rc 方向上传输，
+		// 延迟 closeGrace 再统一回收，避免截断响应；
+		// 到期必须全部关闭，否则 TLS 连接 / peer / goroutine 会永久泄漏
+		// （见 peer_service.go 中 closeGrace 注释）。
+		time.Sleep(closeGrace)
+		rc.Close()
+		upgrade.Close()
+		peer.Close(context.TODO())
 	}()
 	Copy(ctx, upgrade, rc)
 	// io.Copy(upgrade, rc)

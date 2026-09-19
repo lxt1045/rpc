@@ -38,3 +38,4 @@ test/*/client/client
 test/*/proxy/proxy
 test/socks/client_http_local/client_http_local
 test/cert/cert_test2.go
+test/socks_trunk_kcp/cmd/socks-trunk-kcp-server/socks-trunk-kcp-server

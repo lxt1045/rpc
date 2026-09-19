@@ -15,6 +15,13 @@ import (
 	"github.com/lxt1045/utils/log"
 )
 
+// closeGrace 是连接 teardown 时的宽限时间：一端 EOF 后不立即硬关，
+// 给反方向残留数据留出发送时间（避免截断响应），到期再强制回收，
+// 防止 TLS 连接 / 目标连接 / goroutine 永久泄漏。
+// （泄漏长期累积曾耗尽服务端 fd / 网关会话表，导致新连接 SYN 被静默丢弃、
+// client 建连成功率骤降，重启后才恢复。）
+const closeGrace = time.Second * 10
+
 // isBenignCloseErr 判断 err 是否属于 "对端/本端正常关闭连接" 的情况
 // 这类错误在代理场景（浏览器主动关 tab、keep-alive 过期、RST 等）非常常见，
 // 不应按 error 级别打印。
@@ -258,11 +265,16 @@ func (p *SocksSvc) ConnUpgrade(ctx context.Context, req *pb.ConnUpgradeReq) (res
 			if e := recover(); e != nil {
 				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("ConnUpgrade upgrade->rc")
 			}
-			//rc.SetDeadline(time.Now())
-			//rc.Close()
-			//upgrade.Close()
+			// 本方向结束后，目标端残留数据可能还在另一方向（rc->upgrade）上传输，
+			// 延迟 closeGrace 再强制关闭，既避免截断响应，又保证 rc 最终回收，
+			// 防止 rc 与 goroutine 永久泄漏（见 closeGrace 注释）。
+			time.Sleep(closeGrace)
+			rc.SetDeadline(time.Now()) // 唤醒另一方向在 rc 上阻塞的读
+			rc.Close()
+			upgrade.Close()
 		}()
 		Copy(ctx, rc, upgrade)
+		io.Copy()
 	}()
 
 	return &pb.ConnUpgradeRsp{}, nil
@@ -354,6 +366,14 @@ func Copy(ctx context.Context, dst io.WriteCloser, src io.ReadCloser) (written i
 					// 不能直接直接调用 conn.Close()，会发送RST 直接断开tcp 链接
 					tcpConn.CloseWrite()
 					log.Ctx(ctx).Info().Caller().Str("local", tcpConn.LocalAddr().String()).Str("remote", tcpConn.RemoteAddr().String()).Msg("Copy CloseWrite, Send FIN")
+				} else {
+					// dst 不支持半关闭（如 codec.Upgrade 包装的 TLS 连接）：
+					// 必须延迟 Close 把 EOF 传播给对端，否则对端永远收不到关闭信号，
+					// 整条代理链路的连接和 goroutine 会永久泄漏（见 closeGrace 注释）。
+					time.AfterFunc(closeGrace, func() {
+						dst.Close()
+						log.Ctx(ctx).Info().Caller().Msg("Copy delayed close dst")
+					})
 				}
 				return
 			}
