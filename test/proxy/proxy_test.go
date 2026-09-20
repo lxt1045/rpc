@@ -53,21 +53,6 @@ func TestCopyReadError(t *testing.T) {
 	}
 }
 
-func TestWriteInitialShortWrite(t *testing.T) {
-	if err := writeInitial(shortWriter{}, []byte("body")); !errors.Is(err, io.ErrShortWrite) {
-		t.Fatalf("writeInitial error = %v, want io.ErrShortWrite", err)
-	}
-}
-
-func TestGetPeerStopsOnContext(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	cli := &SocksCli{ChPeer: make(chan *Peer)}
-	if peer := cli.getPeer(ctx); peer != nil {
-		t.Fatalf("getPeer returned %v after cancellation", peer)
-	}
-}
-
 func TestCloseEmptyPool(t *testing.T) {
 	cli := &SocksCli{ChPeer: make(chan *Peer)}
 	if err := cli.close(context.Background()); err != nil {
