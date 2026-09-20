@@ -68,6 +68,7 @@ func main() {
 		}
 	}
 	socks.NormalizeTrunkKCPConfig(&conf.TrunkKCP)
+	socks.SetServerTrunkConfig(conf.TrunkKCP)
 	if err := socks.InitServerSecurity(token, conf.MaxClients, conf.TrunkKCP.Conv, conf.TrunkKCP.MaxVirtualConn); err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return

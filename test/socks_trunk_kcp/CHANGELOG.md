@@ -1,5 +1,38 @@
 # Changelog - socks_trunk_kcp
 
+## 2026-09-20 - KCP NoDelay 参数配置化 + 线上流量放大问题结论
+
+### 背景
+
+c/s 建立连接后单浏览器下载，网卡占用 ~30Mbps 但浏览器仅 ~1.3MB/s（线上字节 ≈
+有效载荷 × 2.9）。实测定位：物理连接为 TLS/TCP（可靠流）时，库默认
+`NoDelay(1,10,32,1)`（minRTO=30ms）使 KCP 因延迟抖动大量伪重传（恶劣链路下
+重复段占比达 45%），放大线上流量并压垮有效吞吐。完整数据与机制分析见
+README「线上流量放大问题（KCP over TCP 的伪重传）」一节。
+
+### 改进
+
+- `trunk_kcp.TrunkKCP` 新增 `SetNoDelay(nodelay, interval, resend, nc)`，负数保持当前值。
+- `TrunkKCPConfig` 新增 `kcp_nodelay` / `kcp_interval` / `kcp_resend` / `kcp_nc`
+  四个可选项（`*int`，nil 保持库默认 `(1,10,32,1)`），配套
+  `NoDelayParam()` / `ApplyKCPParam()` 辅助方法。
+- 客户端 `InitTrunk`、服务端 `TrunkStart` 均在建 trunk 时应用配置（两端需一致）；
+  服务端由 `cmd` main 通过新增的 `SetServerTrunkConfig` 注入。
+- `default.yml` 增加注释示例：TCP/TLS 底层推荐 `kcp_nodelay: 0, kcp_interval: 20~40,
+  kcp_resend: 0, kcp_nc: 1`（minRTO 回到 100ms，实测线上放大 1.88x → 1.54x）。
+
+### 代码变更
+
+- `trunk_kcp/trunk_kcp.go`：`SetNoDelay` 方法
+- `test/socks_trunk_kcp/config.go`：4 个配置项 + `NoDelayParam` / `ApplyKCPParam`
+- `test/socks_trunk_kcp/peer_client.go`：client 侧应用
+- `test/socks_trunk_kcp/session.go`：server 侧存储与应用
+- `test/socks_trunk_kcp/cmd/socks-trunk-kcp-server/main.go`：注入配置
+- 测试：`trunk_kcp/lifecycle_test.go`（TestSetNoDelay/TestSetNoDelayDataPath）、
+  `protocol_test.go`（TestNoDelayParam）
+- 诊断测试：`trunk_kcp/wire_amplification_test.go`（KCP 段级线上流量计数）
+
+
 ## 2026-09-15 - 按需创建虚拟连接优化
 
 ### 背景

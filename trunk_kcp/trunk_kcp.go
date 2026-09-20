@@ -143,6 +143,25 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 	return t
 }
 
+// SetNoDelay 调整 KCP 的重传/流控行为，参数语义同 kcp.KCP.NoDelay：
+//   - nodelay: 是否启用 nodelay 模式（0 时最小 RTO=100ms，1 时最小 RTO=30ms）
+//   - interval: KCP 内部处理时钟（ms，最小 10）
+//   - resend: 快速重传阈值（0 表示关闭快速重传）
+//   - nc: 是否关闭拥塞控制（1 关闭 / 0 开启）
+//
+// 传负数表示保持当前值不变。两端应使用相同的参数。
+// 应在 NewTrunkKCP 之后、跑流量之前调用。
+//
+// 注意：当底层物理连接是 TCP/TLS 等可靠流时，KCP 的 ARQ 与 TCP 可靠性语义
+// 重叠，nodelay=1（minRTO=30ms）会因延迟抖动产生大量伪重传，线上流量可被
+// 放大 2~3 倍；此时建议 nodelay=0, interval=20~40, resend=0, nc=1。
+// 详见 test/socks_trunk_kcp/README.md 的"线上流量放大"一节。
+func (t *TrunkKCP) SetNoDelay(nodelay, interval, resend, nc int) {
+	t.kcpLock.Lock()
+	defer t.kcpLock.Unlock()
+	t.kcp.NoDelay(nodelay, interval, resend, nc)
+}
+
 // SetIdleTimeout 设置连接空闲超时时间和回调函数
 // idleTimeout: 连接空闲超时时间，例如 60*time.Second
 // onIdleConn: 当检测到连接空闲超时时的回调函数，返回新连接用于替换

@@ -157,6 +157,8 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 	}
 
 	trunk := trunk_kcp.NewTrunkKCP(conv, nil, conns...)
+	// 应用配置的 KCP NoDelay 参数（需与服务端一致，见 default.yml 注释）
+	p.TrunkCfg.ApplyKCPParam(trunk)
 
 	// 配置空闲连接检测：1分钟未收到数据则替换
 	trunk.SetIdleTimeout(60*time.Second, func(connID int) io.ReadWriteCloser {

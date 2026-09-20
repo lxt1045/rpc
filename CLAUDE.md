@@ -21,13 +21,15 @@ this file used to warn about are gone). Favor explicit package sets if you are o
 library and want to skip the example builds:
 
 ```bash
-go build . ./base/... ./codec/... ./conn/... ./socket/... ./trunk/...   # library only
-go build ./...                                                          # everything
-go vet .                                                                # compiles root tests too
+go build . ./base/... ./codec/... ./conn/... ./socket/... ./trunk/... ./trunk_kcp/...   # library only
+go build ./...                                                                        # everything
+go vet .                                                                              # compiles root tests too
 ```
 
-Tests live in the root package, `codec`-adjacent helpers, `trunk`, and `socket`. Run a single one
-by name:
+The module targets Go 1.26. Tests live in the root package (`*_test.go`, with the network-dependent
+ones split into `rpc_conn_test.go`, `rpc_udp_test.go`, `rpc_quic_test.go`,
+`rpc_quic_socket_test.go`, `rpc_kcp_test.go`, `read_timeout_test.go`), plus `codec`, `trunk`,
+`trunk_kcp`, `socket`, and some `test/*` examples. Run a single one by name:
 
 ```bash
 go test -run '^TestPipe$' -count=1 -timeout 60s .
@@ -36,30 +38,46 @@ go test -run '^TestTrunk$' -count=1 ./trunk
 go test -run '^BenchmarkMethod$' -bench . -run '^$' .
 ```
 
-`go test .` as a whole does **not** pass. Reliable, offline, and safe to use when validating a change:
+`go test .` as a whole does **not** pass. Verified reliable, offline, and safe anchors (run
+together in one command if you like):
 `TestCall`, `TestPipe`, `TestPipeStream`, `TestClient`, `TestClientEm`, `TestMethod`,
-`TestTimeoutConn`, `TestIps`, `TestCmp`, and in `trunk`, `TestUint16` and `TestTrunk`. These run over
-`NewFakeConnPipe()` (`test_service_base.go`) or loopback and need no certs. `TestPipe`/`TestPipeStream`
-are the useful ones for protocol work — they wire a client and service over a fully in-memory pipe.
+`TestTimeoutConn`, `TestIps`, `TestCmp` (`TestPassword` is a trivial print, not a real check).
+These run over `NewFakeConnPipe()` (`test_service_base.go`) or loopback and need no certs.
+`TestPipe`/`TestPipeStream` are the useful ones for protocol work — they wire a client and
+service over a fully in-memory pipe.
+
+Whole-package suites that pass offline (verified on the current tree):
+
+- `go test ./codec` — three regression tests around `writeFull` and close-frame handling.
+- `go test ./trunk` — **fully green, including `TestTrunk0`** and the `TestReview*` /
+  `TestTransport*` regression tests.
+- `go test ./test/proxy ./test/socks_trunk ./test/socks_trunk_kcp` — real unit tests now live in
+  these examples (config/session/auth/protocol/relay/proxy lifecycle).
+- `go test ./trunk_kcp` — all pass **except** `TestReviewHeaderID/ParseHeader2`. That subtest
+  exercises `Header.Format2`/`ParseHeader2`, an experimental branch-free header codec pair used
+  only by that test and its benchmark — production code uses `Format`/`ParseHeader`/`ReadPack`.
+  `Format2` computes its command-bit mask with a broken shift expression and `ParseHeader2` reads
+  the flag after masking it away, so the pair disagrees on command frames. Known-broken
+  experiment, not a production-path bug; fix or delete it before trusting the benchmark numbers.
 
 Flaky or environment-dependent (do not use them as your anchor):
 
-- `TestConn` is a raw TCP echo loop (not the RPC library at all) that opens 100 loopback
-  connections; the server sleeps a random 10–1000 ms per request and the client uses a 1 s read
-  deadline, so it can hang past any timeout. Treat it as timing-sensitive, not green.
-- `TestUDPConn` binds fixed port 18081 and dies on `use of closed network connection` if a stale
-  listener is still alive or a second test run overlaps.
+- `TestConn` (`rpc_conn_test.go`) is a raw TCP echo loop (not the RPC library at all) that opens
+  100 loopback connections; the server sleeps a random 10–1000 ms per request and the client uses
+  a 1 s read deadline, so it can hang past any timeout. Treat it as timing-sensitive, not green.
+- `TestUDPConn` / `TestUDPConnSvc` / `TestUDPConnCli` (`rpc_udp_test.go`) bind fixed port 18081
+  and die on `use of closed network connection` if a stale listener is still alive or a second
+  test run overlaps.
 - `TestQuic` / `TestQuicSocket` die on `timeout: no recent network activity` during the QUIC
   handshake (`TestQuic` also prints a kernel UDP-buffer-size warning first). Bounded to ~6–30 s.
 - `TestKCPConn` gets further — the service side receives and dispatches `SayHello`, then the client
-  reports `resp timeout` after ~30s. `trunk.TestTrunk0` also fails.
+  reports `resp timeout` after ~30s.
+- `socket.TestListen` is a manual probe with an infinite `Accept` loop — it never returns, so
+  `go test ./socket` always hangs until the timeout kills it. Run `socket.TestPipe` /
+  `socket.TestConnect` by name instead (both bind fixed port 1234; don't run two at once).
 
 Several tests call `log.Fatal` on failure, which kills the whole test binary — so one broken network
 test discards the results of everything scheduled after it. Always narrow with `-run`.
-
-The `test/` tree is `main` packages and examples, not tests. Build or run one example at a time;
-each reads certs from its embed-relative `filesystem/static/ca/` and fails at runtime on a fresh
-clone, so don't treat a failed example run as a regression in the library.
 
 ## Dependencies
 
@@ -195,7 +213,8 @@ Key differences from `trunk`:
 
 Usage: `trunk := trunk_kcp.NewTrunkKCP(conv, conn1, conn2, ...); go trunk.Run(ctx); vconn :=
 trunk.GetConn(connID)`. See `trunk_kcp/README.md` for detailed API and tuning parameters. The
-`test/socks_trunk_kcp` example demonstrates it in action. Test with `go test ./trunk_kcp -v`.
+`test/socks_trunk_kcp` example demonstrates it in action. Test with `go test ./trunk_kcp -v`
+(one known failure: `TestReviewHeaderID/ParseHeader2` — see Build and test above).
 
 ### Middleware
 
@@ -221,17 +240,26 @@ the path before running one, and note the `socks` example is the one that actual
 
 ## Examples
 
-`test/` holds runnable `main` packages, not tests. Each of `socks`, `socks_nat`, `socks_quic`,
-`socks_stream`, `socks_trunk`, `socks_trunk_kcp`, `test_broadcast` follows the same shape: peer
-logic (the `*Peer`/service struct, e.g. `SocksSvc`) lives at the example root in `peer_client.go` /
-`peer_service.go` / `peer_proxy.go`, with thin `main.go` binaries under `client/`, `service/`, and
-(for `socks`, `socks_stream`) `proxy/`. Config is read from an embed-relative
-`static/conf/default.yml`, so run each from its own directory. `nat/` and `proxy/` are the two
-other demo variants (NAT-traversal and reverse-proxy), and `webrtc/` holds an experimental
-WebRTC data-channel transport.
+`test/` holds runnable `main` packages plus, in a few of them, real unit tests. Current entries:
+`cert` (cert generator, see Dependencies), `filesystem` (shared embed assets), `pb` (shared demo
+proto), `nat` (NAT traversal), `proxy` (reverse proxy), `socks` (full remote SOCKS5/HTTP proxy,
+including uTLS browser fingerprints under `chrome/` and a `client_http_local` variant),
+`socks_nat`, `socks_trunk` (link aggregation over reliable transports), `socks_trunk_kcp`
+(KCP-based aggregation over unreliable networks), and `test_broadcast`. The `socks_stream`,
+`socks_quic`, and `webrtc` experiments no longer exist.
+
+The `socks*` examples follow the same shape: peer logic (the `*Peer`/service struct, e.g.
+`SocksSvc`) lives at the example root in `peer_client.go` / `peer_service.go` / `peer_proxy.go`,
+with thin `main.go` binaries under `client/`, `service/`, and (for `socks`) `proxy/`.
+`socks_trunk` and `socks_trunk_kcp` additionally keep config/session/protocol/relay logic at
+their roots, ship combined binaries under `cmd/` with Makefiles and deploy scripts, and carry
+their own unit tests (`go test ./test/socks_trunk ./test/socks_trunk_kcp` passes offline).
+Config is read from an embed-relative `static/conf/default.yml`, so run each from its own
+directory.
 
 Run them from their own directory. Read `test/socks` first for the minimal shape (root
-`SocksSvc` + `service/main.go` client/server wiring), `socks_stream` for streaming, `socks_trunk`
-for basic link aggregation over reliable transports, `socks_trunk_kcp` for KCP-based link
-aggregation over unreliable networks, and `socks` for the full remote SOCKS5/HTTP proxy (including
-uTLS browser fingerprints under `chrome/`).
+`SocksSvc` + `service/main.go` client/server wiring), then `socks_trunk` / `socks_trunk_kcp`
+for the two link-aggregation flavors.
+
+`plan.md` (bilingual) and `TODO.md` at the repo root are the original trunk/trunk_kcp design
+notes; they describe intent, not guaranteed current behavior.

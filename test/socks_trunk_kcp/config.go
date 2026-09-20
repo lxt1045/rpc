@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+
+	"github.com/lxt1045/rpc/trunk_kcp"
 )
 
 // TrunkKCPConfig 控制底层 trunk_kcp 链路参数。
@@ -14,6 +16,48 @@ type TrunkKCPConfig struct {
 	MinConns       int    `yaml:"min_conns" mapstructure:"min_conns"`
 	MaxConns       int    `yaml:"max_conns" mapstructure:"max_conns"`
 	MaxVirtualConn int    `yaml:"max_virtual_conn" mapstructure:"max_virtual_conn"`
+
+	// KCP NoDelay 参数（语义同 kcp.KCP.NoDelay），nil 表示使用库默认值 (1,10,32,1)。
+	// 客户端与服务端必须配置成相同的值。
+	// 物理连接为 TCP/TLS 等可靠流时，建议 nodelay=0, interval=20~40, resend=0, nc=1，
+	// 以避免 KCP 伪重传造成的线上流量放大（详见 README "线上流量放大"一节）。
+	KCPNoDelay  *int `yaml:"kcp_nodelay" mapstructure:"kcp_nodelay"`
+	KCPInterval *int `yaml:"kcp_interval" mapstructure:"kcp_interval"`
+	KCPResend   *int `yaml:"kcp_resend" mapstructure:"kcp_resend"`
+	KCPNc       *int `yaml:"kcp_nc" mapstructure:"kcp_nc"`
+}
+
+// NoDelayParam 返回配置的 KCP NoDelay 四元组；未配置项为 -1（保持库当前值）。
+func (c *TrunkKCPConfig) NoDelayParam() (nodelay, interval, resend, nc int) {
+	nodelay, interval, resend, nc = -1, -1, -1, -1
+	if c == nil {
+		return
+	}
+	if c.KCPNoDelay != nil {
+		nodelay = *c.KCPNoDelay
+	}
+	if c.KCPInterval != nil {
+		interval = *c.KCPInterval
+	}
+	if c.KCPResend != nil {
+		resend = *c.KCPResend
+	}
+	if c.KCPNc != nil {
+		nc = *c.KCPNc
+	}
+	return
+}
+
+// ApplyKCPParam 将配置的 KCP NoDelay 参数应用到 trunk（未配置项保持库默认）。
+func (c *TrunkKCPConfig) ApplyKCPParam(t *trunk_kcp.TrunkKCP) {
+	if c == nil || t == nil {
+		return
+	}
+	nodelay, interval, resend, nc := c.NoDelayParam()
+	if nodelay < 0 && interval < 0 && resend < 0 && nc < 0 {
+		return
+	}
+	t.SetNoDelay(nodelay, interval, resend, nc)
 }
 
 // ServerConfig 是服务端运行时配置。

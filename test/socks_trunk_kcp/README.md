@@ -307,3 +307,78 @@ TrunkKCP.Run 在以下情况退出：
 ```
 
 只要还有至少 1 条活跃底层连接，`Run` 就会保持运行，并允许继续 AddConn / RemoveConn。
+
+## 线上流量放大问题（KCP over TCP 的伪重传）
+
+### 现象
+
+c/s 建立连接后，只有一个浏览器在下载：Windows 任务管理器显示网卡占用 ~30Mbps，
+但浏览器下载速度只有 ~1.3MB/s（≈10.4Mbps）。线上字节约为有效载荷的 2.9 倍。
+
+### 实测数据
+
+在 `trunk_kcp/wire_amplification_test.go` 中用字节计数器包住物理连接，
+逐段解析 KCP 包（16MiB 下载，4 条物理连接，pipe 模拟链路）：
+
+| 链路场景 | 线上/载荷 | KCP 重复重发段占比 | 有效吞吐 |
+| --- | --- | --- | --- |
+| 回环（无延迟抖动） | 1.02x | 0% | 88 MB/s |
+| 50ms 延迟 + 40ms 抖动，**零丢包** | 1.36~1.52x | 25~32% | 6.3 MB/s |
+| 50ms + 80ms 抖动 + 2% 丢包 | 1.88x | **45%** | 2.4 MB/s |
+
+注意第二行：链路完全不丢包，KCP 依然重发了约 1/3 的段——纯伪重传。
+链路越差放大越大，真实国际链路（更大抖动 + QoS 丢包）达到 2.9x 与观察吻合。
+重复段到达网卡照样计数（任务管理器虚高），KCP 接收端丢弃重复段（浏览器只算有效数据）。
+
+### 根因
+
+本模块的物理连接是 TLS/TCP（可靠、不丢包的流），而 KCP 是为 UDP/有损链路
+设计的 ARQ 协议。库默认参数 `NoDelay(1, 10, 32, 1)`（见 `trunk_kcp.go`）：
+
+1. **RTO 太敏感**：`nodelay=1` 使 KCP 最小 RTO = 30ms（kcp-go `IKCP_RTO_NDL`）。
+   trunk 把 KCP 包经 `sendChan` 轮询分发到多条 TCP 连接，每条连接排队延迟不同，
+   ACK 回程也要排队，尾部延迟频繁超过 RTO，KCP 于是重发"其实没丢"的段。
+2. **`nc=1` 关闭拥塞控制**：发送方始终保持 1024 段（~1.4MB）窗口打满 →
+   排队更久 → RTO 误判更多 → 重发段又占用瓶颈带宽 → 正反馈，吞吐被压垮。
+3. KCP 重发在应用层，底层 TCP 对它再做一次可靠性传输，双重保险、双倍浪费。
+
+调参对比（同一恶劣链路：50ms + 80ms 抖动 + 2% 丢包）：
+
+| 参数 | 线上/载荷 | 吞吐 | 评价 |
+| --- | --- | --- | --- |
+| `NoDelay(1,10,32,1)`（库默认） | 1.88x | 2.6 MB/s | — |
+| `NoDelay(0,40,0,1)`（minRTO=100ms） | 1.54x | 2.3 MB/s | 有缓解 |
+| `NoDelay(1,10,32,0)`（开拥塞控制） | 1.50x | 0.2 MB/s | 吞吐崩溃 |
+| `NoDelay(0,40,0,0)`（普通模式） | — | 卡死 | KCP cwnd 在持续丢包下饿死 |
+
+调参只能缓解，不能根治——ARQ 层与 TCP 层的可靠性语义本质冲突。
+
+### 缓解：KCP 参数配置化
+
+`TrunkKCPConfig` 新增 4 个可选项（对应 `kcp.KCP.NoDelay` 的四个参数），
+库侧通过 `TrunkKCP.SetNoDelay(nodelay, interval, resend, nc)` 应用，
+`default.yml` 的 `trunk_kcp` 节下配置，**客户端与服务端必须一致**：
+
+```yaml
+trunk_kcp:
+  conv: 123456789
+  min_conns: 8
+  max_conns: 16
+  max_virtual_conn: 8096
+  kcp_nodelay: 0   # 0: 普通模式 minRTO=100ms；1: nodelay 模式 minRTO=30ms（库默认，仅建议 UDP 底层）
+  kcp_interval: 20 # KCP 内部时钟 ms，>=10
+  kcp_resend: 0    # 快速重传阈值，0 关闭
+  kcp_nc: 1        # 1: 关闭 KCP 拥塞控制；0: 开启
+```
+
+不配置（或某项不配置）时保持库默认值 `(1, 10, 32, 1)`。
+
+### 建议（按优先级）
+
+1. **底层是 TCP/TLS 时优先使用 `test/socks_trunk`（TCP 版 trunk）**；
+   `trunk_kcp` 的设计前提是 UDP/有损底层，跑在 TCP 上没有收益还会引入伪重传病理。
+2. 必须使用本模块时（例如计划切 UDP 底层），启用上面这组 `kcp_*` 配置
+   （minRTO 回到 100ms，可显著减少伪重传）。
+3. 物理连接数不宜过多（更多连接 = 更大的分发抖动）；服务端开启 BBR。
+4. 排查手段：Windows `netstat -s -p tcp` 看 TCP 重传；
+   `trunk_kcp/wire_amplification_test.go` 里的 KCP 段计数器可直接复用做线上验证。

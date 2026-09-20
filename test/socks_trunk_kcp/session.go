@@ -38,6 +38,7 @@ type sessionManagerType struct {
 	token      string
 	maxClients int
 	maxVConn   int
+	kcpCfg     TrunkKCPConfig // KCP NoDelay 参数（NoDelayParam 为全 -1 时用库默认）
 	sessions   map[string]*session
 }
 
@@ -68,6 +69,16 @@ func initServerSecurity(token string, maxClients int, conv uint32, maxVConn int)
 // InitServerSecurity 是 main 调用的服务端初始化入口。
 func InitServerSecurity(token string, maxClients int, conv uint32, maxVConn int) error {
 	return initServerSecurity(token, maxClients, conv, maxVConn)
+}
+
+// SetServerTrunkConfig 设置服务端创建 TrunkKCP 时使用的链路参数
+// （主要是 KCP NoDelay 参数，需与客户端配置一致）。
+// 应在 InitServerSecurity 之后、接受连接之前调用。
+func SetServerTrunkConfig(cfg TrunkKCPConfig) {
+	cfg.defaults()
+	sessionManager.mu.Lock()
+	sessionManager.kcpCfg = cfg
+	sessionManager.mu.Unlock()
 }
 
 // SocksSvc 是服务端每个 RPC 连接对应的 service 实例。
@@ -260,6 +271,11 @@ func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (*pb.T
 	}
 
 	trunk := trunk_kcp.NewTrunkKCP(req.TrunkId, onNewConn, rws...)
+	// 应用服务端配置的 KCP NoDelay 参数（需与客户端一致）
+	sessionManager.mu.Lock()
+	kcpCfg := sessionManager.kcpCfg
+	sessionManager.mu.Unlock()
+	kcpCfg.ApplyKCPParam(trunk)
 	sess.mu.Lock()
 	sess.conv = req.TrunkId
 	sess.maxVConn = maxVConn

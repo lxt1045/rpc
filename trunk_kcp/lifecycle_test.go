@@ -1,6 +1,8 @@
 package trunk_kcp
 
 import (
+	"context"
+	"net"
 	"sync"
 	"testing"
 )
@@ -93,5 +95,54 @@ func TestVirtualConnWriteDuringTrunkClose(t *testing.T) {
 		}()
 		trunk.Close()
 		wg.Wait()
+	}
+}
+
+// TestSetNoDelay 是行为级冒烟测试：kcp-go 的 KCP 字段不可导出，无法直接断言
+// 内部状态，这里验证各种参数组合（含 -1 保持）调用不 panic，且配置后链路
+// 仍能正常收发。
+func TestSetNoDelay(t *testing.T) {
+	trunk := NewTrunkKCP(1, nil)
+	defer trunk.Close()
+	for _, p := range [][4]int{
+		{0, 20, 0, 1},   // TCP/TLS 底层推荐值（minRTO=100ms）
+		{-1, -1, -1, -1}, // 全部保持
+		{1, 10, 32, 1},  // 库默认值
+		{0, 40, 2, 0},
+	} {
+		trunk.SetNoDelay(p[0], p[1], p[2], p[3])
+	}
+}
+
+// TestSetNoDelayDataPath 配置参数后虚拟连接仍能正常传输。
+func TestSetNoDelayDataPath(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+
+	cli := NewTrunkKCP(1, nil, a)
+	svc := NewTrunkKCP(1, nil, b)
+	for _, tr := range []*TrunkKCP{cli, svc} {
+		tr.SetNoDelay(0, 20, 0, 1)
+	}
+	ctx := context.Background()
+	go cli.Run(ctx)
+	go svc.Run(ctx)
+	defer cli.Close()
+	defer svc.Close()
+
+	cliV := cli.GetConn(1)
+	svcV := svc.GetConn(1)
+
+	want := []byte("hello kcp param")
+	go cliV.Write(want) //nolint
+
+	buf := make([]byte, 64)
+	n, err := svcV.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf[:n]) != string(want) {
+		t.Fatalf("got %q, want %q", buf[:n], want)
 	}
 }
