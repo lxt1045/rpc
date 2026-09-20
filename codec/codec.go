@@ -96,7 +96,12 @@ type post struct {
 func (c *Codec) Read(p []byte) (n int, err error) {
 	// c.readLock.Lock()
 	// defer c.readLock.Unlock()
-	return c.rwc.Read(p)
+	rwc := c.rwc
+	if rwc == nil {
+		// Close() 已将 rwc 置 nil，避免并发 Read 触发 nil panic
+		return 0, ErrHasBeenClosed.Clone()
+	}
+	return rwc.Read(p)
 }
 func (c *Codec) writeFull(p []byte) (int, error) {
 	c.writeLock.Lock()
