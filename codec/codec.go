@@ -143,6 +143,21 @@ func NewCodec(ctx context.Context, rwc io.ReadWriteCloser, callers []Method, ctx
 	return
 }
 
+func (s *Codec) CloseWrite() error {
+	if close, ok := s.rwc.(interface{ CloseWrite() error }); ok {
+		// 不能直接直接调用 conn.Close()，会发送RST 直接断开tcp 链接
+		return close.CloseWrite()
+	}
+	return nil
+}
+func (s *Codec) CloseRead() error {
+	if close, ok := s.rwc.(interface{ CloseRead() error }); ok {
+		// 不能直接直接调用 conn.Close()，会发送RST 直接断开tcp 链接
+		return close.CloseRead()
+	}
+	return nil
+}
+
 func (c *Codec) Close() (err error) {
 	if c == nil {
 		return

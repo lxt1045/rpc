@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lxt1045/errors"
@@ -14,13 +15,6 @@ import (
 	"github.com/lxt1045/rpc/test/proxy/pb"
 	"github.com/lxt1045/utils/log"
 )
-
-// closeGrace 是连接 teardown 时的宽限时间：一端 EOF 后不立即硬关，
-// 给反方向残留数据留出发送时间（避免截断响应），到期再强制回收，
-// 防止 TLS 连接 / 目标连接 / goroutine 永久泄漏。
-// （泄漏长期累积曾耗尽服务端 fd / 网关会话表，导致新连接 SYN 被静默丢弃、
-// client 建连成功率骤降，重启后才恢复。）
-const closeGrace = time.Second * 10
 
 // isBenignCloseErr 判断 err 是否属于 "对端/本端正常关闭连接" 的情况
 // 这类错误在代理场景（浏览器主动关 tab、keep-alive 过期、RST 等）非常常见，
@@ -232,13 +226,14 @@ func (p *SocksSvc) ConnUpgrade(ctx context.Context, req *pb.ConnUpgradeReq) (res
 		log.Ctx(ctx).Error().Caller().Err(err).Msgf("failed to connect to target: %v", err)
 		return
 	}
-	rc.(*net.TCPConn).SetKeepAlive(true)
+	rcTCP := rc.(*net.TCPConn)
+	rcTCP.SetKeepAlive(true)
 
 	log.Ctx(ctx).Info().Caller().Err(err).Msgf("proxy %s <-> %s", p.RemoteAddr, req.Addr)
 
 	if len(req.Body) > 0 {
 		n := 0
-		n, err = rc.Write(req.Body)
+		n, err = rcTCP.Write(req.Body)
 		if n < 0 || n < len(req.Body) {
 			err = errors.Errorf("n < 0 || n < l, err: %s", err.Error())
 			return
@@ -253,11 +248,11 @@ func (p *SocksSvc) ConnUpgrade(ctx context.Context, req *pb.ConnUpgradeReq) (res
 			if e := recover(); e != nil {
 				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("ConnUpgrade rc->upgrade")
 			}
-			rc.SetDeadline(time.Now()) // 唤醒另一方向在 rc 上阻塞的读
-			rc.Close()
+			rcTCP.SetDeadline(time.Now()) // 唤醒另一方向在 rc 上阻塞的读
+			rcTCP.Close()
 			upgrade.Close() // 同步关闭 upgrade, 对端会收到 EOF
 		}()
-		Copy(ctx, upgrade, rc)
+		Copy(ctx, upgrade, rcTCP)
 	}()
 
 	go func() {
@@ -268,17 +263,27 @@ func (p *SocksSvc) ConnUpgrade(ctx context.Context, req *pb.ConnUpgradeReq) (res
 			// 本方向结束后，目标端残留数据可能还在另一方向（rc->upgrade）上传输，
 			// 延迟 closeGrace 再强制关闭，既避免截断响应，又保证 rc 最终回收，
 			// 防止 rc 与 goroutine 永久泄漏（见 closeGrace 注释）。
-			time.Sleep(closeGrace)
-			rc.SetDeadline(time.Now()) // 唤醒另一方向在 rc 上阻塞的读
-			rc.Close()
-			upgrade.Close()
+			if e := rcTCP.CloseWrite(); e != nil {
+				log.Ctx(ctx).Error().Err(e).Caller().Msg("rcTCP.CloseWrite()")
+			}
+			rcTCP.SetDeadline(time.Now()) // 唤醒另一方向在 rc 上阻塞的读
+			if e := upgrade.CloseRead(); e != nil {
+				log.Ctx(ctx).Error().Err(e).Caller().Msg("upgrade.CloseRead()")
+			}
 		}()
-		Copy(ctx, rc, upgrade)
-		io.Copy()
+		Copy(ctx, rcTCP, upgrade)
 	}()
 
 	return &pb.ConnUpgradeRsp{}, nil
 }
+
+var (
+	pool = sync.Pool{
+		New: func() any {
+			return make([]byte, 1024*8)
+		},
+	}
+)
 
 // Copy 将 src 的内容搬运到 dst，直到任一方出错或 ctx 取消。
 //
@@ -292,104 +297,164 @@ func Copy(ctx context.Context, dst io.WriteCloser, src io.ReadCloser) (written i
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// 读进程和写进程分开，增加延时/增加吞吐率
 	ch := make(chan []byte, 128)
 
+	// 读
 	go func() {
+		var err error
 		defer func() {
 			if e := recover(); e != nil {
-				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("Copy reader")
+				err = errors.Errorf("recover : %v", e)
 			}
 			close(ch)
+
+			local, remote := "", ""
+			if tcpConn, ok := src.(*net.TCPConn); ok {
+				local, remote = tcpConn.LocalAddr().String(), tcpConn.RemoteAddr().String()
+			}
+			log.Ctx(ctx).Error().Caller().Err(err).Str("local", local).Str("remote", remote).Msg("src.Read")
 		}()
-		buf := make([]byte, 1024*64)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			default:
 			}
+			buf := pool.Get().([]byte)
 			n, er := src.Read(buf)
 			if n > 0 {
-				bs := make([]byte, n)
-				copy(bs, buf[:n])
 				select {
 				case <-ctx.Done():
 					return
-				case ch <- bs:
+				case ch <- buf:
 				}
 			}
 			if er != nil {
-				err := errors.WithErr(er)
-				if tcpConn, ok := src.(*net.TCPConn); ok {
-					log.Ctx(ctx).Error().Caller().Err(err).Str("local", tcpConn.LocalAddr().String()).Str("remote", tcpConn.RemoteAddr().String()).Msg("src.Read")
-				} else {
-					log.Ctx(ctx).Error().Caller().Err(err).Msg("src.Read")
+				err = errors.WithErr(er)
+				if e := CloseRead(src); e != nil {
+					log.Ctx(ctx).Error().Err(e).Caller().Msg("rcTCP.CloseWrite()")
 				}
 				return
 			}
 		}
 	}()
 
-	defer func() {
-		if e := recover(); e != nil {
-			err = errors.Errorf("recover : %v", e)
-		}
-		cancel()
+	// 写
+	func() {
+		defer func() {
+			if e := recover(); e != nil {
+				err = errors.Errorf("recover : %v", e)
+			}
+			cancel()
+			if set, ok := src.(interface{ SetDeadline(t time.Time) error }); ok {
+				set.SetDeadline(time.Now()) // 唤醒
+			}
 
-		// // 唤醒可能阻塞在 src.Read 的 reader 协程
-		// if dl, ok := src.(interface{ SetDeadline(t time.Time) error }); ok {
-		// 	_ = dl.SetDeadline(time.Now())
-		// }
-		if err != nil && !isBenignCloseErr(err) {
-			if tcpConn, ok := dst.(*net.TCPConn); ok {
-				log.Ctx(ctx).Error().Caller().Err(err).Str("local", tcpConn.LocalAddr().String()).Str("remote", tcpConn.RemoteAddr().String()).Msg("Copy defer")
-			} else {
-				log.Ctx(ctx).Error().Caller().Err(err).Msg("Copy defer")
-			}
-		} else if err != nil {
-			if tcpConn, ok := dst.(*net.TCPConn); ok {
-				log.Ctx(ctx).Error().Caller().Err(err).Str("local", tcpConn.LocalAddr().String()).Str("remote", tcpConn.RemoteAddr().String()).Msg("Copy defer benign close")
-			} else {
-				log.Ctx(ctx).Debug().Caller().Err(err).Msg("Copy defer benign close")
-			}
-			err = nil // 将良性关闭视为正常退出
-		}
-	}()
-
-	for {
-		var bs []byte
-		var ok bool
-		select {
-		case bs, ok = <-ch:
-			if !ok {
-				if tcpConn, ok := dst.(*net.TCPConn); ok {
-					// 不能直接直接调用 conn.Close()，会发送RST 直接断开tcp 链接
-					tcpConn.CloseWrite()
-					log.Ctx(ctx).Info().Caller().Str("local", tcpConn.LocalAddr().String()).Str("remote", tcpConn.RemoteAddr().String()).Msg("Copy CloseWrite, Send FIN")
-				} else {
-					// dst 不支持半关闭（如 codec.Upgrade 包装的 TLS 连接）：
-					// 必须延迟 Close 把 EOF 传播给对端，否则对端永远收不到关闭信号，
-					// 整条代理链路的连接和 goroutine 会永久泄漏（见 closeGrace 注释）。
-					time.AfterFunc(closeGrace, func() {
-						dst.Close()
-						log.Ctx(ctx).Info().Caller().Msg("Copy delayed close dst")
-					})
-				}
-				return
-			}
-			var n int
-			n, err = dst.Write(bs)
-			written += int64(n)
+			// // 唤醒可能阻塞在 src.Read 的 reader 协程
+			// if dl, ok := src.(interface{ SetDeadline(t time.Time) error }); ok {
+			// 	_ = dl.SetDeadline(time.Now())
+			// }
 			if err != nil {
-				err = errors.New("err: %v", err)
+				local, remote := "", ""
+				if tcpConn, ok := dst.(*net.TCPConn); ok {
+					local, remote = tcpConn.LocalAddr().String(), tcpConn.RemoteAddr().String()
+				}
+				if !isBenignCloseErr(err) {
+					log.Ctx(ctx).Error().Caller().Err(err).Str("local", local).Str("remote", remote).Msg("src.Write")
+				} else {
+					log.Ctx(ctx).Error().Caller().Err(err).Str("local", local).Str("remote", remote).Msg("Copy defer benign close")
+					err = nil // 将良性关闭视为正常退出
+				}
+			}
+		}()
+
+		for {
+			var bs []byte
+			var ok bool
+			select {
+			case bs, ok = <-ch:
+				if !ok {
+					return
+				}
+				var n int
+				n, err = dst.Write(bs)
+				written += int64(n)
+				if err != nil {
+					pool.Put(bs)
+					err = errors.New("err: %v", err)
+					if e := CloseWrite(dst); e != nil {
+						log.Ctx(ctx).Error().Err(e).Caller().Msg("rcTCP.CloseWrite()")
+					}
+					return
+				}
+				if n < len(bs) {
+					for {
+						bs = bs[n:]
+						n = 0
+						n, err = dst.Write(bs)
+						written += int64(n)
+						if err != nil {
+							err = errors.New("err: %v", err)
+							pool.Put(bs)
+							return
+						}
+						if n >= len(bs) {
+							break
+						}
+					}
+				}
+				pool.Put(bs)
+			case <-ctx.Done():
 				return
 			}
-			if n < len(bs) {
-				err = errors.Errorf("short write: %d < %d", n, len(bs))
-				return
-			}
-		case <-ctx.Done():
-			return
 		}
+	}()
+	return
+}
+
+func CloseRead(rw io.ReadCloser) (err error) {
+	if close, ok := rw.(interface{ CloseRead() error }); ok {
+		// 不能直接直接调用 conn.Close()，会发送RST 直接断开tcp 链接
+		return close.CloseRead()
 	}
+
+	// closeGrace 是连接 teardown 时的宽限时间：一端 EOF 后不立即硬关，
+	// 给反方向残留数据留出发送时间（避免截断响应），到期再强制回收，
+	// 防止 TLS 连接 / 目标连接 / goroutine 永久泄漏。
+	// （泄漏长期累积曾耗尽服务端 fd / 网关会话表，导致新连接 SYN 被静默丢弃、
+	// client 建连成功率骤降，重启后才恢复。）
+	const closeGrace = time.Second * 10
+
+	// // dst 不支持半关闭（如 codec.Upgrade 包装的 TLS 连接）：
+	// // 必须延迟 Close 把 EOF 传播给对端，否则对端永远收不到关闭信号，
+	// // 整条代理链路的连接和 goroutine 会永久泄漏（见 closeGrace 注释）。
+	// time.AfterFunc(closeGrace, func() {
+	// 	rw.Close()
+	// })
+	time.Sleep(closeGrace)
+	return rw.Close()
+}
+
+func CloseWrite(rw io.WriteCloser) (err error) {
+	if close, ok := rw.(interface{ CloseWrite() error }); ok {
+		// 不能直接直接调用 conn.Close()，会发送RST 直接断开tcp 链接
+		return close.CloseWrite()
+	}
+
+	// closeGrace 是连接 teardown 时的宽限时间：一端 EOF 后不立即硬关，
+	// 给反方向残留数据留出发送时间（避免截断响应），到期再强制回收，
+	// 防止 TLS 连接 / 目标连接 / goroutine 永久泄漏。
+	// （泄漏长期累积曾耗尽服务端 fd / 网关会话表，导致新连接 SYN 被静默丢弃、
+	// client 建连成功率骤降，重启后才恢复。）
+	const closeGrace = time.Second * 10
+
+	// // dst 不支持半关闭（如 codec.Upgrade 包装的 TLS 连接）：
+	// // 必须延迟 Close 把 EOF 传播给对端，否则对端永远收不到关闭信号，
+	// // 整条代理链路的连接和 goroutine 会永久泄漏（见 closeGrace 注释）。
+	// time.AfterFunc(closeGrace, func() {
+	// 	rw.Close()
+	// })
+	time.Sleep(closeGrace)
+	return rw.Close()
 }
