@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/lxt1045/rpc"
-	socks "github.com/lxt1045/rpc/test/socks_trunk/socks_trunk"
-	"github.com/lxt1045/rpc/test/socks_trunk/socks_trunk/filesystem"
-	"github.com/lxt1045/rpc/test/socks_trunk/socks_trunk/pb"
+	socks "github.com/lxt1045/rpc/test/socks_trunk"
+	"github.com/lxt1045/rpc/test/socks_trunk/filesystem"
+	"github.com/lxt1045/rpc/test/socks_trunk/pb"
 	"github.com/lxt1045/utils/config"
 	"github.com/lxt1045/utils/gid"
 	"github.com/lxt1045/utils/log"

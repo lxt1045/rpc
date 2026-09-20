@@ -299,7 +299,7 @@ func (p *SocksCli) OutToTCPPeer(ctx context.Context, address string, inConn *net
 			//}
 			//upgrade.Close()
 		}()
-		Copy(ctx, upgrade, *inConn)
+		socket.Copy(ctx, upgrade, *inConn)
 	}()
 
 	defer func() {
@@ -313,7 +313,7 @@ func (p *SocksCli) OutToTCPPeer(ctx context.Context, address string, inConn *net
 		peer.Close(context.TODO())
 		log.Ctx(ctx).Info().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn closed")
 	}()
-	Copy(ctx, *inConn, upgrade)
+	socket.Copy(ctx, *inConn, upgrade)
 	return
 }
 
@@ -566,7 +566,7 @@ func (p *SocksCli) connect(ctx context.Context, tgtAddr string, rc net.Conn) (er
 				log.Ctx(ctx).Debug().Err(e).Caller().Msg("rc.Close()")
 			}
 		}()
-		Copy(ctx, rc, upgrade)
+		socket.Copy(ctx, rc, upgrade)
 		// io.Copy(rc, upgrade)
 	}()
 
@@ -593,7 +593,7 @@ func (p *SocksCli) connect(ctx context.Context, tgtAddr string, rc net.Conn) (er
 		}
 		peer.Close(context.TODO())
 	}()
-	Copy(ctx, upgrade, rc)
+	socket.Copy(ctx, upgrade, rc)
 	// io.Copy(upgrade, rc)
 	return
 }

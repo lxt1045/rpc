@@ -308,7 +308,7 @@ func (p *SocksCli) OutToTCPPeer(ctx context.Context, address string, inConn *net
 			//}
 			//upgrade.Close()
 		}()
-		Copy(ctx, upgrade, *inConn)
+		socket.Copy(ctx, upgrade, *inConn)
 	}()
 
 	defer func() {
@@ -322,7 +322,7 @@ func (p *SocksCli) OutToTCPPeer(ctx context.Context, address string, inConn *net
 		peer.Close(context.TODO())
 		log.Ctx(ctx).Info().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn closed")
 	}()
-	Copy(ctx, *inConn, upgrade)
+	socket.Copy(ctx, *inConn, upgrade)
 	return
 }
 
@@ -538,6 +538,8 @@ func (p *SocksCli) connect(ctx context.Context, tgtAddr string, rc net.Conn) (er
 	n, err := rc.Read(buf)
 	if err != nil {
 		err = errors.Errorf("Read:%s", err.Error())
+		rc.Close()
+		peer.Close(context.TODO())
 		return
 	}
 	req := &pb.ConnUpgradeReq{
@@ -550,32 +552,59 @@ func (p *SocksCli) connect(ctx context.Context, tgtAddr string, rc net.Conn) (er
 	upgrade, err := peer.Upgrade(ctx, "ConnUpgrade", req, resp)
 	if err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
+		rc.Close()
+		peer.Close(context.TODO())
 		return
 	}
 
 	// ctx, cancel := context.WithCancel(ctx)
 	// go io.Copy(rc, upgrade)
 	// io.Copy(upgrade, rc)
+
+	// 反方向（service->browser）的结束信号：浏览器半关闭（只关写、还在等读）时，
+	// 主 Copy 会立即返回，靠 done 等待响应数据自然传完，而不是定时硬断
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer func() {
-			// // cancel()
-			// // rc.SetDeadline(time.Now()) // 唤醒因读写conn而阻塞的协程
-			// // rc.Close()
-			// time.Sleep(time.Second * 3)
-			upgrade.Close()
+			if e := recover(); e != nil {
+				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("connect upgrade->rc")
+			}
+			if e := upgrade.Close(); e != nil {
+				log.Ctx(ctx).Debug().Err(e).Caller().Msg("upgrade.Close()")
+			}
+			if e := rc.Close(); e != nil {
+				log.Ctx(ctx).Debug().Err(e).Caller().Msg("rc.Close()")
+			}
 		}()
-		Copy(ctx, rc, upgrade)
+		socket.Copy(ctx, rc, upgrade)
 		// io.Copy(rc, upgrade)
 	}()
 
 	defer func() {
-		// // cancel()
-		// time.Sleep(time.Second * 3)
-		// rc.SetDeadline(time.Now()) // 唤醒因读写conn而阻塞的协程
-		// rc.Close()
-		// upgrade.Close()
+		if e := recover(); e != nil {
+			log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("connect")
+		}
+		// 主 Copy（browser->service）结束后，响应数据可能还在 upgrade->rc
+		// 方向上传输（浏览器只关了写、还在等读）：先等反方向自然结束
+		// （service/target 关闭 -> upgrade EOF），响应再慢也不截断；
+		// 若对端 keep-alive 迟迟不关，则由 closeGrace 兜底强制回收，
+		// 防止 TLS 连接 / peer / goroutine 永久泄漏（见 peer_service.go 中
+		// closeGrace 注释）。upgrade 包装的是 TLS 连接，CloseWrite 是空操作，
+		// 只有真正 Close 才能把 EOF 传播给 service。
+		select {
+		case <-done:
+		case <-time.After(time.Minute * 10):
+		}
+		if e := rc.Close(); e != nil {
+			log.Ctx(ctx).Debug().Err(e).Caller().Msg("rc.Close()")
+		}
+		if e := upgrade.Close(); e != nil {
+			log.Ctx(ctx).Debug().Err(e).Caller().Msg("upgrade.Close()")
+		}
+		peer.Close(context.TODO())
 	}()
-	Copy(ctx, upgrade, rc)
+	socket.Copy(ctx, upgrade, rc)
 	// io.Copy(upgrade, rc)
 	return
 }

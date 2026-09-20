@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/lxt1045/rpc"
+	"github.com/lxt1045/rpc/socket"
 	"github.com/lxt1045/rpc/test/proxy/pb"
 )
 
@@ -27,7 +28,7 @@ func (errorReader) Close() error               { return nil }
 func TestCopy(t *testing.T) {
 	payload := bytes.Repeat([]byte("proxy-data"), 20_000)
 	dst := &bufferCloser{}
-	written, err := Copy(context.Background(), dst, io.NopCloser(bytes.NewReader(payload)))
+	written, err := socket.Copy(context.Background(), dst, io.NopCloser(bytes.NewReader(payload)))
 	if err != nil {
 		t.Fatalf("Copy returned error: %v", err)
 	}
@@ -39,7 +40,7 @@ func TestCopy(t *testing.T) {
 func TestCopyCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := Copy(ctx, &bufferCloser{}, errorReader{err: errors.New("read should not run")})
+	_, err := socket.Copy(ctx, &bufferCloser{}, errorReader{err: errors.New("read should not run")})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Copy error = %v, want context.Canceled", err)
 	}
@@ -47,7 +48,7 @@ func TestCopyCancellation(t *testing.T) {
 
 func TestCopyReadError(t *testing.T) {
 	want := errors.New("read failed")
-	_, err := Copy(context.Background(), &bufferCloser{}, errorReader{err: want})
+	_, err := socket.Copy(context.Background(), &bufferCloser{}, errorReader{err: want})
 	if !errors.Is(err, want) {
 		t.Fatalf("Copy error = %v, want %v", err, want)
 	}

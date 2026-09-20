@@ -10,9 +10,9 @@ import (
 	"github.com/lxt1045/errors"
 	"github.com/lxt1045/rpc"
 	"github.com/lxt1045/rpc/codec"
+	"github.com/lxt1045/rpc/socket"
 	"github.com/lxt1045/rpc/test/socks_nat/pb"
 	"github.com/lxt1045/utils/log"
-	"github.com/lxt1045/utils/socks"
 )
 
 type peerSvc struct {
@@ -149,13 +149,14 @@ func (p *peerSvc) ConnUpgrade(ctx context.Context, req *pb.ConnUpgradeReq) (resp
 		log.Ctx(ctx).Error().Caller().Err(err).Msgf("failed to connect to target: %v", err)
 		return
 	}
-	rc.(*net.TCPConn).SetKeepAlive(true)
+	rcTCP := rc.(*net.TCPConn)
+	rcTCP.SetKeepAlive(true)
 
 	log.Ctx(ctx).Info().Caller().Err(err).Msgf("proxy %s <-> %s", p.RemoteAddr, req.Addr)
 
 	if len(req.Body) > 0 {
 		n := 0
-		n, err = rc.Write(req.Body)
+		n, err = rcTCP.Write(req.Body)
 		if n < 0 || n < len(req.Body) {
 			err = errors.Errorf("n < 0 || n < l, err: %s", err.Error())
 			return
@@ -170,15 +171,15 @@ func (p *peerSvc) ConnUpgrade(ctx context.Context, req *pb.ConnUpgradeReq) (resp
 			if e := recover(); e != nil {
 				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("ConnUpgrade rc->upgrade")
 			}
-			rc.SetDeadline(time.Now()) // 唤醒另一方向在 rc 上阻塞的读
-			rc.Close()
+			rcTCP.SetDeadline(time.Now()) // 唤醒另一方向在 rc 上阻塞的读
+			rcTCP.Close()
 			upgrade.Close() // 同步关闭 upgrade, 对端会收到 EOF
 
 			if p.AfterConnUpgradeClose != nil {
 				p.AfterConnUpgradeClose()
 			}
 		}()
-		socks.Copy(ctx, upgrade, rc)
+		socket.Copy(ctx, upgrade, rcTCP)
 	}()
 
 	go func() {
@@ -186,11 +187,20 @@ func (p *peerSvc) ConnUpgrade(ctx context.Context, req *pb.ConnUpgradeReq) (resp
 			if e := recover(); e != nil {
 				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("ConnUpgrade upgrade->rc")
 			}
-			//rc.SetDeadline(time.Now())
-			//rc.Close()
-			//upgrade.Close()
+			// 本方向结束后先半关闭 rc，通知目标端不再发送数据；
+			// 另一方向（rc->upgrade）可能还有残留数据要发给 client，
+			// 延迟 closeGrace 再强制关闭，既避免截断响应，又保证 rc 最终回收，
+			// 防止 rc 与 goroutine 永久泄漏（见 closeGrace 注释）。
+			if e := rcTCP.CloseWrite(); e != nil {
+				log.Ctx(ctx).Debug().Err(e).Caller().Msg("rcTCP.CloseWrite()")
+			}
+			time.AfterFunc(time.Second*30, func() {
+				rcTCP.SetDeadline(time.Now()) // 唤醒另一方向在 rc 上阻塞的读
+				rcTCP.Close()
+				upgrade.Close()
+			})
 		}()
-		socks.Copy(ctx, rc, upgrade)
+		socket.Copy(ctx, rcTCP, upgrade)
 	}()
 
 	return &pb.ConnUpgradeRsp{}, nil

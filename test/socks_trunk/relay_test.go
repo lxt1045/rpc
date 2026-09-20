@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"testing"
+
+	"github.com/lxt1045/rpc/socket"
 )
 
 type writeCloser struct {
@@ -20,7 +22,7 @@ func TestCopyFromClosedSource(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = Copy(context.Background(), dst, pr)
+		_, _ = socket.Copy(context.Background(), dst, pr)
 	}()
 
 	if _, err := pw.Write([]byte("hello trunk copy")); err != nil {

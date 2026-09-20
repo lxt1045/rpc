@@ -5,9 +5,11 @@ import (
 	"io"
 	"math"
 	"net"
+	"time"
 
 	"github.com/lxt1045/errors"
 	"github.com/lxt1045/rpc"
+	"github.com/lxt1045/rpc/socket"
 	"github.com/lxt1045/rpc/test/socks_nat/pb"
 	"github.com/lxt1045/utils/log"
 	"github.com/lxt1045/utils/socks"
@@ -122,6 +124,7 @@ func (p *peerCli) connect2(ctx context.Context, addr string, rc net.Conn) (err e
 	n, err := rc.Read(buf)
 	if err != nil {
 		err = errors.Errorf("Read:%s", err.Error())
+		rc.Close()
 		return
 	}
 	req := &pb.ConnUpgradeReq{
@@ -134,34 +137,57 @@ func (p *peerCli) connect2(ctx context.Context, addr string, rc net.Conn) (err e
 	upgrade, err := p.Peer.Upgrade(ctx, "ConnUpgrade", req, resp)
 	if err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
+		rc.Close()
 		return
 	}
 	// ctx, cancel := context.WithCancel(ctx)
 	// go io.Copy(rc, upgrade)
 	// io.Copy(upgrade, rc)
+
+	// 反方向（service->browser）的结束信号：浏览器半关闭（只关写、还在等读）时，
+	// 主 Copy 会立即返回，靠 done 等待响应数据自然传完，而不是定时硬断
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		defer func() {
-			// // cancel()
-			// // rc.SetDeadline(time.Now()) // 唤醒因读写conn而阻塞的协程
-			// // rc.Close()
-			// time.Sleep(time.Second * 3)
-			upgrade.Close()
+			if e := recover(); e != nil {
+				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("connect2 upgrade->rc")
+			}
+			if e := upgrade.Close(); e != nil {
+				log.Ctx(ctx).Debug().Err(e).Caller().Msg("upgrade.Close()")
+			}
+			if e := rc.Close(); e != nil {
+				log.Ctx(ctx).Debug().Err(e).Caller().Msg("rc.Close()")
+			}
 			if p.AfterConnUpgradeClose != nil {
 				p.AfterConnUpgradeClose()
 			}
 		}()
-		socks.Copy(ctx, rc, upgrade)
+		socket.Copy(ctx, rc, upgrade)
 		// io.Copy(rc, upgrade)
 	}()
 
 	defer func() {
-		// // cancel()
-		// time.Sleep(time.Second * 3)
-		// rc.SetDeadline(time.Now()) // 唤醒因读写conn而阻塞的协程
-		// rc.Close()
-		// upgrade.Close()
+		if e := recover(); e != nil {
+			log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("connect2")
+		}
+		// 主 Copy（browser->service）结束后，响应数据可能还在 upgrade->rc
+		// 方向上传输（浏览器只关了写、还在等读）：先等反方向自然结束
+		// （service/target 关闭 -> upgrade EOF），响应再慢也不截断；
+		// 若对端 keep-alive 迟迟不关，则由超时兜底强制回收，
+		// 防止连接 / goroutine 永久泄漏。
+		select {
+		case <-done:
+		case <-time.After(time.Minute * 10):
+		}
+		if e := rc.Close(); e != nil {
+			log.Ctx(ctx).Debug().Err(e).Caller().Msg("rc.Close()")
+		}
+		if e := upgrade.Close(); e != nil {
+			log.Ctx(ctx).Debug().Err(e).Caller().Msg("upgrade.Close()")
+		}
 	}()
-	socks.Copy(ctx, upgrade, rc)
+	socket.Copy(ctx, upgrade, rc)
 	// io.Copy(upgrade, rc)
 	return
 }
