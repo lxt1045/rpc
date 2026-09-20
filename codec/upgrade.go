@@ -57,6 +57,19 @@ func newUpgrade(c *Codec, callID uint16, callSN uint32) *Upgrade {
 	}
 }
 
+func (s *Upgrade) CloseWrite() error {
+	if s.codec != nil {
+		return s.codec.CloseWrite()
+	}
+	return nil
+}
+func (s *Upgrade) CloseRead() error {
+	if s.codec != nil {
+		return s.codec.CloseRead()
+	}
+	return nil
+}
+
 // client 端发起升级请求，服务端收到升级请求后，切换到 stream 模式，之后 client 和 server 都可以在 stream 上读写数据
 func (c *Codec) Upgrade(ctx context.Context, callID uint16, req, res Msg) (upgrade *Upgrade, err error) {
 	upgrade = newUpgrade(c, callID, atomic.AddUint32(&c.tmpCallSN, 1))

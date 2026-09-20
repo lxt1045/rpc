@@ -114,11 +114,22 @@ func main() {
 				if strings.Contains(err.Error(), "use of closed network connection") {
 					log.Ctx(ctx).Error().Caller().Err(ErrUnexpected.WithErr(err)).Send()
 					// panic(err)
-				} else {
-					err = ErrUnexpected.WithErr(err)
-					log.Ctx(ctx).Error().Caller().Err(err).Send()
+					return err
 				}
-				// continue
+				// fd 耗尽（EMFILE）等暂时性错误不应杀死整个进程：
+				// 退避后重试，等待空闲连接回收释放资源。
+				if ne, ok := err.(net.Error); ok && ne.Temporary() {
+					log.Ctx(ctx).Error().Caller().Err(ErrUnexpected.WithErr(err)).Msg("accept temporary error, retry")
+					time.Sleep(time.Millisecond * 100)
+					continue
+				}
+				if strings.Contains(err.Error(), "too many open files") {
+					log.Ctx(ctx).Error().Caller().Err(ErrUnexpected.WithErr(err)).Msg("accept EMFILE, retry")
+					time.Sleep(time.Millisecond * 100)
+					continue
+				}
+				err = ErrUnexpected.WithErr(err)
+				log.Ctx(ctx).Error().Caller().Err(err).Send()
 				return err
 			}
 			// conn.SetReadDeadline(time.Second)
