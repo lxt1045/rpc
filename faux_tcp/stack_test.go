@@ -1059,3 +1059,22 @@ func BenchmarkThroughput(b *testing.B) {
 		}
 	}
 }
+
+// TestSynAckEchoesTimestamp 服务端 SYN+ACK 必须回显客户端 SYN 的 TSval。
+// 真实 Linux 一定回显；置 0 会被部分状态化 NAT/防火墙判为无效而丢弃
+// （真机实测服务端 SYN+ACK 一直是 ecr 0，是本次修复的动机）。
+func TestSynAckEchoesTimestamp(t *testing.T) {
+	cli, _, _, rec := testPair(t, nil, nil)
+	_ = cli
+	waitFor(t, time.Second, func() bool { return len(rec.snapshot()) >= 2 }, "handshake packets")
+	pkts := rec.snapshot()
+	if pkts[0].TSval == 0 {
+		t.Fatal("client SYN should carry TSval")
+	}
+	if !pkts[1].Has(flagSYN) || !pkts[1].Has(flagACK) {
+		t.Fatalf("pkt1 should be SYN+ACK, got flags=%x", pkts[1].Flags)
+	}
+	if pkts[1].TSecr != pkts[0].TSval {
+		t.Fatalf("SYN+ACK TSecr=%d, want echo of SYN TSval=%d", pkts[1].TSecr, pkts[0].TSval)
+	}
+}

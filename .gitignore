@@ -43,3 +43,4 @@ test/cert/cert_test2.go
 test/*/*/logs/
 test/socks_trunk_kcp/cmd/socks-trunk-kcp-server/socks-trunk-kcp-server
 test/socks_trunk_kcp/cmd/socks-trunk-kcp-client/socks-trunk-kcp-client
+test/socks_faux_trunk_kcp/cmd/socks-faux-trunk-kcp-server/socks-faux-trunk-kcp-server

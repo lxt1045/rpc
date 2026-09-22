@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -178,6 +180,10 @@ func (cn *Conn) Write(bs []byte) (n int, err error) {
 	}
 }
 
+// PeerMSS 对端在握手时通告的 MSS（0=未通告）。路径 MTU 受限时可据此校准
+// 上层分段大小（本层 cfg.MSS 需相应调小）。
+func (cn *Conn) PeerMSS() int { return cn.c.PeerMSS() }
+
 // Close 关闭连接：发 FIN（消耗一个序号），随后走完整四次挥手；
 // 宽限期后对端仍无回应则强制关闭（FIN 不重传）。幂等。
 func (cn *Conn) Close() error {
@@ -241,7 +247,7 @@ func Dial(ctx context.Context, cfg Config, laddr, raddr string) (net.Conn, error
 		return nil, err
 	}
 
-	link, err := newRawLink(local.IP, local.Port)
+	link, err := newRawLink(cfg, local.IP, local.Port)
 	if err != nil {
 		return nil, err
 	}
@@ -293,13 +299,82 @@ func resolveLocal(laddr string, remoteIP netip.Addr) (Endpoint, error) {
 	if err != nil {
 		return Endpoint{}, err
 	}
-	// 随机高端口（真实 TCP 客户端行为：49152~65535）
-	var b [2]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	port, err := pickLocalPort()
+	if err != nil {
 		return Endpoint{}, err
 	}
-	port := 49152 + binary.BigEndian.Uint16(b[:])%16384
 	return Endpoint{IP: ip, Port: port}, nil
+}
+
+// pickLocalPort 选一个"像内核挑的"本地源端口：范围取自
+// /proc/sys/net/ipv4/ip_local_port_range（真实客户端就是从这里选源端口），
+// 并避开本机已占用的端口。
+//
+// 为什么不能用固定区间：某些网络设备/运营商只放行"源端口落在本机 ephemeral 范围
+// 内"的 TCP 会话的回程报文。实测某客户端 ip_local_port_range=44620-48715，而本包
+// 原先硬编码 49152-65535，结果 SYN 正常到达服务端、服务端也回了 SYN+ACK，但客户端
+// 一个包都收不到（同端口的内核 TCP 一切正常）——源端口落在范围外，回程被上游丢弃。
+func pickLocalPort() (uint16, error) {
+	lo, hi := 32768, 60999 // 内核默认范围（读不到 /proc 时的兜底）
+	if b, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range"); err == nil {
+		var a, c int
+		if _, err := fmt.Sscanf(string(b), "%d %d", &a, &c); err == nil && a >= 1024 && c > a && c <= 65535 {
+			lo, hi = a, c
+		}
+	}
+	span := hi - lo + 1
+	var b [2]byte
+	for i := 0; i < 32; i++ {
+		if _, err := rand.Read(b[:]); err != nil {
+			return 0, err
+		}
+		p := lo + int(binary.BigEndian.Uint16(b[:]))%span
+		if localPortFree(p) {
+			return uint16(p), nil
+		}
+	}
+	// 兜底：范围内随机取一个（可能与本机端口撞车，交给上层重试）
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, err
+	}
+	return uint16(lo + int(binary.BigEndian.Uint16(b[:]))%span), nil
+}
+
+// localPortFree 本机是否未占用该端口（用一次 bind 探测；TIME_WAIT 里的端口仍可用）
+func localPortFree(port int) bool {
+	l, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = l.Close()
+	return true
+}
+
+// handshakeTimeoutErr 组装可自诊断的握手超时错误：区分"对端没回"与"本机发不出去"。
+func (c *fconn) handshakeTimeoutErr() error {
+	recv := c.RecvPackets.Load()
+	sentErr := c.SendErrors.Load()
+	msg := fmt.Sprintf("握手超时：无 SYN+ACK；已发 %d 个报文，收到 %d 个报文，发送失败 %d 次",
+		c.SentPackets.Load(), recv, sentErr)
+	if e := c.lastSendErr(); e != nil {
+		msg += fmt.Sprintf("；最后发送错误: %v", e)
+	}
+	switch {
+	case sentErr > 0:
+		msg += "；本机 raw socket 发包失败，检查权限/路由/源地址"
+	case recv == 0:
+		msg += "；对端无任何回包：① 服务端是否运行、云安全组/入站防火墙是否放行该 TCP 端口；" +
+			"② 用 tcpdump 对比（与收包同一挂钩点）：tcpdump 能看到回包而这里计数为 0 = 收包过滤/帧格式问题，" +
+			"tcpdump 也看不到 = 包没出去或对端没回（含同出口公网 IP 的 NAT 回环）"
+	default:
+		msg += "；有回包但无有效 SYN+ACK：① 对端 RST 抑制规则（iptables/nft）未生效；" +
+			"② 对端/中间设备是 TCP 代理（SYN-cookie），SYN+ACK 的 ack 不是本端 ISN" +
+			"（日志搜 \"SYNACK 的 ack 不符\"）；③ 端口被别的内核服务占用"
+	}
+	if d, ok := c.d.link.(LinkDescriber); ok {
+		msg += "；本端链路: " + d.Describe()
+	}
+	return ErrHandshakeTimeout.New(msg)
 }
 
 // handshake 三次握手（带超时与有限重试——SYN 重试是正常 TCP 行为）
@@ -321,7 +396,7 @@ func (c *fconn) handshake(ctx context.Context) error {
 			return ctx.Err()
 		case <-time.After(c.cfg.HandshakeTimeout):
 			if i >= c.cfg.HandshakeRetries-1 {
-				return ErrHandshakeTimeout.New()
+				return c.handshakeTimeoutErr()
 			}
 		}
 	}

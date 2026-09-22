@@ -74,6 +74,7 @@ type TrunkKCP struct {
 	// KCP 实例（单实例处理双向通信）
 	kcp     *kcp.KCP
 	kcpLock sync.Mutex
+	mtu     int // KCP 线上包 MTU（含 KCP 头；0 表示用默认 KcpMtu）
 
 	// 数据通道
 	sendChan chan []byte // KCP 输出 -> 网络发送
@@ -129,7 +130,8 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 	t.kcp.WndSize(1024, 1024)
 	// 设置 MTU 为 1400（典型以太网 MTU 1500 - IP/UDP 头部）
 	// MSS = MTU - KCP头部(24) = 1376，更大的 MSS 减少分片
-	t.kcp.SetMtu(KcpMtu)
+	t.mtu = KcpMtu
+	t.kcp.SetMtu(t.mtu)
 
 	// 第1个参数 nodelay-启用以后若干常规加速将启动
 	// 第2个参数 interval为内部处理时钟，默认设置为 10ms
@@ -156,6 +158,19 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 // 重叠，nodelay=1（minRTO=30ms）会因延迟抖动产生大量伪重传，线上流量可被
 // 放大 2~3 倍；此时建议 nodelay=0, interval=20~40, resend=0, nc=1。
 // 详见 test/socks_trunk_kcp/README.md 的"线上流量放大"一节。
+// SetMtu 设置 KCP 线上包 MTU（含 KCP 头；默认 KcpMtu=1400）。
+// 用于路径 MTU 受限的场景（如 VPN/隧道出口把 MSS 夹到 1280，或底层是 faux_tcp
+// 且其 mss 被调小）：MTU 必须 ≤ 底层单包可承载字节数，否则大于路径 MTU 的报文
+// 会被丢弃（faux_tcp 的报文带 DF，不会被分片）。
+// 需在 Run/AddConn 之前调用（同时影响收包长度校验）。
+func (t *TrunkKCP) SetMtu(mtu int) {
+	if mtu <= kcpHeaderSize || mtu > KcpMtu {
+		return
+	}
+	t.mtu = mtu
+	t.kcp.SetMtu(mtu)
+}
+
 func (t *TrunkKCP) SetNoDelay(nodelay, interval, resend, nc int) {
 	t.kcpLock.Lock()
 	defer t.kcpLock.Unlock()
@@ -292,7 +307,11 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, ac *activeConn) {
 
 			// KCP 的 len 在 20~24 Byte, 直接解析即可
 			payloadLen := binary.LittleEndian.Uint32(pending[20:24])
-			if payloadLen > KcpMtu-kcpHeaderSize {
+			mtu := t.mtu
+			if mtu <= 0 {
+				mtu = KcpMtu
+			}
+			if payloadLen > uint32(mtu-kcpHeaderSize) {
 				log.Ctx(ctx).Warn().Msgf("recvLoop conn %d invalid KCP segment length: %d", ac.id, payloadLen)
 				t.RemoveConn(ac.id)
 				return

@@ -3,6 +3,7 @@ package socks_faux_kcp
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 func TestWriteReadOpenHeader(t *testing.T) {
@@ -91,5 +92,21 @@ func TestNoDelayParam(t *testing.T) {
 	n, i, r, nc = cfg.NoDelayParam()
 	if n != 0 || i != 20 || r != -1 || nc != -1 {
 		t.Fatalf("partial config mapping wrong, got %d %d %d %d", n, i, r, nc)
+	}
+}
+
+func TestHandshakeBudget(t *testing.T) {
+	// 零值：faux_tcp 默认 1s × (3+1)
+	if got := (FauxTCPConfig{}).HandshakeBudget(); got != 4*time.Second {
+		t.Fatalf("default budget = %v, want 4s", got)
+	}
+	// 配置文件里的 3s × (3+1)
+	cfg := FauxTCPConfig{HandshakeTimeoutMS: 3000, HandshakeRetries: 3}
+	if got := cfg.HandshakeBudget(); got != 12*time.Second {
+		t.Fatalf("3s budget = %v, want 12s", got)
+	}
+	// 单次超时不小于零值时用默认
+	if got := (FauxTCPConfig{HandshakeRetries: 1}).HandshakeBudget(); got != 2*time.Second {
+		t.Fatalf("1 retry budget = %v, want 2s", got)
 	}
 }

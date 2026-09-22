@@ -36,8 +36,9 @@ func (d *FauxDialer) Dial(ctx context.Context) (net.Conn, error) {
 	conn, err := faux_tcp.Dial(ctx, cfg, d.Local, d.Remote)
 	if err != nil {
 		return nil, fmt.Errorf("faux_tcp dial %s: %w "+
-			"(需要 Linux + root/CAP_NET_RAW；若不想自动装 iptables RST 抑制规则，"+
-			"可设 faux_tcp.manual_firewall 并按 README 手工配置)", d.Remote, err)
+			"(本机需要 Linux + root/CAP_NET_RAW；跨机需确认服务端已运行、"+
+			"云安全组/防火墙放行入站该 TCP 端口、两端都做了 RST 抑制；"+
+			"不想自动装 iptables 规则可设 faux_tcp.manual_firewall 并按 README 手工配置)", d.Remote, err)
 	}
 	return conn, nil
 }

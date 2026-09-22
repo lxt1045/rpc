@@ -37,20 +37,28 @@ func fwRun(name string, args ...string) (string, error) {
 	return string(out), err
 }
 
-// iptablesRSTDrop iptables 实现：
+// iptablesRSTDrop iptables 实现。**规则装在 raw 表**：
 //
-//	iptables -A OUTPUT -p tcp --sport <port> --tcp-flags RST RST -j DROP
+//	iptables -t raw -A OUTPUT -p tcp --sport <port> --tcp-flags RST RST -j DROP
+//
+// 为什么必须是 raw 表（而不是 filter 表的 OUTPUT）：内核收到"无监听 socket 的
+// SYN"会回 RST。若只在 filter 表丢弃，包虽被丢掉（客户端看不到），但 **conntrack
+// 已经先记录了这条 RST**，把该流标成 CLOSED/RST —— 之后本进程用户态发出的
+// SYN+ACK 在 conntrack 眼里是 INVALID，NAT（宿主机自身或云平台）不会为它做地址
+// 转换，客户端表现为"服务端发了 SYN+ACK 却一个包都收不到"。
+// raw 表在 conntrack 之前执行（priority -300 < -200），从源头避免状态被污染。
+// 同时清理旧版本装在 filter 表的同名规则（否则它仍会污染 conntrack）。
 func iptablesRSTDrop(iptables string, port uint16) (func(), error) {
-	rule := []string{"-p", "tcp", "--sport", fmt.Sprint(port), "--tcp-flags", "RST", "RST", "-j", "DROP"}
+	rule := iptablesRSTRule(port)
 
 	// -C 检查幂等：已存在（运维手工配过）则不重复添加，清理时也不删别人的规则
-	check := append([]string{"-C", "OUTPUT"}, rule...)
+	check := append([]string{"-t", "raw", "-C", "OUTPUT"}, rule...)
 	if _, err := fwRun(iptables, check...); err == nil {
 		return func() {}, nil
 	}
-	add := append([]string{"-A", "OUTPUT"}, rule...)
+	add := append([]string{"-t", "raw", "-A", "OUTPUT"}, rule...)
 	if out, err := fwRun(iptables, add...); err != nil {
-		return nil, ErrFirewall.Newf("iptables -A 失败: %v, %s", err, strings.TrimSpace(string(out)))
+		return nil, ErrFirewall.Newf("iptables -t raw -A OUTPUT 失败: %v, %s", err, strings.TrimSpace(string(out)))
 	}
 
 	var once bool = true
@@ -59,12 +67,25 @@ func iptablesRSTDrop(iptables string, port uint16) (func(), error) {
 			return
 		}
 		once = false
-		del := append([]string{"-D", "OUTPUT"}, rule...)
+		del := append([]string{"-t", "raw", "-D", "OUTPUT"}, rule...)
 		_, _ = fwRun(iptables, del...)
+		legacy := append([]string{"-D", "OUTPUT"}, rule...)
+		_, _ = fwRun(iptables, legacy...)
 	}, nil
 }
 
-// nftRSTDrop nftables 实现：独立表 inet faux_tcp_rst，便于整体清理
+// rstDropTable RST 抑制规则必须挂的表：raw（conntrack 之前）。
+const rstDropTable = "raw"
+
+// iptablesRSTRule 构造 RST 抑制匹配条件（不含 -t/-A/-C/-D）。
+func iptablesRSTRule(port uint16) []string {
+	return []string{"-p", "tcp", "--sport", fmt.Sprint(port), "--tcp-flags", "RST", "RST", "-j", "DROP"}
+}
+
+// nftRSTDrop nftables 实现：独立表 inet faux_tcp_rst，便于整体清理。
+// 链挂 **priority raw（-300）**：保证在 conntrack 之前丢弃内核 RST，
+// 否则 conntrack 会先把该流标成 RST/CLOSED，之后用户态 SYN+ACK 被判 INVALID
+// 而无法被 NAT 转换（详见 iptablesRSTDrop 注释）。
 func nftRSTDrop(nft string, port uint16) (func(), error) {
 	const (
 		table = "faux_tcp_rst"
@@ -75,7 +96,7 @@ func nftRSTDrop(nft string, port uint16) (func(), error) {
 			return nil, ErrFirewall.Newf("nft add table 失败: %v", err)
 		}
 		if _, err := fwRun(nft, "add", "chain", "inet", table, chain,
-			"{", "type", "filter", "hook", "output", "priority", "0", ";", "policy", "accept", ";", "}"); err != nil {
+			"{", "type", "filter", "hook", "output", "priority", "raw", ";", "policy", "accept", ";", "}"); err != nil {
 			return nil, ErrFirewall.Newf("nft add chain 失败: %v", err)
 		}
 	}

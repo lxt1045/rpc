@@ -22,6 +22,10 @@ type TrunkKCPConfig struct {
 	MaxConns       int    `yaml:"max_conns"`
 	MaxVirtualConn int    `yaml:"max_virtual_conn"`
 
+	// KCPMtu KCP 线上包 MTU（含 24B KCP 头），默认 1400。
+	// 路径 MTU 受限时（VPN/隧道出口改写 MSS）必须调小：kcp_mtu ≤ faux_tcp.mss。
+	KCPMtu int `yaml:"kcp_mtu"`
+
 	// KCP NoDelay 参数（语义同 kcp.KCP.NoDelay），nil 表示使用库默认值 (1,10,32,1)。
 	// 客户端与服务端必须配置成相同的值。
 	//
@@ -61,6 +65,9 @@ func (c *TrunkKCPConfig) ApplyKCPParam(t *trunk_kcp.TrunkKCP) {
 	if c == nil || t == nil {
 		return
 	}
+	if c.KCPMtu > 0 {
+		t.SetMtu(c.KCPMtu)
+	}
 	nodelay, interval, resend, nc := c.NoDelayParam()
 	if nodelay < 0 && interval < 0 && resend < 0 && nc < 0 {
 		return
@@ -73,6 +80,14 @@ type FauxTCPConfig struct {
 	// MSS 单个 TCP 段最大载荷，默认 1448。必须 ≥ KCP 线上包（默认 1400），
 	// 否则上层（trunk_kcp 按长度流式重组）会因半帧丢失永久错位。
 	MSS int `yaml:"mss"`
+	// AdvMSS 本端 SYN/SYN+ACK 里通告的 MSS，默认 = MSS。MSS 管"本端发多大"，
+	// AdvMSS 管"对端发多大"；两者分开是为了对付路径上的 MSS-clamp 中间盒：
+	// 它只在"需要改写 MSS"时才为该流建会话状态，本端把 MSS 调到 1240（≤ 它的
+	// 改写目标）后它不改写也不建状态，回程 SYN+ACK 会被丢弃（内核 TCP 通告 1460
+	// 被改写成 1280，所以内核一切正常）。这种情况把 adv_mss 显式设成 1460。
+	AdvMSS int `yaml:"adv_mss"`
+	// Window 通告的接收窗口，默认 65535（faux_tcp 默认）。
+	Window int `yaml:"window"`
 	// TTL IPv4 TTL，默认 64（仿 Linux）。
 	TTL int `yaml:"ttl"`
 	// KeepAliveSeconds 空闲保活间隔（标准 TCP keepalive 探测包），默认 25。
@@ -85,16 +100,31 @@ type FauxTCPConfig struct {
 	CloseGraceMS int `yaml:"close_grace_ms"`
 	// HealDelayMS 丢包后 ack "虚拟重传愈合"等待，默认 200ms。
 	HealDelayMS int `yaml:"heal_delay_ms"`
+	// ReplySrc 出包源地址，**云主机默认留空**：留空=按报文目的 IP 作为源（网卡内网
+	// 地址），由平台 NAT 转成公网，与内核 TCP 同路。仅"无状态 DNAT/端口映射"
+	// （Docker 桥接、K8s NodePort）回程不通时填对外服务地址。
+	// 云主机 1:1 NAT/弹性公网 IP 场景填公网 IP 会被平台源地址校验静默丢弃
+	// （内核 TCP 能通、faux_tcp 握手超时），faux_tcp 启动时会对非本机地址打 WARN。
+	ReplySrc string `yaml:"reply_src"`
+	// DebugPackets 收包调试（不挂 cBPF + 用户态过滤计数），排查"收不到包"时开。
+	DebugPackets bool `yaml:"debug_packets"`
 	// ManualFirewall true 表示 RST 抑制规则由运维手工维护（faux_tcp 默认自动装拆）。
 	ManualFirewall bool `yaml:"manual_firewall"`
 }
 
 // ToFauxTCP 转换为 faux_tcp.Config（零值字段交给 faux_tcp 填默认）。
 func (c FauxTCPConfig) ToFauxTCP() faux_tcp.Config {
+	win := 0 // 0 = 用 faux_tcp 默认窗口
+	if c.Window > 0 && c.Window <= 65535 {
+		win = c.Window
+	}
 	cfg := faux_tcp.Config{
 		MSS:              c.MSS,
+		AdvMSS:           c.AdvMSS,
+		Window:           uint16(win),
 		TTL:              uint8(c.TTL),
 		HandshakeRetries: c.HandshakeRetries,
+		DebugPackets:     c.DebugPackets,
 		ManualFirewall:   c.ManualFirewall,
 	}
 	if c.KeepAliveSeconds > 0 {
@@ -109,7 +139,27 @@ func (c FauxTCPConfig) ToFauxTCP() faux_tcp.Config {
 	if c.HealDelayMS > 0 {
 		cfg.HealDelay = time.Duration(c.HealDelayMS) * time.Millisecond
 	}
+	if c.ReplySrc != "" {
+		if ip, err := netip.ParseAddr(c.ReplySrc); err == nil && ip.Is4() {
+			cfg.ReplySrc = ip
+		}
+	}
 	return cfg
+}
+
+// HandshakeBudget 估算一次 faux_tcp 拨号最长耗时（单次超时 × (重试+1)），
+// 零值字段按 faux_tcp 默认（1s/3 次）计算。客户端拨号 ctx 超时必须大于它，
+// 否则超时会先被 ctx 吃掉，握手失败的自诊断信息就看不到了。
+func (c FauxTCPConfig) HandshakeBudget() time.Duration {
+	timeout := time.Duration(c.HandshakeTimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = time.Second // faux_tcp 默认 HandshakeTimeout
+	}
+	retries := c.HandshakeRetries
+	if retries <= 0 {
+		retries = 3 // faux_tcp 默认 HandshakeRetries
+	}
+	return timeout * time.Duration(retries+1)
 }
 
 // ConnConfig 服务端监听 / 客户端拨号地址。
@@ -218,7 +268,9 @@ func (c *FauxTCPConfig) ValidateMSS(kcpMTU int) error {
 		kcpMTU = 1400 // trunk_kcp 默认 KCP 线上包
 	}
 	if mss < kcpMTU {
-		return fmt.Errorf("faux_tcp MSS(%d) 小于 KCP 线上包(%d)：丢包会造成半帧错位，请调大 MSS", mss, kcpMTU)
+		return fmt.Errorf("faux_tcp MSS(%d) 小于 KCP 线上包(%d)：丢包会造成半帧错位，"+
+			"请调大 MSS；若路径 MTU 受限（如 VPN 把 MSS 夹到 1280），请同时调小 "+
+			"faux_tcp.mss 与 trunk_kcp.kcp_mtu（保持 kcp_mtu ≤ mss）", mss, kcpMTU)
 	}
 	return nil
 }
@@ -243,7 +295,7 @@ func ValidateClientConfig(c *ClientConfig) error {
 	if c.ClientConn.Addr == "" {
 		return fmt.Errorf("client-conn.addr is required")
 	}
-	if err := c.FauxTCP.ValidateMSS(0); err != nil {
+	if err := c.FauxTCP.ValidateMSS(c.Trunk.KCPMtu); err != nil {
 		return err
 	}
 	return nil
@@ -258,7 +310,7 @@ func ValidateServerConfig(c *ServerConfig) error {
 	if c.Conn.Addr == "" {
 		return fmt.Errorf("conn.addr is required")
 	}
-	if err := c.FauxTCP.ValidateMSS(0); err != nil {
+	if err := c.FauxTCP.ValidateMSS(c.Trunk.KCPMtu); err != nil {
 		return err
 	}
 	return nil

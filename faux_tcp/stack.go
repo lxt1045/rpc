@@ -1,10 +1,13 @@
 package faux_tcp
 
 import (
+	"context"
 	"io"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lxt1045/utils/log"
 )
 
 // state TCP 状态机的状态
@@ -128,6 +131,9 @@ func (d *demux) sendRst(p *Packet) {
 		}
 	}
 	src := Endpoint{IP: p.Dst.IP, Port: p.Dst.Port}
+	if d.cfg.ReplySrc.IsValid() {
+		src.IP = d.cfg.ReplySrc
+	}
 	bs := buildPacket(&d.cfg, src, p.Src, seq, ack, flags, clockMS(), p.TSval, nil, 0)
 	_ = d.link.WritePacket(bs)
 }
@@ -193,6 +199,7 @@ type fconn struct {
 	sndNxt   uint32 // 下一个发送序号（只增不减，与对端 ack 无关）
 	rcvNxt   uint32 // 对端最高连续序号（ack 语义自洽的核心）
 	tsRecent uint32 // 对端最近 TSval（回显到 TSecr）
+	peerMSS  uint16 // 对端通告的 MSS（路径 MTU 受限时可据此校准本端分段）
 	ipID     uint16 // IPv4 ID（递增，仿 Linux）
 	lastSent time.Time
 	lastRecv time.Time // 最近一次入站报文（死亡检测/半开回收）
@@ -226,9 +233,14 @@ type fconn struct {
 	// 在持有 c.mu 的路径上调用，实现必须非阻塞。
 	onEstablished func(c *fconn)
 
-	// 统计（测试/观测用）
+	// 统计（测试/观测用；握手超时诊断也依赖它们）
 	SentPackets atomic.Int64
 	RecvPackets atomic.Int64
+	// SendErrors 链路发包失败次数（raw socket 错误此前被静默丢弃，
+	// 会让"本机发不出去"与"对端没回"都表现为握手超时）
+	SendErrors atomic.Int64
+	sendErrMu  sync.Mutex
+	sendErr    error
 }
 
 func newFConn(cfg Config, d *demux, local, remote Endpoint) *fconn {
@@ -305,12 +317,35 @@ func (c *fconn) buildLocked(flags uint8, payload []byte, sack [][2]uint32) []byt
 	return bs
 }
 
+// recordSendErr 记录一次链路发送失败（供握手/连接错误信息诊断）；
+// 前几次同时打到 debug 日志，服务端"回不出 SYNACK"这类问题可以直接从日志看到。
+func (c *fconn) recordSendErr(err error) {
+	if err == nil {
+		return
+	}
+	n := c.SendErrors.Add(1)
+	c.sendErrMu.Lock()
+	c.sendErr = err
+	c.sendErrMu.Unlock()
+	if n <= 3 {
+		log.Ctx(context.Background()).Debug().
+			Msgf("faux_tcp: 发包失败(%d) %s -> %s: %v", n, c.local, c.remote, err)
+	}
+}
+
+// lastSendErr 返回最近一次发送失败（无则 nil）。
+func (c *fconn) lastSendErr() error {
+	c.sendErrMu.Lock()
+	defer c.sendErrMu.Unlock()
+	return c.sendErr
+}
+
 // dispatchControlLocked 发出控制段：优先异步队列，满则同步兜底。持有 c.mu 调用。
 func (c *fconn) dispatchControlLocked(bs []byte) {
 	select {
 	case c.outCh <- bs:
 	default:
-		_ = c.d.link.WritePacket(bs)
+		c.recordSendErr(c.d.link.WritePacket(bs))
 	}
 }
 
@@ -319,18 +354,41 @@ func (c *fconn) writeLoop() {
 	for {
 		select {
 		case bs := <-c.outCh:
-			_ = c.d.link.WritePacket(bs)
+			c.recordSendErr(c.d.link.WritePacket(bs))
 		case <-c.done:
 			for {
 				select {
 				case bs := <-c.outCh:
-					_ = c.d.link.WritePacket(bs)
+					c.recordSendErr(c.d.link.WritePacket(bs))
 				default:
 					return
 				}
 			}
 		}
 	}
+}
+
+// notePeerMSS 记录对端/路径通告的 MSS；若小于本端 MSS，说明路径 MTU 受限
+// （常见于 VPN/隧道出口改写 MSS），必须把 faux_tcp.mss 与 KCP MTU 一起调小，
+// 否则大于路径 MTU 的报文会被丢弃（本层报文带 DF，不会被分片）。
+func (c *fconn) notePeerMSS(peerMSS uint16) {
+	if peerMSS == 0 {
+		return
+	}
+	c.peerMSS = peerMSS
+	if int(peerMSS) < c.cfg.MSS {
+		log.Ctx(context.Background()).Warn().
+			Msgf("faux_tcp: 对端/路径通告 MSS=%d < 本端 MSS=%d（路径 MTU 受限）："+
+				"请把 faux_tcp.mss 调到 ≤%d，并把 KCP MTU(kcp_mtu) 调到 ≤ faux_tcp.mss，"+
+				"否则大于路径 MTU 的报文会被丢弃", peerMSS, c.cfg.MSS, peerMSS)
+	}
+}
+
+// PeerMSS 返回对端在握手时通告的 MSS（0 表示未通告）。
+func (c *fconn) PeerMSS() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return int(c.peerMSS)
 }
 
 // sendLocked 构造并入队一个控制段；调用方按语义推进 sndNxt。持有 c.mu 调用。
@@ -507,8 +565,13 @@ func (c *fconn) onTick() {
 	idle := time.Since(c.lastRecv)
 	switch c.state {
 	case stSynRcvd:
-		// 半开连接（SYN 扫描留下的）超时回收
+		// 半开连接超时回收：SYNACK 发出多次仍收不到最后一个 ACK，通常是
+		// 回程被 NAT/防火墙/容器网络丢弃（客户端会表现为"握手超时、收到 0 个报文"）
 		if idle > c.cfg.handshakeWindow() {
+			log.Ctx(context.Background()).Debug().
+				Msgf("faux_tcp: 半开连接超时回收 peer=%s（已发 %d 个报文未收到 ACK；"+
+					"若对端报握手超时，请检查回程：NAT/安全组/容器网络是否放行本端发出的 SYN+ACK）",
+					c.remote, c.SentPackets.Load())
 			c.closeLocked(nil)
 		}
 	case stEstablished:
@@ -562,6 +625,7 @@ func (c *fconn) handlePacket(p *Packet) {
 func (c *fconn) handleSynSent(p *Packet) {
 	if p.Has(flagSYN) && p.Has(flagACK) && p.Ack == c.sndNxt {
 		c.rcvNxt = p.Seq + 1
+		c.notePeerMSS(p.MSS)
 		c.state = stEstablished
 		c.sendLocked(flagACK, nil)
 		select {

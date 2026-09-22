@@ -33,6 +33,13 @@
 - [x] 窗口通告固定大窗口（如 65535 + wscale=7），不出现零窗口—— `Config.Window/WScale`
 - [x] 保活为标准 TCP 探测包（seq=sndNxt-1）+ 对端死亡回收；半开连接超时回收—— `TestKeepaliveProbe` / `TestPeerDeathReap` / `TestHalfOpenReap`（2026-09 改进）
 - [x] 内核 RST 抑制自动装拆（iptables/nft 幂等）+ 收包 cBPF 过滤—— `firewall_linux.go` / `link_linux.go`（2026-09 改进，真机验证仍待阶段 2/3）
+- [x] 收包改用 cooked `AF_PACKET/SOCK_DGRAM`（内核剥链路层头）：兼容以太网/lo 与
+  tun/wireguard/ppp 等无以太网头接口；cBPF 偏移随之改为 IP 头内偏移（`TestBPFFilterCookedOffsets`
+  用用户态 BPF VM 钉住偏移，含 IHL=6 的 IP 选项用例）——2026-09 远程拨号"收到 0 个报文"故障的修复
+- [x] 收包不绑定单网卡（兼容多网卡非对称路由）+ `Config.DebugPackets` 收包调试计数
+  （`rx_total/rx_match/rx_dropped`，用户态过滤，`TestMatchTCPDstPortUserspace` 覆盖）——2026-09
+- [x] 握手超时自诊断：统计发送失败次数/最近发送错误/收包数/本端链路（`iface=`），
+  区分"本机发不出去""对端无回包""有回包但非 SYN+ACK"—— `TestHandshakeTimeoutDiagnostics`
 
 ### 必须去掉的 TCP 机制
 

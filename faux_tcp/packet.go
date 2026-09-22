@@ -44,6 +44,7 @@ type Packet struct {
 
 	TSval, TSecr uint32 // 时间戳选项（0 表示不存在）
 	SACK         [][2]uint32
+	MSS          uint16 // 对端在 SYN/SYN+ACK 里通告的 MSS（0 表示未通告）
 	// Payload 数据载荷。parsePacket 为每个报文独立分配（所有权归 Packet，
 	// 投递时无需再拷贝）；手工构造的 Packet 由调用方持有。
 	Payload []byte
@@ -57,16 +58,18 @@ func (p *Packet) Has(f uint8) bool { return p.Flags&f != 0 }
 // ---------------------------------------------------------------------------
 
 // tcpOptionsSyn 仿 Linux 的 SYN 选项布局：
-// MSS(4) + SACK-perm(2) + TS(10) + NOP(1) + WS(3) = 20 字节
-func tcpOptionsSyn(mss int, wscale uint8, tsval uint32) []byte {
+// MSS(4) + SACK-perm(2) + TS(10) + NOP(1) + WS(3) = 20 字节。
+// tsecr 必须回显对端 SYN 的 TSval（主动侧首个 SYN 为 0）：真实 Linux 一定回显，
+// 置 0 会被部分状态化 NAT/防火墙判为无效（曾实测到服务端 SYN+ACK 一直是 ecr 0）。
+func tcpOptionsSyn(mss int, wscale uint8, tsval, tsecr uint32) []byte {
 	opts := make([]byte, 20)
 	opts[0], opts[1] = 2, 4 // MSS
 	binary.BigEndian.PutUint16(opts[2:4], uint16(mss))
 	opts[4], opts[5] = 4, 2  // SACK permitted
 	opts[6], opts[7] = 8, 10 // TS
 	binary.BigEndian.PutUint32(opts[8:12], tsval)
-	binary.BigEndian.PutUint32(opts[12:16], 0) // TSecr=0
-	opts[16] = 1                               // NOP
+	binary.BigEndian.PutUint32(opts[12:16], tsecr) // 回显对端 TSval
+	opts[16] = 1                                   // NOP
 	opts[17], opts[18], opts[19] = 3, 3, wscale
 	return opts
 }
@@ -113,7 +116,7 @@ func buildPacketSack(cfg *Config, src, dst Endpoint, seq, ack uint32, flags uint
 	var opts []byte
 	switch {
 	case flags&flagSYN != 0:
-		opts = tcpOptionsSyn(cfg.MSS, cfg.WScale, tsval)
+		opts = tcpOptionsSyn(cfg.AdvMSS, cfg.WScale, tsval, tsecr)
 	case len(sack) > 0:
 		opts = tcpOptionsSack(tsval, tsecr, sack)
 	default:
@@ -268,6 +271,8 @@ func parseOptions(opts []byte, p *Packet) {
 			return
 		}
 		switch {
+		case kind == 2 && l == 4: // MSS
+			p.MSS = binary.BigEndian.Uint16(opts[i+2 : i+4])
 		case kind == 8 && l == 10: // TS
 			p.TSval = binary.BigEndian.Uint32(opts[i+2 : i+6])
 			p.TSecr = binary.BigEndian.Uint32(opts[i+6 : i+10])
@@ -281,17 +286,4 @@ func parseOptions(opts []byte, p *Packet) {
 		}
 		i += l
 	}
-}
-
-// stripEthernet 剥离以太网头；非 IPv4 以太帧返回 nil。
-// 返回的切片引用入参。
-func stripEthernet(frame []byte) []byte {
-	const ethLen = 14
-	if len(frame) < ethLen {
-		return nil
-	}
-	if binary.BigEndian.Uint16(frame[12:14]) != 0x0800 {
-		return nil
-	}
-	return frame[ethLen:]
 }

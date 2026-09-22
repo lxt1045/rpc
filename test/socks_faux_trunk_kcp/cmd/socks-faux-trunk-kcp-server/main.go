@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"expvar"
+	"io"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -20,6 +22,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+/*
+$env:CGO_ENABLED=0; $env:GOOS="linux"; $env:GOARCH="amd64"; go build ./
+*/
 type Config struct {
 	Debug bool
 	Pprof bool
@@ -42,7 +47,8 @@ func main() {
 	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	conf := &Config{}
-	if err := config.UnmarshalFS("static/conf/default.yml", filesystem.Static, conf); err != nil {
+	confSource, err := socks.LoadConfig("static/conf/default.yml", filesystem.Static, conf)
+	if err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
@@ -50,6 +56,8 @@ func main() {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
+	log.Ctx(ctx).Info().Str("conf", confSource).Msg("config loaded")
+	log.Ctx(ctx).Info().Str("conf.faux_tcp.reply_src", conf.FauxTCP.ReplySrc).Msg("reply_src")
 
 	token := os.Getenv("SOCKS_TRUNK_TOKEN")
 	if token == "" {
@@ -83,6 +91,32 @@ func main() {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
+	// 诊断模式：内核 TCP 监听同一端口并回显（对照 faux_tcp 失败时用）。
+	// 用途：容器/端口映射环境下判断"回程是否通"——若内核 TCP 能连通而 faux_tcp
+	// 不通，说明端口映射与回程对内核 TCP 有效，问题在 raw socket 回程（需要
+	// --network host 或宿主/平台配合）。
+	if os.Getenv("SOCKS_FAUX_PLAIN_LISTEN") != "" {
+		ln, lerr := net.Listen("tcp", srvCfg.Conn.Addr)
+		if lerr != nil {
+			log.Ctx(ctx).Error().Caller().Err(lerr).Send()
+			return
+		}
+		log.Ctx(ctx).Warn().Str("addr", srvCfg.Conn.Addr).
+			Msg("PLAIN TCP 诊断监听已启动（内核 TCP，非 faux_tcp）：用于对照验证端口映射/回程")
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				log.Ctx(ctx).Error().Caller().Err(aerr).Send()
+				return
+			}
+			log.Ctx(ctx).Info().Str("remote", c.RemoteAddr().String()).Msg("PLAIN TCP 连接已建立")
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(c)
+		}
+	}
+
 	if err := socks.ConfigureACL(srvCfg.ACL); err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return

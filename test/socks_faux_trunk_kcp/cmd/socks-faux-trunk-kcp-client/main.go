@@ -44,7 +44,8 @@ func main() {
 	ctx, _ = log.WithLogid(ctx, gid.New())
 
 	conf := &Config{}
-	if err := config.UnmarshalFS("static/conf/default.yml", filesystem.Static, conf); err != nil {
+	confSource, err := socks.LoadConfig("static/conf/default.yml", filesystem.Static, conf)
+	if err != nil {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
@@ -52,6 +53,7 @@ func main() {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
+	log.Ctx(ctx).Info().Str("conf", confSource).Msg("config loaded")
 
 	token := os.Getenv("SOCKS_TRUNK_TOKEN")
 	if token == "" {

@@ -66,11 +66,17 @@ func (p *SocksCli) dialer() ConnDialer {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.dflt == nil {
+		// 拨号超时必须大于握手预算（单次超时 ×(重试+1)），否则 ctx 先超时，
+		// 握手超时的自诊断信息（收到几个报文/发送失败几次）就看不到。
+		timeout := p.FauxCfg.HandshakeBudget() + 2*time.Second
+		if timeout < 5*time.Second {
+			timeout = 5 * time.Second
+		}
 		p.dflt = &FauxDialer{
 			Config:  p.FauxCfg,
 			Local:   p.LocalAddr,
 			Remote:  p.PeerAddr,
-			Timeout: 5 * time.Second,
+			Timeout: timeout,
 		}
 	}
 	return p.dflt
