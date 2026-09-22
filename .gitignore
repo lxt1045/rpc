@@ -42,3 +42,4 @@ test/cert/cert_test2.go
 # runtime logs
 test/*/*/logs/
 test/socks_trunk_kcp/cmd/socks-trunk-kcp-server/socks-trunk-kcp-server
+test/socks_trunk_kcp/cmd/socks-trunk-kcp-client/socks-trunk-kcp-client

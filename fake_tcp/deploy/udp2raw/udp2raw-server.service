@@ -1,0 +1,21 @@
+# udp2raw 服务端（FakeTCP 伪装层）——配合 fake_tcp/deploy/udp2raw/README.md
+# 安装：cp udp2raw-server.service /etc/systemd/system/ && systemctl enable --now udp2raw-server
+# 环境变量在 /etc/fake_tcp/udp2raw-server.env 维护：
+#   PSK=xxx  LISTEN=0.0.0.0:4002  FORWARD=127.0.0.1:4001
+[Unit]
+Description=udp2raw server (FakeTCP camouflage)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/fake_tcp/udp2raw-server.env
+ExecStart=/usr/local/bin/udp2raw -s -l ${LISTEN} -r ${FORWARD} -k ${PSK} \
+  --raw-mode faketcp --cipher-mode none --auth-mode none --keep-rule
+Restart=always
+RestartSec=2
+# udp2raw 需要 raw socket 与 iptables 权限；不想 root 运行就放开下面两行
+# AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+# CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

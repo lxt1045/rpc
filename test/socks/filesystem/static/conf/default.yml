@@ -7,7 +7,7 @@ log:
   # store-level: info
   report-level: debug # 上报到日志系统的日志等级
   to-console: true
-  filename: "" # "./logs/running.log"
+  filename: "./logs/running.log"
   max-size: 20
   max-backups: 100
   max-age: 60

@@ -1,0 +1,20 @@
+# udp2raw 客户端（FakeTCP 伪装层）——配合 fake_tcp/deploy/udp2raw/README.md
+# 安装：cp udp2raw-client.service /etc/systemd/system/ && systemctl enable --now udp2raw-client
+# 环境变量在 /etc/fake_tcp/udp2raw-client.env 维护：
+#   PSK=xxx  LISTEN=127.0.0.1:4001  SERVER=1.2.3.4:4002
+[Unit]
+Description=udp2raw client (FakeTCP camouflage)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/fake_tcp/udp2raw-client.env
+ExecStart=/usr/local/bin/udp2raw -c -l ${LISTEN} -r ${SERVER} -k ${PSK} \
+  --raw-mode faketcp --cipher-mode none --auth-mode none --keep-rule
+Restart=always
+RestartSec=2
+# AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+# CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
