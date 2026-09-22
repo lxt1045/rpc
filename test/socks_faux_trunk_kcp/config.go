@@ -1,6 +1,8 @@
 package socks_faux_kcp
 
 import (
+	"crypto/tls"
+	"embed"
 	"fmt"
 	"net"
 	"net/netip"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/lxt1045/rpc/faux_tcp"
 	"github.com/lxt1045/rpc/trunk_kcp"
+	"github.com/lxt1045/utils/config"
 )
 
 // TrunkKCPConfig 控制底层 trunk_kcp 链路参数。
@@ -109,12 +112,53 @@ func (c FauxTCPConfig) ToFauxTCP() faux_tcp.Config {
 	return cfg
 }
 
-// ConnConfig 服务端监听 / 客户端拨号地址（本示例无 TLS：faux_tcp 自带 TCP 外观，
-// 但尚不含加密/认证传输层，token 以明文过线，详见 README）。
+// ConnConfig 服务端监听 / 客户端拨号地址。
 type ConnConfig struct {
 	Addr string `yaml:"addr"`
 	// LocalAddr 客户端可选：指定本地 IP:端口（默认按对端路由自动选择 IP + 随机端口）
 	LocalAddr string `yaml:"local_addr"`
+}
+
+// TLSConfig 控制端到端 TLS。TLS 跑在 trunk_kcp VirtualConn（可靠有序流）之上——
+// faux_tcp 是不可靠数据报语义，不能直接承载 TLS（记录 >MSS 会报错、丢包不补）。
+// 控制通道与每条代理数据连接各自一次 TLS 握手；open header（含目标地址）也在
+// TLS 之内传输。证书模型与仓库其它示例一致：CA 签发的 server/client 双向证书
+// （mTLS，见 utils/config.LoadTLSConfig）。
+type TLSConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	Host       string `yaml:"host"` // 客户端校验的 ServerName
+	CACert     string `yaml:"ca-cert"`
+	ServerCert string `yaml:"server-cert"`
+	ServerKey  string `yaml:"server-key"`
+	ClientCert string `yaml:"client-cert"`
+	ClientKey  string `yaml:"client-key"`
+}
+
+// ServerTLS 构建服务端 *tls.Config（mTLS：要求并校验客户端证书）。
+// Enabled=false 返回 nil（明文模式，仅供调试/兼容）。
+func (c TLSConfig) ServerTLS(fsys embed.FS) (*tls.Config, error) {
+	if !c.Enabled {
+		return nil, nil
+	}
+	cfg, err := config.LoadTLSConfig(fsys, c.ServerCert, c.ServerKey, c.CACert)
+	if err != nil {
+		return nil, fmt.Errorf("load server tls config: %w", err)
+	}
+	return cfg, nil
+}
+
+// ClientTLS 构建客户端 *tls.Config（携带客户端证书，校验服务端证书）。
+// Enabled=false 返回 nil（明文模式）。
+func (c TLSConfig) ClientTLS(fsys embed.FS) (*tls.Config, error) {
+	if !c.Enabled {
+		return nil, nil
+	}
+	cfg, err := config.LoadTLSConfig(fsys, c.ClientCert, c.ClientKey, c.CACert)
+	if err != nil {
+		return nil, fmt.Errorf("load client tls config: %w", err)
+	}
+	cfg.ServerName = c.Host
+	return cfg, nil
 }
 
 // ServerConfig 是服务端运行时配置。
@@ -124,6 +168,7 @@ type ServerConfig struct {
 	Conn       ConnConfig     `yaml:"conn"`
 	Trunk      TrunkKCPConfig `yaml:"trunk_kcp"`
 	FauxTCP    FauxTCPConfig  `yaml:"faux_tcp"`
+	TLS        TLSConfig      `yaml:"tls"`
 	ACL        ACLConfig      `yaml:"acl"`
 }
 
@@ -133,6 +178,7 @@ type ClientConfig struct {
 	ClientConn ConnConfig     `yaml:"client_conn"`
 	Trunk      TrunkKCPConfig `yaml:"trunk_kcp"`
 	FauxTCP    FauxTCPConfig  `yaml:"faux_tcp"`
+	TLS        TLSConfig      `yaml:"tls"`
 }
 
 // ACLConfig 简单访问控制。

@@ -67,12 +67,31 @@ trunk_kcp:
   min_conns: 1
   max_conns: 3
   max_virtual_conn: 32
+tls:
+  enabled: true
+  host: "speedtest.cn"
+  ca-cert: "static/ca/root-cert.pem"
+  server-cert: "static/ca/server-cert.pem"
+  server-key: "static/ca/server-key.pem"
+  client-cert: "static/ca/client-cert.pem"
+  client-key: "static/ca/client-key.pem"
 socks: "$SOCKS_ADDR"
 http: ""
 log:
   log-level: error
   to-console: true
 EOF
+
+# 证书：filesystem/static/ca/*.pem 不入 git，缺失时用 test/cert 现场生成
+CA_DIR="$ROOT/filesystem/static/ca"
+if [[ ! -f "$CA_DIR/server-cert.pem" ]]; then
+  echo "generating certs via test/cert ..."
+  mkdir -p "$CA_DIR"
+  (cd "$REPO_ROOT" && go test -run TestMake -count=1 ./test/cert >/dev/null)
+  for f in root-cert.pem server-cert.pem server-key.pem client-cert.pem client-key.pem; do
+    cp "$REPO_ROOT/test/cert/ca/$f" "$CA_DIR/$f"
+  done
+fi
 
 (cd "$REPO_ROOT" && go build -o "$WORK/server" ./test/socks_faux_trunk_kcp/cmd/socks-faux-trunk-kcp-server)
 (cd "$REPO_ROOT" && go build -o "$WORK/client" ./test/socks_faux_trunk_kcp/cmd/socks-faux-trunk-kcp-client)

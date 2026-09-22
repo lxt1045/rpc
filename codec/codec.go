@@ -54,7 +54,10 @@ type Codec struct {
 	// chDone <-chan struct{}
 	ctx context.Context
 
+	// rwc 底层连接：构造后不可变（Close 不再置 nil），因此读路径无需加锁；
+	// 关闭状态由 closed 表示。writeLock 只负责串行化帧写入（并发写不能交错）。
 	rwc       io.ReadWriteCloser
+	closed    atomic.Bool
 	writeLock sync.Mutex
 	// readLock  sync.Mutex
 	tmpCallSN uint32
@@ -94,22 +97,20 @@ type post struct {
 }
 
 func (c *Codec) Read(p []byte) (n int, err error) {
-	// c.readLock.Lock()
-	// defer c.readLock.Unlock()
-	rwc := c.rwc
-	if rwc == nil {
-		// Close() 已将 rwc 置 nil，避免并发 Read 触发 nil panic
+	// rwc 构造后不可变，读路径无需加锁；关闭后底层 Read 自行返回错误，
+	// 这里只在 Close 已完成时短路。
+	if c.closed.Load() {
 		return 0, ErrHasBeenClosed.Clone()
 	}
-	return rwc.Read(p)
+	return c.rwc.Read(p)
 }
 func (c *Codec) writeFull(p []byte) (int, error) {
 	c.writeLock.Lock()
 	defer c.writeLock.Unlock()
-	w := c.rwc
-	if w == nil {
+	if c.closed.Load() {
 		return 0, ErrHasBeenClosed.Clone()
 	}
+	w := c.rwc
 	total := 0
 	for total < len(p) {
 		n, err := w.Write(p[total:])
@@ -221,20 +222,16 @@ func (c *Codec) Close() (err error) {
 			}
 		}()
 
-		c.writeLock.Lock()
 		rwc := c.rwc
-		c.rwc = nil
-		c.writeLock.Unlock()
-		if rwc != nil {
-			if dl, ok := rwc.(interface{ SetWriteDeadline(time.Time) error }); ok {
-				// Closing must not wait forever behind a blocked writer. The
-				// connection is discarded after this best-effort close frame.
-				_ = dl.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-			}
+		if dl, ok := rwc.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			// 给收尾的 close 帧一个上界：对端不读时也不能把 Close 拖死
+			// （连接随后会被丢弃）。
+			_ = dl.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 		}
 		if atomic.LoadUint32(&c.status) == 0 {
 			_ = c.SendCloseMsg(c.ctx)
 		}
+		c.closed.Store(true)
 
 		if rwc != nil {
 			if tcpConn, ok := rwc.(*net.TCPConn); ok {
@@ -256,7 +253,7 @@ func (c *Codec) Close() (err error) {
 }
 
 func (c *Codec) IsClosed() (yes bool) {
-	return c == nil || c.rwc == nil
+	return c == nil || c.closed.Load()
 }
 
 func (rpc *Codec) Done() <-chan struct{} {
@@ -362,7 +359,7 @@ func (c *Codec) ReadLoop() {
 			if c.delay != nil {
 				c.delay.Close()
 			}
-		} else if c.rwc != nil {
+		} else if !c.closed.Load() {
 			c.Close()
 		}
 	}()
@@ -382,6 +379,10 @@ func (c *Codec) ReadLoop() {
 		// codec; returning here races with the response and leaves callers stuck.
 		if atomic.LoadUint32(&c.status) > 1 {
 			err = ErrHasBeenClosed.Clonef("ReadLoop c.status: %d", c.status)
+			return
+		}
+		if c.closed.Load() {
+			err = ErrHasBeenClosed.Clonef("ReadLoop closed")
 			return
 		}
 		header, bsBody, err = ReadPack(ctx, c.rwc, rbuf) // TODO: 设置读超时？？

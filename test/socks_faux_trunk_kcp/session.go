@@ -3,10 +3,12 @@ package socks_faux_kcp
 import (
 	"context"
 	"crypto/subtle"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lxt1045/rpc"
@@ -18,19 +20,28 @@ import (
 
 var sessionManager = newSessionManager()
 
+// serverTLS 服务端 TLS 配置（数据面 VirtualConn 与控制通道共用）；nil = 明文模式。
+var serverTLS atomic.Pointer[tls.Config]
+
+// SetServerTLSConfig 设置服务端 TLS 配置（main 在监听前调用一次）。
+func SetServerTLSConfig(cfg *tls.Config) {
+	serverTLS.Store(cfg)
+}
+
+func serverTLSConfig() *tls.Config { return serverTLS.Load() }
+
 type session struct {
 	clientID string
 	conv     uint32
 	maxVConn int
 
+	// authorized 会话级授权：由控制通道（迷你 trunk + TLS）上的 Auth 置位。
+	// 物理连接的 TrunkUpgrade 只认已授权会话。
+	authorized atomic.Bool
+
 	mu    sync.Mutex
-	conns []sessionConn
 	trunk *trunk_kcp.TrunkKCP
 	svcs  map[*SocksSvc]struct{}
-}
-
-type sessionConn struct {
-	rw io.ReadWriteCloser
 }
 
 type sessionManagerType struct {
@@ -40,11 +51,13 @@ type sessionManagerType struct {
 	maxVConn   int
 	kcpCfg     TrunkKCPConfig // KCP NoDelay 参数（NoDelayParam 为全 -1 时用库默认）
 	sessions   map[string]*session
+	byConv     map[uint32]*session // 数据面 trunk conv → 会话（TrunkUpgrade 鉴权用）
 }
 
 func newSessionManager() *sessionManagerType {
 	return &sessionManagerType{
 		sessions:   make(map[string]*session),
+		byConv:     make(map[uint32]*session),
 		maxClients: 1024,
 		maxVConn:   256,
 	}
@@ -81,6 +94,29 @@ func SetServerTrunkConfig(cfg TrunkKCPConfig) {
 	sessionManager.mu.Unlock()
 }
 
+// registerConv 建立 conv → 会话索引（TrunkStart 时调用）。
+func (m *sessionManagerType) registerConv(conv uint32, sess *session) {
+	m.mu.Lock()
+	m.byConv[conv] = sess
+	m.mu.Unlock()
+}
+
+// lookupConv 按 conv 查会话（物理连接 TrunkUpgrade 鉴权用）。
+func (m *sessionManagerType) lookupConv(conv uint32) *session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.byConv[conv]
+}
+
+// unregisterConv 摘除 conv 索引（会话关闭时调用）。
+func (m *sessionManagerType) unregisterConv(conv uint32, sess *session) {
+	m.mu.Lock()
+	if m.byConv[conv] == sess {
+		delete(m.byConv, conv)
+	}
+	m.mu.Unlock()
+}
+
 // SocksSvc 是服务端每个 RPC 连接对应的 service 实例。
 type SocksSvc struct {
 	Name       string
@@ -108,6 +144,8 @@ func (p *SocksSvc) Close(ctx context.Context, req *pb.CloseReq) (*pb.CloseRsp, e
 	return &pb.CloseRsp{}, nil
 }
 
+// Auth 认证。本示例中 Auth 只从控制通道（迷你 trunk + TLS）发起，
+// token 不会以明文出现在 faux_tcp 链路上。
 func (p *SocksSvc) Auth(ctx context.Context, req *pb.AuthReq) (*pb.AuthRsp, error) {
 	if req == nil || req.Name == "" {
 		return &pb.AuthRsp{Status: pb.AuthRsp_Fail, Err: &pb.Err{Msg: "empty token"}}, nil
@@ -142,16 +180,10 @@ func (p *SocksSvc) Auth(ctx context.Context, req *pb.AuthReq) (*pb.AuthRsp, erro
 	}
 	sessionManager.mu.Unlock()
 
-	// 如果是重连，检查是否需要清理旧的 trunk
+	// 注意：不在此做"旧 trunk 清理"——0 连接启动的新 trunk（TrunkStart 刚建、
+	// 物理连接还没 AddConn）ConnCount() 也是 0，误杀会造成 TrunkUpgrade 被拒
+	// 的竞态；重连时旧 trunk 由 TrunkStart 的"先关旧"逻辑回收。
 	sess.mu.Lock()
-	if sess.trunk != nil && sess.trunk.ConnCount() == 0 {
-		// trunk 存在但没有活跃连接，说明是旧的，需要清理
-		oldTrunk := sess.trunk
-		sess.trunk = nil
-		sess.conns = nil
-		log.Ctx(ctx).Info().Msg("cleaning up stale trunk in Auth")
-		go func() { _ = oldTrunk.Close() }()
-	}
 	sess.svcs[p] = struct{}{}
 	sess.mu.Unlock()
 
@@ -161,52 +193,50 @@ func (p *SocksSvc) Auth(ctx context.Context, req *pb.AuthReq) (*pb.AuthRsp, erro
 	p.sess = sess
 	p.mu.Unlock()
 	p.Name = req.Name
+
+	// 会话级授权（物理连接的 TrunkUpgrade 依此判定）
+	sess.authorized.Store(true)
 	return &pb.AuthRsp{Status: pb.AuthRsp_Succ}, nil
 }
 
 func (p *SocksSvc) Conn(ctx context.Context, req *pb.ConnReq) (*pb.ConnRsp, error) {
-	return nil, fmt.Errorf("Conn is not used by socks_trunk_kcp")
+	return nil, fmt.Errorf("Conn is not used by socks_faux_trunk_kcp")
 }
 
 func (p *SocksSvc) ConnUpgrade(ctx context.Context, req *pb.ConnUpgradeReq) (*pb.ConnUpgradeRsp, error) {
-	return nil, fmt.Errorf("ConnUpgrade is not used by socks_trunk_kcp")
+	return nil, fmt.Errorf("ConnUpgrade is not used by socks_faux_trunk_kcp")
 }
 
+// TrunkUpgrade 由物理连接（裸 RPC，无秘密）发起：把当前连接升级为数据面
+// trunk 的物理连接。鉴权方式：req.TrunkId 必须对应一个已授权且已 TrunkStart
+// 的会话（授权发生在控制通道的 TLS 内）。
 func (p *SocksSvc) TrunkUpgrade(ctx context.Context, req *pb.TrunkUpgradeReq) (*pb.TrunkUpgradeRsp, error) {
-	if !p.isAuthorized() {
-		return nil, fmt.Errorf("not authenticated")
+	if req == nil {
+		return nil, fmt.Errorf("nil request")
 	}
 	upgrade := codec.GetUpgrade(ctx)
 	if upgrade == nil {
 		return nil, fmt.Errorf("upgrade is nil")
 	}
-	sess, err := p.session()
+	sess := sessionManager.lookupConv(req.TrunkId)
+	if sess == nil || !sess.authorized.Load() {
+		upgrade.Close()
+		return nil, fmt.Errorf("trunk %d not authorized", req.TrunkId)
+	}
+	sess.mu.Lock()
+	trunk := sess.trunk
+	sess.mu.Unlock()
+	if trunk == nil {
+		upgrade.Close()
+		return nil, fmt.Errorf("trunk %d not started", req.TrunkId)
+	}
+	id, err := trunk.AddConn(upgrade)
 	if err != nil {
+		log.Ctx(ctx).Warn().Err(err).Msg("AddConn to trunk failed")
 		upgrade.Close()
 		return nil, err
 	}
-	sess.mu.Lock()
-	if sess.trunk != nil {
-		trunk := sess.trunk
-		sess.mu.Unlock()
-		// An idle trunk is healthy too; refresh its physical connections.
-		connCount := trunk.ConnCount()
-		virtualCount := trunk.VirtualConnCount()
-		if connCount > 0 {
-			if _, err := trunk.AddConn(upgrade); err != nil {
-				log.Ctx(ctx).Warn().Err(err).Msg("AddConn to existing trunk failed")
-				upgrade.Close()
-				return nil, err
-			}
-			log.Ctx(ctx).Info().Int("conn_count", connCount).Int("virtual_count", virtualCount).Msg("added conn to existing trunk")
-			return &pb.TrunkUpgradeRsp{}, nil
-		}
-		// trunk 没有活跃连接或虚拟连接，说明正在关闭或已废弃，需要重新创建
-		log.Ctx(ctx).Warn().Int("conn_count", connCount).Int("virtual_count", virtualCount).Msg("trunk exists but is stale or closing, treating as new session")
-		sess.mu.Lock()
-	}
-	sess.conns = append(sess.conns, sessionConn{rw: upgrade})
-	sess.mu.Unlock()
+	log.Ctx(ctx).Info().Int("conn_id", id).Uint32("trunk_id", req.TrunkId).Msg("physical conn upgraded into trunk")
 	return &pb.TrunkUpgradeRsp{}, nil
 }
 
@@ -234,6 +264,8 @@ func (p *SocksSvc) TrunkRemoveConn(ctx context.Context, req *pb.TrunkUpgradeReq)
 	return &pb.TrunkUpgradeRsp{}, nil
 }
 
+// TrunkStart 由控制通道（已认证）发起：创建数据面 trunk（0 物理连接启动，
+// 物理连接随后由各条连接的 TrunkUpgrade 逐个 AddConn 加入）。
 func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (*pb.TrunkStartRsp, error) {
 	if !p.isAuthorized() {
 		return nil, fmt.Errorf("not authenticated")
@@ -242,6 +274,11 @@ func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (*pb.T
 	if err != nil {
 		return nil, err
 	}
+	if !sess.authorized.Load() {
+		return nil, fmt.Errorf("session not authorized")
+	}
+	maxVConn := p.maxVirtualConns()
+
 	sess.mu.Lock()
 	// 如果已存在 trunk，先关闭旧的
 	if sess.trunk != nil {
@@ -252,31 +289,17 @@ func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (*pb.T
 		_ = oldTrunk.Close()
 		sess.mu.Lock()
 	}
-	conns := append([]sessionConn(nil), sess.conns...)
-	// 清空 conns 列表，防止重复使用
-	sess.conns = nil
-	sess.mu.Unlock()
-	if len(conns) != int(req.UpgradeCount) {
-		return nil, fmt.Errorf("upgrade count mismatch: have %d want %d", len(conns), req.UpgradeCount)
-	}
-	rws := make([]io.ReadWriteCloser, 0, len(conns))
-	for _, c := range conns {
-		rws = append(rws, c.rw)
-	}
-	maxVConn := p.maxVirtualConns()
 
-	// 创建回调函数，按需处理新的虚拟连接
 	onNewConn := func(vconn *trunk_kcp.VirtualConn) {
 		p.serveVirtualConn(ctx, vconn)
 	}
 
-	trunk := trunk_kcp.NewTrunkKCP(req.TrunkId, onNewConn, rws...)
-	// 应用服务端配置的 KCP NoDelay 参数（需与客户端一致）
+	// 0 物理连接启动（trunk_kcp 原生支持 AddConn 动态加入）
+	trunk := trunk_kcp.NewTrunkKCP(req.TrunkId, onNewConn)
 	sessionManager.mu.Lock()
 	kcpCfg := sessionManager.kcpCfg
 	sessionManager.mu.Unlock()
 	kcpCfg.ApplyKCPParam(trunk)
-	sess.mu.Lock()
 	sess.conv = req.TrunkId
 	sess.maxVConn = maxVConn
 	sess.trunk = trunk
@@ -285,6 +308,7 @@ func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (*pb.T
 	p.trunk = trunk
 	p.mu.Unlock()
 
+	sessionManager.registerConv(req.TrunkId, sess)
 	go trunk.Run(ctx)
 	return &pb.TrunkStartRsp{}, nil
 }
@@ -321,12 +345,25 @@ func (p *SocksSvc) maxVirtualConns() int {
 	return sessionManager.maxVConn
 }
 
+// serveVirtualConn 处理数据面虚拟连接：启用 TLS 时先把 vconn 包成 TLS 连接
+// （握手在内进行），open header（含目标地址）与应用数据都在 TLS 之内。
 func (p *SocksSvc) serveVirtualConn(ctx context.Context, vconn *trunk_kcp.VirtualConn) {
 	if vconn == nil {
 		return
 	}
 	defer vconn.Close()
-	msg, err := ReadOpenHeader(vconn)
+
+	var rwc io.ReadWriteCloser = vconn
+	if cfg := serverTLSConfig(); cfg != nil {
+		tlsConn, err := wrapTLSServer(ctx, vconn, nil, nil, cfg, 10*time.Second)
+		if err != nil {
+			log.Ctx(ctx).Debug().Err(err).Msg("virtual conn tls handshake failed")
+			return
+		}
+		rwc = tlsConn
+	}
+
+	msg, err := ReadOpenHeader(rwc)
 	if err != nil {
 		if err != io.EOF {
 			log.Ctx(ctx).Debug().Err(err).Msg("virtual conn closed before open")
@@ -335,25 +372,25 @@ func (p *SocksSvc) serveVirtualConn(ctx context.Context, vconn *trunk_kcp.Virtua
 	}
 	if !CheckACL(msg.Addr) {
 		log.Ctx(ctx).Warn().Str("addr", msg.Addr).Msg("acl deny")
-		_ = vconn.Close()
+		_ = rwc.Close()
 		return
 	}
 	d := net.Dialer{Timeout: 30 * time.Second}
 	rc, err := d.Dial("tcp", msg.Addr)
 	if err != nil {
 		log.Ctx(ctx).Warn().Err(err).Str("addr", msg.Addr).Msg("dial target failed")
-		_ = vconn.Close()
+		_ = rwc.Close()
 		return
 	}
 	if len(msg.Body) > 0 {
 		if _, err := rc.Write(msg.Body); err != nil {
 			rc.Close()
-			_ = vconn.Close()
+			_ = rwc.Close()
 			return
 		}
 	}
 	log.Ctx(ctx).Info().Str("addr", msg.Addr).Msg("proxy connected")
-	relay(ctx, vconn, rc)
+	relay(ctx, rwc, rc)
 }
 
 func (m *sessionManagerType) unregister(svc *SocksSvc) {
@@ -366,7 +403,7 @@ func (m *sessionManagerType) unregister(svc *SocksSvc) {
 	}
 	sess.mu.Lock()
 	delete(sess.svcs, svc)
-	empty := len(sess.svcs) == 0 && len(sess.conns) == 0
+	empty := len(sess.svcs) == 0
 	sess.mu.Unlock()
 	if empty {
 		m.closeSession(clientID)
@@ -382,15 +419,14 @@ func (m *sessionManagerType) closeSession(clientID string) {
 	m.mu.Unlock()
 	if ok {
 		sess.mu.Lock()
+		conv := sess.conv
 		if sess.trunk != nil {
 			_ = sess.trunk.Close()
 		}
-		for _, c := range sess.conns {
-			if c.rw != nil {
-				_ = c.rw.Close()
-			}
-		}
 		sess.mu.Unlock()
+		if conv != 0 {
+			m.unregisterConv(conv, sess)
+		}
 	}
 }
 

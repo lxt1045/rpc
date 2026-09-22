@@ -2,6 +2,7 @@ package socks_faux_kcp
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -30,7 +31,10 @@ type SocksCli struct {
 	Token     string
 	TrunkCfg  TrunkKCPConfig
 	FauxCfg   FauxTCPConfig
-	ChPeer    chan *Peer
+	// TLSCfg 端到端 TLS（跑在 trunk_kcp VirtualConn 上）：nil = 明文模式。
+	// 控制通道与每条代理数据连接都会做一次 TLS 握手。
+	TLSCfg *tls.Config
+	ChPeer chan *Peer
 
 	// Dialer 底层拨号器；nil 时按 PeerAddr/LocalAddr/FauxCfg 构造 FauxDialer。
 	// 测试可注入内存链路拨号器（见 faux_mem_test.go）。
@@ -117,9 +121,9 @@ func (p *SocksCli) GetPeer() *Peer {
 	}
 }
 
-// RunConnLoop 建立并认证一条控制 RPC 连接（承载 Auth/TrunkStart/TrunkUpgrade 等控制面调用）。
-// 控制面底层同样走 faux_tcp（伪装 TCP）；faux_tcp 不做重传，链路丢包时控制面
-// 调用可能失败，由上层重试（RunConnLoop 循环 + InitTrunk 重试）兜底。
+// RunConnLoop 建立并认证一条控制 RPC 连接（承载 Auth/TrunkStart/TrunkRemoveConn）。
+// 控制通道分层：faux_tcp → 迷你 trunk(KCP 可靠层) → 控制 vconn → TLS → RPC。
+// faux_tcp 不重传，迷你 trunk 为控制面补上可靠性；token 只在 TLS 之内传输。
 func (p *SocksCli) RunConnLoop(ctx context.Context) {
 	for {
 		select {
@@ -127,35 +131,69 @@ func (p *SocksCli) RunConnLoop(ctx context.Context) {
 			return
 		default:
 		}
-		conn, err := p.dial(ctx)
+		peer, err := p.dialControlPeer(ctx)
 		if err != nil {
 			log.Ctx(ctx).Warn().Err(err).Msg("dial control conn failed")
 			time.Sleep(time.Second)
 			continue
 		}
-		peer, err := rpc.NewPeer(ctx, p, pb.RegisterSocksCliServer, pb.NewSocksSvcClient)
-		if err != nil {
-			_ = conn.Close()
-			time.Sleep(time.Second)
-			continue
-		}
-		if err = peer.Conn(ctx, conn); err != nil {
-			_ = conn.Close()
-			time.Sleep(time.Second)
-			continue
-		}
-		if err = p.authPeer(ctx, peer); err != nil {
-			_ = conn.Close()
-			log.Ctx(ctx).Warn().Err(err).Msg("auth control conn failed")
-			time.Sleep(time.Second)
-			continue
-		}
 		select {
-		case p.ChPeer <- &Peer{Peer: peer, LocalAddrs: conn.LocalAddr().String(), RemoteAddrs: conn.RemoteAddr().String()}:
+		case p.ChPeer <- peer:
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// dialControlPeer 建立一条控制连接并完成认证。
+func (p *SocksCli) dialControlPeer(ctx context.Context) (*Peer, error) {
+	conn, err := p.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var ctrl *trunk_kcp.TrunkKCP
+	fail := func(err error) (*Peer, error) {
+		if ctrl != nil {
+			_ = ctrl.Close() // 连带关闭 faux_tcp 物理连接
+		}
+		_ = conn.Close()
+		return nil, err
+	}
+
+	// 类型标记：服务端按首字节分流（控制/物理）
+	if _, err := conn.Write([]byte{connTypeControl}); err != nil {
+		return fail(err)
+	}
+	// 迷你 trunk：为控制 RPC 提供可靠性（faux_tcp 不重传，丢包会打断裸 RPC）
+	ctrl = trunk_kcp.NewTrunkKCP(ctrlConv, nil, conn)
+	go ctrl.Run(ctx)
+	vconn := ctrl.GetConn(0)
+	if vconn == nil {
+		return fail(errors.New("control vconn open failed"))
+	}
+
+	// TLS（可选；token 只在 TLS 之内传输）
+	var c net.Conn = wrapVConn(vconn, conn.LocalAddr(), conn.RemoteAddr())
+	if p.TLSCfg != nil {
+		tlsConn, err := wrapTLSClient(ctx, vconn, conn.LocalAddr(), conn.RemoteAddr(), p.TLSCfg, 10*time.Second)
+		if err != nil {
+			return fail(err)
+		}
+		c = tlsConn
+	}
+
+	peer, err := rpc.NewPeer(ctx, p, pb.RegisterSocksCliServer, pb.NewSocksSvcClient)
+	if err != nil {
+		return fail(err)
+	}
+	if err = peer.Conn(ctx, &ctrlConn{Conn: c, ctrl: ctrl}); err != nil {
+		return fail(err)
+	}
+	if err = p.authPeer(ctx, peer); err != nil {
+		_ = peer.Close(ctx)
+		return fail(err)
+	}
+	return &Peer{Peer: peer, LocalAddrs: conn.LocalAddr().String(), RemoteAddrs: conn.RemoteAddr().String()}, nil
 }
 
 // InitTrunk 创建 N 条物理连接（faux_tcp）并启动 trunk_kcp。
@@ -177,11 +215,10 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 	if n <= 0 {
 		n = p.TrunkCfg.MinConns
 	}
-	conns, err := p.TrunkConn(ctx, conv, n)
-	if err != nil {
-		return err
-	}
 
+	// 顺序与 socks_trunk_kcp 相反：先在控制连接上 TrunkStart（服务端建
+	// 0 连接 trunk 并登记 conv→会话），再逐条拨物理连接 TrunkUpgrade 加入。
+	// 因为 TrunkUpgrade（物理连接上的裸 RPC）依赖 conv 对应的已授权会话。
 	trunkPeer := p.GetPeer()
 
 	req := &pb.TrunkStartReq{
@@ -192,9 +229,21 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 		return err
 	}
 
-	trunk := trunk_kcp.NewTrunkKCP(conv, nil, conns...)
+	conns, err := p.TrunkConn(ctx, conv, n)
+	if err != nil {
+		return err
+	}
+
+	trunk := trunk_kcp.NewTrunkKCP(conv, nil) // 本地 0 连接启动
 	// 应用配置的 KCP NoDelay 参数（物理层是 faux_tcp，默认快速模式即可）
 	p.TrunkCfg.ApplyKCPParam(trunk)
+	for _, c := range conns {
+		if _, err := trunk.AddConn(c); err != nil {
+			_ = c.Close()
+			_ = trunk.Close()
+			return err
+		}
+	}
 
 	// 空闲连接检测：1 分钟未收到数据则替换（faux_tcp 保活包不产生上层数据，
 	// 因此长期无代理流量时物理连接会被主动轮换，避免 NAT/防火墙表项老化）。
@@ -318,8 +367,9 @@ func (p *SocksCli) MaintainTrunk(ctx context.Context) {
 	}
 }
 
-// TrunkConn 建立 n 条物理连接：faux_tcp 拨号 → RPC Auth → Upgrade 交给 trunk_kcp。
-// 每条连接一个独立四元组；Upgrade 之后该连接不再承载 RPC 帧，只跑 KCP 段。
+// TrunkConn 建立 n 条物理连接：faux_tcp 拨号 → 类型字节 → 裸 RPC →
+// TrunkUpgrade 交给 trunk_kcp。物理连接上不做 Auth（无秘密可传；服务端按
+// conv 关联控制通道里已授权的会话）。Upgrade 之后该连接只跑 KCP 段。
 func (p *SocksCli) TrunkConn(ctx context.Context, conv uint32, n int) ([]io.ReadWriteCloser, error) {
 	g := errgroup.Group{}
 	var mu sync.Mutex
@@ -331,16 +381,16 @@ func (p *SocksCli) TrunkConn(ctx context.Context, conv uint32, n int) ([]io.Read
 			if err != nil {
 				return err
 			}
+			if _, err := conn.Write([]byte{connTypePhysical}); err != nil {
+				_ = conn.Close()
+				return err
+			}
 			peer, err := rpc.NewPeer(ctx, p, pb.RegisterSocksCliServer, pb.NewSocksSvcClient)
 			if err != nil {
 				_ = conn.Close()
 				return err
 			}
 			if err = peer.Conn(ctx, conn); err != nil {
-				_ = conn.Close()
-				return err
-			}
-			if err = p.authPeer(ctx, peer); err != nil {
 				_ = conn.Close()
 				return err
 			}
@@ -448,10 +498,21 @@ func (p *SocksCli) openProxy(ctx context.Context, local net.Conn, addr string, h
 		return err
 	}
 	defer vconn.Close()
-	if err := WriteOpenHeader(vconn, addr, head); err != nil {
-		_ = vconn.Close()
+
+	// 数据面端到端 TLS：open header（含目标地址）与代理数据都在 TLS 之内
+	var rwc io.ReadWriteCloser = vconn
+	if p.TLSCfg != nil {
+		tlsConn, err := wrapTLSClient(ctx, vconn, nil, nil, p.TLSCfg, 10*time.Second)
+		if err != nil {
+			_ = vconn.Close()
+			return err
+		}
+		rwc = tlsConn
+	}
+	if err := WriteOpenHeader(rwc, addr, head); err != nil {
+		_ = rwc.Close()
 		return err
 	}
-	relay(ctx, vconn, local)
+	relay(ctx, rwc, local)
 	return nil
 }

@@ -31,6 +31,7 @@ type Config struct {
 	Conn        socks.ConnConfig     `yaml:"conn"`
 	TrunkKCP    socks.TrunkKCPConfig `yaml:"trunk_kcp"`
 	FauxTCP     socks.FauxTCPConfig  `yaml:"faux_tcp"`
+	TLS         socks.TLSConfig      `yaml:"tls"`
 	ACL         socks.ACLConfig      `yaml:"acl"`
 	MetricsAddr string               `yaml:"metrics_addr"`
 }
@@ -86,6 +87,19 @@ func main() {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
+
+	// 端到端 TLS（跑在 trunk_kcp VirtualConn 上）：控制通道与数据面共用。
+	// 证书生成：go test -run TestMake ./test/cert，然后把 test/cert/ca/ 下的
+	// root/server/client pem 拷到 filesystem/static/ca/（见 README）。
+	tlsCfg, err := srvCfg.TLS.ServerTLS(filesystem.Static)
+	if err != nil {
+		log.Ctx(ctx).Error().Caller().Err(err).Send()
+		return
+	}
+	if tlsCfg == nil {
+		log.Ctx(ctx).Warn().Caller().Msg("tls.enabled=false：token 与代理数据明文传输（仅可信链路）")
+	}
+	socks.SetServerTLSConfig(tlsCfg)
 
 	// faux_tcp 监听：AF_PACKET 收 + raw IP 发，需要 Linux + root/CAP_NET_RAW；
 	// 内核 RST 抑制规则默认自动装拆（faux_tcp.manual_firewall: true 时改为手工维护）。

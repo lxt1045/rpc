@@ -27,6 +27,7 @@ type Config struct {
 	ClientConn socks.ConnConfig     `yaml:"client_conn"`
 	TrunkKCP   socks.TrunkKCPConfig `yaml:"trunk_kcp"`
 	FauxTCP    socks.FauxTCPConfig  `yaml:"faux_tcp"`
+	TLS        socks.TLSConfig      `yaml:"tls"`
 	Socks      string               `yaml:"socks"`
 	HTTP       string               `yaml:"http"`
 }
@@ -74,6 +75,16 @@ func main() {
 		httpAddr = conf.HTTP
 	}
 
+	// 端到端 TLS（与控制通道共用一套 CA/证书）
+	tlsCfg, err := cliCfg.TLS.ClientTLS(filesystem.Static)
+	if err != nil {
+		log.Ctx(ctx).Error().Caller().Err(err).Send()
+		return
+	}
+	if tlsCfg == nil {
+		log.Ctx(ctx).Warn().Caller().Msg("tls.enabled=false：token 与代理数据明文传输（仅可信链路）")
+	}
+
 	cli := &socks.SocksCli{
 		Name:      "socks-faux-trunk-kcp-client",
 		PeerAddr:  cliCfg.ClientConn.Addr,
@@ -81,6 +92,7 @@ func main() {
 		Token:     cliCfg.Token,
 		TrunkCfg:  cliCfg.Trunk,
 		FauxCfg:   cliCfg.FauxTCP,
+		TLSCfg:    tlsCfg,
 		ChPeer:    make(chan *socks.Peer, 2),
 	}
 	var _ pb.SocksCliServer = cli

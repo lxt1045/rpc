@@ -2,6 +2,7 @@ package socks_faux_kcp
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lxt1045/rpc"
 	"github.com/lxt1045/rpc/faux_tcp"
 	"github.com/lxt1045/rpc/test/socks_faux_trunk_kcp/pb"
 )
@@ -211,7 +213,8 @@ func proxyRoundTrip(t *testing.T, ctx context.Context, cli *SocksCli, target str
 }
 
 // startFauxStack 启动内存 faux_tcp 服务端 + 客户端（控制面与数据面都走内存链路）。
-func startFauxStack(t *testing.T, ctx context.Context, trunkCfg TrunkKCPConfig) (*SocksCli, *memNet) {
+// useTLS=true 时控制通道与数据面都跑端到端 TLS（内存自签 CA，无文件依赖）。
+func startFauxStack(t *testing.T, ctx context.Context, trunkCfg TrunkKCPConfig, useTLS bool) (*SocksCli, *memNet) {
 	t.Helper()
 	const token = "e2e-faux-token"
 
@@ -220,6 +223,16 @@ func startFauxStack(t *testing.T, ctx context.Context, trunkCfg TrunkKCPConfig) 
 	}
 	SetServerTrunkConfig(trunkCfg)
 	t.Cleanup(CloseAllSessions)
+
+	var clientTLS *tls.Config
+	if useTLS {
+		certs := newTestCerts(t)
+		SetServerTLSConfig(certs.serverTLS(t))
+		t.Cleanup(func() { SetServerTLSConfig(nil) })
+		clientTLS = certs.clientTLS(t)
+	} else {
+		SetServerTLSConfig(nil)
+	}
 
 	srv, err := NewServer(ctx)
 	if err != nil {
@@ -237,6 +250,7 @@ func startFauxStack(t *testing.T, ctx context.Context, trunkCfg TrunkKCPConfig) 
 		Name:     "e2e-client",
 		Token:    token,
 		TrunkCfg: trunkCfg,
+		TLSCfg:   clientTLS,
 		Dialer:   &memDialer{net: netw},
 		ChPeer:   make(chan *Peer, 2),
 	}
@@ -256,7 +270,7 @@ func TestFauxTrunkProxyEndToEnd(t *testing.T) {
 
 	target := newEchoTarget(t)
 	trunkCfg := TrunkKCPConfig{Conv: 0x66aa55, MinConns: 2, MaxConns: 2, MaxVirtualConn: 16}
-	cli, _ := startFauxStack(t, ctx, trunkCfg)
+	cli, _ := startFauxStack(t, ctx, trunkCfg, true)
 
 	// 两条并发虚拟连接（验证多路复用 + 多条物理连接的负载分担）
 	proxyRoundTrip(t, ctx, cli, target, 32)
@@ -283,7 +297,7 @@ func TestFauxTrunkProxySurvivesLoss(t *testing.T) {
 
 	target := newEchoTarget(t)
 	trunkCfg := TrunkKCPConfig{Conv: 0x66aa56, MinConns: 2, MaxConns: 2, MaxVirtualConn: 16}
-	cli, netw := startFauxStack(t, ctx, trunkCfg)
+	cli, netw := startFauxStack(t, ctx, trunkCfg, true)
 
 	// 建链完成后注入 ~12% 丢包（丢每 8 个报文中的 1 个）
 	var n uint64
@@ -297,4 +311,62 @@ func TestFauxTrunkProxySurvivesLoss(t *testing.T) {
 	})
 
 	proxyRoundTrip(t, ctx, cli, target, 64)
+}
+
+// TestFauxTrunkProxyPlaintext 明文模式（tls.enabled=false）：兼容路径仍可用。
+func TestFauxTrunkProxyPlaintext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	target := newEchoTarget(t)
+	trunkCfg := TrunkKCPConfig{Conv: 0x66aa57, MinConns: 2, MaxConns: 2, MaxVirtualConn: 16}
+	cli, _ := startFauxStack(t, ctx, trunkCfg, false)
+	proxyRoundTrip(t, ctx, cli, target, 16)
+}
+
+// TestTrunkUpgradeRequiresAuthorization 物理连接的 TrunkUpgrade 必须对应
+// 已授权会话（控制通道 TLS 内完成 Auth）；未授权直接拒绝。
+func TestTrunkUpgradeRequiresAuthorization(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := InitServerSecurity("tok-unauth", 8, 0x7788, 16); err != nil {
+		t.Fatal(err)
+	}
+	SetServerTrunkConfig(TrunkKCPConfig{Conv: 0x7788, MinConns: 1, MaxConns: 1})
+	t.Cleanup(CloseAllSessions)
+
+	srv, err := NewServer(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	netw := newMemNet()
+	ln := faux_tcp.ListenWithLink(faux_tcp.Config{}, netw.serverLink(),
+		faux_tcp.Endpoint{IP: memSrvIP, Port: memSrvPort})
+	defer ln.Close()
+	go func() { _ = srv.Serve(ln) }()
+
+	// 直接拨一条物理连接（0x02）并调 TrunkUpgrade：没有任何认证/TrunkStart
+	d := &memDialer{net: netw}
+	conn, err := d.Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte{connTypePhysical}); err != nil {
+		t.Fatal(err)
+	}
+	cli := &SocksCli{}
+	peer, err := rpc.NewPeer(ctx, cli, pb.RegisterSocksCliServer, pb.NewSocksSvcClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Conn(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	err = peer.Invoke(ctx, "TrunkUpgrade", &pb.TrunkUpgradeReq{TrunkId: 0x7788, UpgradeId: 0}, &pb.TrunkUpgradeRsp{})
+	if err == nil {
+		t.Fatal("unauthorized TrunkUpgrade should be rejected")
+	}
+	t.Logf("rejected as expected: %v", err)
 }
