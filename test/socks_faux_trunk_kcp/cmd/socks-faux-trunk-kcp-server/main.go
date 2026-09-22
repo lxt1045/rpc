@@ -57,7 +57,6 @@ func main() {
 		return
 	}
 	log.Ctx(ctx).Info().Str("conf", confSource).Msg("config loaded")
-	log.Ctx(ctx).Info().Str("conf.faux_tcp.reply_src", conf.FauxTCP.ReplySrc).Msg("reply_src")
 
 	token := os.Getenv("SOCKS_TRUNK_TOKEN")
 	if token == "" {

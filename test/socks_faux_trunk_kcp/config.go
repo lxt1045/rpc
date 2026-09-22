@@ -100,12 +100,6 @@ type FauxTCPConfig struct {
 	CloseGraceMS int `yaml:"close_grace_ms"`
 	// HealDelayMS 丢包后 ack "虚拟重传愈合"等待，默认 200ms。
 	HealDelayMS int `yaml:"heal_delay_ms"`
-	// ReplySrc 出包源地址，**云主机默认留空**：留空=按报文目的 IP 作为源（网卡内网
-	// 地址），由平台 NAT 转成公网，与内核 TCP 同路。仅"无状态 DNAT/端口映射"
-	// （Docker 桥接、K8s NodePort）回程不通时填对外服务地址。
-	// 云主机 1:1 NAT/弹性公网 IP 场景填公网 IP 会被平台源地址校验静默丢弃
-	// （内核 TCP 能通、faux_tcp 握手超时），faux_tcp 启动时会对非本机地址打 WARN。
-	ReplySrc string `yaml:"reply_src"`
 	// DebugPackets 收包调试（不挂 cBPF + 用户态过滤计数），排查"收不到包"时开。
 	DebugPackets bool `yaml:"debug_packets"`
 	// ManualFirewall true 表示 RST 抑制规则由运维手工维护（faux_tcp 默认自动装拆）。
@@ -138,11 +132,6 @@ func (c FauxTCPConfig) ToFauxTCP() faux_tcp.Config {
 	}
 	if c.HealDelayMS > 0 {
 		cfg.HealDelay = time.Duration(c.HealDelayMS) * time.Millisecond
-	}
-	if c.ReplySrc != "" {
-		if ip, err := netip.ParseAddr(c.ReplySrc); err == nil && ip.Is4() {
-			cfg.ReplySrc = ip
-		}
 	}
 	return cfg
 }

@@ -81,48 +81,11 @@ func TestHandshakeTimeoutDiagnostics(t *testing.T) {
 	}
 }
 
-// TestReplySrc 无状态 DNAT 环境（Docker 端口映射）下回包源地址必须改写为对外地址。
-// 判据：客户端 telnet 该端口（内核 TCP）能通、faux_tcp 握手超时。
-func TestReplySrc(t *testing.T) {
-	cfg := Config{ReplySrc: netip.MustParseAddr("203.0.113.7")}
-	cfg.defaults()
-
-	net0 := newMemNet()
-	rec := &recorder{}
-	net0.hook = func(src, dst [4]byte, bs []byte) bool {
-		if p, err := parsePacket(bs); err == nil {
-			rec.add(p)
-		}
-		return true
-	}
-	// 监听在 0.0.0.0（DNAT 后目的地址是容器内网地址），链路归属 testServerIP
-	ln := listenWithLink(cfg, net0.link(testServerIP),
-		Endpoint{IP: netip.IPv4Unspecified(), Port: 8080})
-	defer ln.Close()
-
-	syn := buildPacket(&cfg, testEndpoint(testClientIP, 40000),
-		testEndpoint(testServerIP, 8080), 1000, 0, flagSYN, clockMS(), 0, nil, 1)
-	net0.deliver(testClientIP, testServerIP, syn)
-
-	waitFor(t, time.Second, func() bool { return len(rec.snapshot()) >= 2 }, "synack")
-	for _, p := range rec.snapshot() {
-		if p.Has(flagSYN) && p.Has(flagACK) {
-			if got := p.Src.IP; got != cfg.ReplySrc {
-				t.Fatalf("SYN+ACK src=%s, want reply_src=%s", got, cfg.ReplySrc)
-			}
-			if p.Dst.IP != netip.AddrFrom4(testClientIP) {
-				t.Fatalf("SYN+ACK dst=%s, want client ip", p.Dst.IP)
-			}
-			return
-		}
-	}
-	t.Fatal("no SYN+ACK captured")
-}
-
-// TestReplySrcDefaultUsesPacketDst 未配置 reply_src 时，回包源地址必须取"报文的
-// 目的 IP"——这正是云主机 1:1 NAT 场景所需要的：源地址是网卡内网地址，由平台 NAT
-// 转成公网，与内核 TCP 同路。（填公网 IP 反而会被平台源地址校验丢弃。）
-func TestReplySrcDefaultUsesPacketDst(t *testing.T) {
+// TestReplySourceIsPacketDst 回包源地址必须取"报文的目的 IP"——这是唯一正确的选择：
+// 客户端就是往这个地址发的，回程必须用同一地址才符合它的期望。云主机上它是网卡内网
+// 地址，公网地址由平台 NAT 提供（曾试过提供一个伪造公网源地址的开关，云平台会按
+// 源地址校验丢掉，已移除；见 README「出包源地址」）。
+func TestReplySourceIsPacketDst(t *testing.T) {
 	var cfg Config
 	cfg.defaults()
 
@@ -149,27 +112,13 @@ func TestReplySrcDefaultUsesPacketDst(t *testing.T) {
 			if got := p.Src.IP; got != netip.AddrFrom4(testServerIP) {
 				t.Fatalf("SYN+ACK src=%s, want 报文目的 IP %s", got, netip.AddrFrom4(testServerIP))
 			}
+			if p.Dst.IP != netip.AddrFrom4(testClientIP) {
+				t.Fatalf("SYN+ACK dst=%s, want client ip", p.Dst.IP)
+			}
 			return
 		}
 	}
 	t.Fatal("no SYN+ACK captured")
-}
-
-// TestIsLocalAddr 钉住 listen 启动告警的判据：本机网卡地址（回环）为真，
-// 公网/保留地址为假——假的那一类正是云平台源地址校验会丢弃的源地址。
-func TestIsLocalAddr(t *testing.T) {
-	if !isLocalAddr(netip.MustParseAddr("127.0.0.1")) {
-		t.Fatal("127.0.0.1 should be local")
-	}
-	// TEST-NET-3 / TEST-NET-1，不可能配在本机
-	for _, s := range []string{"203.0.113.7", "192.0.2.1"} {
-		if isLocalAddr(netip.MustParseAddr(s)) {
-			t.Fatalf("%s should not be reported as local", s)
-		}
-	}
-	if isLocalAddr(netip.Addr{}) {
-		t.Fatal("invalid addr must not be local")
-	}
 }
 
 // TestPickLocalPort 钉住源端口选择：必须落在本机 ephemeral 范围内

@@ -1,5 +1,37 @@
 # Changelog - socks_faux_trunk_kcp
 
+## 2026-09-23 - 清理排查期间加入的试验性代码（经验保留在 README）
+
+根因确定后，把排查过程中"为了验证假设"加进去、且已被证伪的开关删掉，避免它们继续
+把后来者带偏。保留的都是**有独立价值**的诊断/能力（下面「保留」一节）。
+
+### 删除
+
+- `faux_tcp.Config.ReplySrc` + 示例 `faux_tcp.reply_src` + 示例启动日志里的 `reply_src`
+  一行：为"平台只为内核跟踪的流做回程 SNAT"这个后来被证伪的猜想加的（把出包源 IP
+  统一改写成对外地址）。真机上它只会被云平台源地址校验丢掉，并把排查方向带偏。
+  **回包源地址固定取"收到 SYN 的那个本地地址"**，无需配置；容器场景用 `--network host`。
+- `faux_tcp.Listen` 启动时对 `ReplySrc` 的本机地址校验与 WARN、`isLocalAddr` 及其单测
+  （随 ReplySrc 一起删除）。
+- SYN debug 日志里的 `回包源=<ip>` 字段（源地址恒等于 SYN 的目的地址，日志里的
+  `%s -> %s` 已包含该信息）。
+- `debug_packets` 的 `tx_seen` 计数与 `PACKET_OUTGOING` 判断：协议限定的 AF_PACKET
+  socket 本来就收不到本端出向报文，该计数恒为 0，属噪声。
+- 相应测试 `TestReplySrc` / `TestIsLocalAddr`（`TestReplySrcDefaultUsesPacketDst`
+  改名为 `TestReplySourceIsPacketDst` 保留，钉住"源地址=报文目的 IP"这一正确行为）。
+
+### 保留（有独立价值，不是一次性调试代码）
+
+- `faux_tcp.debug_packets`：不挂 cBPF + 用户态过滤，`rx_total/rx_match/rx_dropped`
+  随握手失败信息打印——这是区分"网卡侧没收到包"与"收到但不匹配"的关键手段（本次靠
+  `rx_match=0` 排除了本端收包侧）。
+- 握手超时的自诊断信息（已发/收到/发送失败次数、最后发送错误、`iface=... cooked(...)`、
+  可执行的分支提示）与 `LinkDescriber`。
+- 服务端 `收到 SYN ... 对端通告 MSS=` 日志：一眼判断路径上有没有 MSS-clamp 中间盒。
+- RST 抑制规则装在 **raw 表**（conntrack 之前）+ `TestRSTDropRuleUsesRawTable`。
+- 源端口按 `ip_local_port_range` 选择 + `TestPickLocalPort`（本次根因修复）。
+- `adv_mss`（发送上限与通告值分离）、`window` 可选项（默认仍 65535）。
+
 ## 2026-09-23 - 根因：源端口落在本机 ephemeral 范围之外，回程 SYN+ACK 被上游静默丢弃
 
 **决定性 A/B**（同一台客户端、同一个公网端口、同一时间段）：
@@ -32,8 +64,8 @@ SYN+ACK 被丢——而同一个端口的内核 TCP 一切正常。这也解释�
 - `faux_tcp.Config.AdvMSS`（+ 示例 `faux_tcp.adv_mss`）：发送单段上限与通告值分离
   （语义更清晰；**不修上面那个故障**）。示例新增 `faux_tcp.window` 可选项，默认配置
   里给了 `window: 64240`。
-- `debug_packets` 的 `rx_total/rx_match/rx_dropped` 只统计入向；另计 `tx_seen`
-  （协议限定的 AF_PACKET socket 通常收不到自己的出向报文，为 0 属正常）。
+- `debug_packets` 的 `rx_total/rx_match/rx_dropped` 只统计入向（协议限定的 AF_PACKET
+  socket 本来就收不到自己的出向报文；当时另加的 `tx_seen` 计数已在清理中删除）。
 - README：新增「跨机部署 → 排查决策树」（六步，每步带命令与判据）、
   「真机复盘：源端口不在本机 ephemeral 范围」（证据表 + 假设-判据排除表 + 三条教训），
   并修正了两处旧说法：`telnet` 连正在运行的 faux 服务端**会**显示 `Connected`（raw 栈
@@ -41,6 +73,9 @@ SYN+ACK 被丢——而同一个端口的内核 TCP 一切正常。这也解释�
   `rx_total=0` 不再被解释成"本机收包通道异常"。
 
 ## 2026-09-23 - 真机定位：`reply_src` 填公网 IP 被云平台源地址校验丢弃（结论修正）
+
+> 注：本条涉及的 `reply_src` 开关（以及 `回包源=` 日志、`tx_seen` 计数）已在后续
+> 「清理排查期间加入的试验性代码」条目中**删除**；"不要伪造出包源地址"的结论保留。
 
 **修正上一节的真机结论**：那份结论（"平台只为内核跟踪的流做回程 SNAT，所以要把
 `reply_src` 写成公网 IP"）是**在 Docker 端口映射环境**下成立的，推广到"云主机 +
@@ -94,6 +129,8 @@ A/B 对照（同一容器、同一端口）：内核 TCP 监听（`SOCKS_FAUX_PL
 - `faux_tcp.Config.ReplySrc`（+ 示例配置 `faux_tcp.reply_src`）：本端出包统一使用该
   源 IP，绕过平台回程转换（等价于本端自己做 SNAT，适用于 Docker 桥接/K8s NodePort
   等无状态 DNAT 环境；留空为默认行为）。`TestReplySrc` 钉住 SYN+ACK 源地址改写。
+  **（已删除：真机证明云平台会按源地址校验丢弃伪造源地址，且它把排查带偏；容器场景
+  改用 `--network host`。）**
 - README：在「Docker / 容器部署」中给出该开关的适用判据与用法（更干净方案是
   `--network host`）。
 

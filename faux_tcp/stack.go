@@ -131,9 +131,6 @@ func (d *demux) sendRst(p *Packet) {
 		}
 	}
 	src := Endpoint{IP: p.Dst.IP, Port: p.Dst.Port}
-	if d.cfg.ReplySrc.IsValid() {
-		src.IP = d.cfg.ReplySrc
-	}
 	bs := buildPacket(&d.cfg, src, p.Src, seq, ack, flags, clockMS(), p.TSval, nil, 0)
 	_ = d.link.WritePacket(bs)
 }

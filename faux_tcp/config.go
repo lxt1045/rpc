@@ -3,7 +3,6 @@ package faux_tcp
 import (
 	"crypto/rand"
 	"encoding/binary"
-	"net/netip"
 	"time"
 )
 
@@ -42,20 +41,6 @@ type Config struct {
 	// 发给我们的大小，两者分开配置更清晰：路径 MTU 受限时把 MSS 压到 1240，
 	// 通告值仍可保持 Linux 默认的 1460。接收侧不按通告值校验（读缓冲按最大段预留）。
 	AdvMSS int
-
-	// ReplySrc 可选：本端**所有出站报文的源 IP 统一用它**（零值=关闭，按报文目的
-	// IP 作为源）。仅服务端有意义，用于"无状态 DNAT/端口映射"环境（Docker 桥接、
-	// K8s NodePort 等）：平台只为内核跟踪的流做回程 SNAT，raw socket 发出的
-	// SYN+ACK 会以容器私网源地址出去而被丢弃；把源地址直接写成对外服务地址即可
-	// 绕过回程转换（等价于本端自己做了 SNAT）。
-	//
-	// **云主机 1:1 NAT/弹性公网 IP 场景（腾讯云 VPC/轻量、阿里云 ECS 等）不要填**：
-	// 这类平台对虚拟网卡做出站源地址校验，源 IP 不是网卡地址的报文会被静默丢弃。
-	// 典型现象：内核 TCP 监听同端口能通、faux_tcp 握手超时；服务端 tcpdump 里
-	// SYN+ACK 的源地址是公网 IP 而非网卡内网地址，客户端一个包都收不到（且服务端
-	// nf_conntrack 里没有该流）。此时留空即可：回包源地址取报文目的 IP（内网地址），
-	// 与内核 TCP 完全同路，由平台 NAT 转成公网。
-	ReplySrc netip.Addr
 
 	// DebugPackets 收包调试模式：不挂内核 cBPF，改为用户态过滤并统计
 	// （rx_total / rx_match / rx_dropped，会随握手失败信息一起打印）。

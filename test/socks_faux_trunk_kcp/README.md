@@ -127,18 +127,13 @@ docker run -d --name socks-faux-server \
 
 | 判据 | 含义 | 处理 |
 | --- | --- | --- |
-| 源地址是**公网 IP**（如 `43.155.182.37`），而网卡是内网地址 | 配置了 `reply_src`，云平台对虚拟网卡做出站源地址校验 → 报文被静默丢弃（客户端一个包收不到；服务端 `nf_conntrack` 里没有该流） | **把 `reply_src` 留空**（启动日志会 WARN）。回包源地址改取报文目的 IP（内网地址），与内核 TCP 同路，由平台 NAT 转公网 |
+| 源地址是**公网 IP**（如 `43.155.182.37`），而网卡是内网地址 | 出包源地址被伪造过（云平台对虚拟网卡做出站源地址校验 → 报文被静默丢弃；客户端一个包收不到，服务端 `nf_conntrack` 里也没有该流） | `faux_tcp` **没有源地址配置项**：回包源地址固定取收到 SYN 的那个本地地址（=网卡内网地址），由平台 NAT 转公网。若看到公网源地址，说明跑的是带 `reply_src` 的旧版本，升级即可 |
 | 源地址是**网卡内网地址**、客户端仍无入向包，且**本端源端口在 `ip_local_port_range` 之外** | 上游设备/运营商只为"源端口落在本机 ephemeral 范围内"的会话放行回程（**真机根因**） | 用含源端口修复的版本（`faux_tcp` 自动按 `ip_local_port_range` 选）；或手工指定范围内的 `client-conn.local_addr`。见文末「真机复盘」 |
-| 源地址是**网卡内网地址**、源端口正常，仍收不到 | 平台只为**内核跟踪的流**做回程 SNAT（无状态 DNAT/端口映射：Docker 桥接、K8s NodePort） | 在服务端配置 `reply_src: "<对外服务地址>"`，等价于本端自己做 SNAT |
+| 源地址是**网卡内网地址**、源端口正常，仍收不到 | 无状态 DNAT/端口映射环境下，平台只为**内核跟踪的流**做回程 SNAT | 改用 **`--network host`**（推荐，等价直接挂宿主机网卡）；不要靠伪造源地址绕过 |
 
-```yaml
-faux_tcp:
-  reply_src: ""   # 云主机（1:1 NAT/弹性公网 IP）留空；仅无状态 DNAT 环境才填对外地址
-```
-
-> 判据要点：**云主机 1:1 NAT（腾讯云 VPC/轻量、阿里云 ECS）本身就会为网卡内网地址
-> 做 SNAT**，所以独立部署在云主机上时必须留空——填公网 IP 反而触发源地址校验被丢。
-> 只有"平台不认识我们的 raw socket 流"的容器端口映射场景才需要 `reply_src`。
+> 历史：曾经为上面的第三种情况提供过 `faux_tcp.reply_src`（把出包源 IP 统一改写成
+> 对外地址）。真机证明它在云主机上只会被源地址校验丢掉、并把排查带偏，已**删除**；
+> 相关经验保留在本节与 `faux_tcp/README.md`「出包源地址」。
 
 **客户端抓包的判据**（决策树第 4 步）：只有 `Out [S]`、没有入向 `[S.]` → 回包死在
 "服务端 → 客户端"之间（按上表定性）；看到入向 `[S.]` 却仍超时 → 回包到了本机，问题在
@@ -221,21 +216,21 @@ telnet 43.155.182.37 18099
 | 步 | 机器 | 命令 / 看什么 | 判据与结论 |
 |---|---|---|---|
 | 0 | 服务端 | `ps -ef \| grep socks-faux-trunk-kcp-server`；启动日志 | 没有 `server started (faux_tcp transport)` → 进程没起或启动就失败（权限/iptables/证书），先解决它 |
-| 1 | 服务端 | 日志（`log-level: debug`）有无 `faux_tcp: 收到 SYN <客户端> -> <服务端>, seq=..., 对端通告 MSS=..., 回包源=...` | **完全没有** → SYN 没到服务端：云安全组/网络 ACL 未放行入站 TCP、服务端本机防火墙、链路；有 → 进第 2 步 |
-| 2 | 服务端 | 同一行里的 `对端通告 MSS=` / `回包源=` | `MSS` 比客户端配的值小很多 → 路径上有 MSS-clamp 中间盒（只影响大数据分段，见「路径 MTU 受限」）；`回包源` 不是本机网卡地址 → 云平台源地址校验会丢包，`reply_src` 应留空 |
-| 3 | 服务端 | `sudo tcpdump -vni any 'tcp port 18099'` | 应看到 `In [S]` 紧跟 `Out [S.]`，且 `[S.]` 的**源地址=网卡内网地址**、`cksum ... (correct)`、`ecr` 回显客户端 TSval；没有 `Out [S.]` → 本机发不出去，看日志里的 `发包失败(N)` |
+| 1 | 服务端 | 日志（`log-level: debug`）有无 `faux_tcp: 收到 SYN <客户端> -> <服务端>, seq=..., 对端通告 MSS=...` | **完全没有** → SYN 没到服务端：云安全组/网络 ACL 未放行入站 TCP、服务端本机防火墙、链路；有 → 进第 2 步 |
+| 2 | 服务端 | 同一行里的 `对端通告 MSS=` | 比客户端配的值小很多 → 路径上有 MSS-clamp 中间盒（只影响大数据分段，见「路径 MTU 受限」）；与配置一致 → 该方向没有夹取 |
+| 3 | 服务端 | `sudo tcpdump -vni any 'tcp port 18099'` | 应看到 `In [S]` 紧跟 `Out [S.]`，且 `[S.]` 的**源地址=网卡内网地址**、`cksum ... (correct)`、`ecr` 回显客户端 TSval；源地址是公网 IP → 源地址被伪造（升级到删除 `reply_src` 的版本）；没有 `Out [S.]` → 本机发不出去，看日志里的 `发包失败(N)` |
 | 4 | 客户端 | `sudo tcpdump -ni <出口网卡> 'tcp port 18099'` | **只有 `Out [S]`、没有入向 `[S.]`** → 回程被丢，进第 5 步；看到入向 `[S.]` 却仍超时 → 本端收包侧（看 `debug_packets` 的 `rx_match` 与 `iface=`） |
 | 5 | 客户端 | **A/B**：`telnet <服务端IP> 18099`（对**正在运行的 faux 服务端**） | `Connected` → 服务端报文与整条回程链路正常（服务端日志同步出现 `收到 SYN`），问题只在客户端 raw 流 → 进第 6 步；一直 `Trying ...` → 链路/安全组/端口本身不通 |
 | 6 | 客户端 | ① `sysctl net.ipv4.ip_local_port_range` 对比抓包里**自己 SYN 的源端口**；② `debug_packets` 的计数；③ 换网络（手机热点）复跑 | 源端口落在范围外 → 本次真机根因；`rx_match>0` 仍超时 → 报文到了本机但被判无效；换网络就好 → 客户端所在网络/出口设备的问题 |
 
-> `debug_packets` 三个计数的读法（**只统计入向**；协议限定的 AF_PACKET socket 收不到
-> 自己发出的报文，所以 `tx_seen` 为 0 是正常的，不是故障）：
+> `debug_packets` 三个计数的读法（计数天然只含入向：协议限定的 AF_PACKET socket 收不到
+> 自己发出的报文，tcpdump 用的是 `ETH_P_ALL` 才看得到）：
 > `rx_total=0` → 本机一个包都没收到；`rx_total>0, rx_match=0` → 收到了但没一个是"目的
 > 端口=本连接本地端口"的（回包根本没到本机）；`rx_match>0` 仍超时 → 报文已进本连接但
 > 不是有效 SYN+ACK（对端缺 RST 抑制，或端口被别的内核服务占用）。
 
 
-#### 云主机（1:1 NAT / 弹性公网 IP）特有的静默丢包：`reply_src` 别填公网 IP
+#### 云主机（1:1 NAT / 弹性公网 IP）：出包源地址**不能被伪造**
 
 > 这是"内核 TCP 能通、faux 不通"的**其中一种**成因，不是通用解释（真机上还踩到过
 > 源端口不在 ephemeral 范围，见文末复盘）。判据只看服务端 `Out [S.]` 的源地址。
@@ -249,32 +244,32 @@ telnet 43.155.182.37 18099
 ```bash
 # 服务端（云主机）
 sudo tcpdump -vni any 'tcp port 18099'
-#   faux_tcp:  Out IP 43.155.182.37.18099 > <客户端>.xxx: Flags [S.]    ← 公网 IP，被平台丢弃
-#   内核 TCP:  Out IP 10.8.0.2.18099  > <客户端>.xxx: Flags [S.]        ← 网卡内网地址，平台 NAT 放行
+#   Out IP 43.155.182.37.18099 > <客户端>.xxx: Flags [S.]   ← 公网 IP：源地址被伪造，平台丢弃
+#   Out IP 10.8.0.2.18099      > <客户端>.xxx: Flags [S.]   ← 网卡内网地址：正常，平台 NAT 放行
 # 服务端上确认没有本地 conntrack 牵连（raw socket 流不建 conntrack）
 sudo cat /proc/net/nf_conntrack | grep 18099
 ```
 
-原因：云主机网卡只有内网地址，公网 IP 由平台 1:1 NAT 提供，并对**虚拟网卡做出站源
-地址校验**（反欺骗）。内核 TCP 回包源地址是网卡内网地址，平台正常 SNAT 成公网；
-`reply_src` 直接写公网 IP 的 raw 报文不匹配任何 NAT 映射，被静默丢弃。
+原因：云主机网卡只有内网地址，公网 IP 由平台 1:1 NAT 提供，平台对**虚拟网卡做出站源
+地址校验**（反欺骗）。源地址是网卡内网地址时平台正常 SNAT 成公网；伪造公网源地址的
+raw 报文不匹配任何 NAT 映射，被静默丢弃。
 
-**处理**：把 `faux_tcp.reply_src` 留空（这也是默认值；启动日志对非本机地址会打 WARN）。
-留空后回包源地址取"报文目的 IP"＝网卡内网地址，与内核 TCP 完全同路。
+**处理**：`faux_tcp` 的回包源地址固定取"收到 SYN 的那个本地地址"（= 网卡内网地址），
+**没有配置项**——不需要做任何事。若确实看到公网源地址，说明在跑带 `reply_src` 的旧
+版本（该开关已在真机踩坑后删除，见 `faux_tcp/README.md`「出包源地址」）。
 
-> 反例（**需要** `reply_src` 的场景）：容器端口映射（Docker 桥接、K8s NodePort）等
-> 无状态 DNAT —— 平台只为内核跟踪的流做回程转换，raw socket 回包会带着容器私网源
-> 地址出去被丢弃。那种环境下把 `reply_src` 填成容器外的对外服务地址才正确。
+> 容器端口映射（Docker 桥接、K8s NodePort）等无状态 DNAT 场景，**优先 `--network host`**
+> （等价于直接用宿主机网卡，没有 DNAT，回包源地址天然正确），不要靠伪造源地址绕过。
 
 **收包侧计数**（`faux_tcp.debug_packets: true` 时握手失败信息里会多一段）：
 
 ```
 本端链路: iface=eth1 local=10.1.1.95:46205 cooked(AF_PACKET/SOCK_DGRAM);
-      debug(未挂 cBPF) rx_total=N rx_match=M rx_dropped=K tx_seen=0
+      debug(未挂 cBPF) rx_total=N rx_match=M rx_dropped=K
 ```
 
-`rx_*` 只统计入向；`tx_seen` 为 0 属正常（协议限定的 AF_PACKET socket 收不到自己发出的
-报文，tcpdump 用的是 `ETH_P_ALL` 才看得到）。三个计数的读法见上面决策树。
+计数天然只含入向：协议限定的 AF_PACKET socket 收不到本端发出的报文（tcpdump 用的是
+`ETH_P_ALL` 才看得到）。三个计数的读法见上面决策树。
 
 **tcpdump 与 faux_tcp 的收包挂在同一个位置**（网卡收包点），所以"tcpdump 看得到回包、
 faux_tcp 却报收到 0 个"就说明是**本端收包侧**的问题。历史上真出现过一类：`SOCK_RAW`
@@ -300,7 +295,7 @@ sudo tcpdump -ni any 'tcp port 18099'
 | 服务端日志 | 含义 | 处理 |
 |---|---|---|
 | 启动时有 `server started (faux_tcp transport)` | 服务端正常监听 | 继续 |
-| `faux_tcp: 收到 SYN <客户端> -> <服务端>, seq=..., 对端通告 MSS=..., 回包源=...` | SYN 到了服务端 | 问题在回程或客户端 raw 流：先看 `对端通告 MSS`（有无 MSS-clamp）、`回包源`（是否网卡地址），再按决策树第 4~6 步 |
+| `faux_tcp: 收到 SYN <客户端> -> <服务端>, seq=..., 对端通告 MSS=...` | SYN 到了服务端 | 问题在回程或客户端 raw 流：先看 `对端通告 MSS`（有无 MSS-clamp），再按决策树第 3~6 步 |
 | 只有 `faux_tcp: 半开连接超时回收 peer=...（已发 N 个报文未收到 ACK）` | 我们回了 SYN+ACK、对端没 ACK | 与客户端"收不到回包"是同一件事的两面，按第 4~6 步查 |
 | 完全没有 `收到 SYN` | SYN 没到服务端 | 云**安全组/网络 ACL 未放行入站 TCP**；或服务端进程没在跑（`ps -ef \| grep socks-faux-trunk-kcp-server`）；或客户端出口没把包发出去 |
 | `faux_tcp: 发包失败(N) ...` | 服务端回不出 SYN+ACK | 看错误内容：路由/权限/源地址问题 |
@@ -391,7 +386,7 @@ go test -run '^TestPickLocalPort$' -count=1 -v ./faux_tcp   # 单元测试（无
 
 | 假设 | 判据 | 结论 |
 | --- | --- | --- |
-| 云平台按源地址校验丢了伪造的公网源 IP（`reply_src: 43.155.182.37`） | 服务端 `Out [S.]` 的源地址是公网 IP 还是网卡内网地址 | 改成留空（源地址与内核一致 `10.8.0.2`）后**仍然失败** → 不是本次原因。但云主机本就该留空，`reply_src` 只在无状态 DNAT（Docker/K8s）场景需要 |
+| 云平台按源地址校验丢了伪造的公网源 IP（曾为此加过 `reply_src` 开关） | 服务端 `Out [S.]` 的源地址是公网 IP 还是网卡内网地址 | 改回"源地址取报文目的 IP"（与内核一致 `10.8.0.2`）后**仍然失败** → 不是本次原因。该开关已删除：它在云主机上只会被源地址校验丢掉、并把排查带偏 |
 | 内核 RST 污染 conntrack（规则必须装 raw 表而不是 filter 表） | 服务端 tcpdump 有无出向 `Flags [R]`；`/proc/net/nf_conntrack` 有无该流 | 抑制规则生效（抓包里无 RST）、conntrack 为空 → 也不是本次原因（raw 表规则仍保留，语义更正确） |
 | SYN 通告的 MSS ≤ 中间盒的夹取目标 ⇒ 它不建流状态 | 客户端 SYN 的 `mss` vs 服务端抓到的 `mss`；改 `adv_mss: 1460` 后重试 | 改了仍失败 → 不成立（`adv_mss` 作为配置项保留：发送上限与通告值分离，语义更清晰） |
 | 初始窗口 `win 65535` 被中间盒按策略拦 | 客户端 SYN 的 `win` vs 内核 SYN 的 `win`；改 `window: 64240` 后重试 | 改成内核同款 64240 后仍失败 → 不成立 |
@@ -422,7 +417,7 @@ faux_tcp:
   adv_mss: 1460          # 对外通告的 MSS（只影响对端发给我们），可与 mss 分开
   keepalive_seconds: 25  # 标准 TCP keepalive 探测包
   heal_delay_ms: 200     # 丢包后 ack 愈合等待（详见 faux_tcp/README.md）
-  # reply_src: ""        # 仅无状态 DNAT（Docker 桥接/K8s）需要；云主机必须留空
+  debug_packets: false   # true 时打印 rx_total/rx_match/rx_dropped，排查收包问题时开
   manual_firewall: false # true 则自行维护 RST 抑制规则
 tls:
   enabled: true          # 端到端 TLS（mTLS）；false 为明文模式（仅可信链路）
@@ -490,10 +485,10 @@ sudo ./test/socks_faux_trunk_kcp/scripts/local_integration_test.sh
 | 现象 | 原因/处理 |
 |---|---|
 | `fauxtcp: 需要 root 或 CAP_NET_RAW...` | 未以 root 运行；或容器缺少 `CAP_NET_RAW`/`CAP_NET_ADMIN` |
-| `fauxtcp: 未找到 iptables/nft...` | 无防火墙工具：装 iptables，或 `manual_firewall: true` 自行配置 |
+| `faux_tcp: 未找到 iptables/nft...` | 无防火墙工具：装 iptables，或 `manual_firewall: true` 自行配置 |
 | 连接建立后立即断（RST） | RST 抑制规则未生效：确认 iptables/nft 可用，或手工加规则 |
 | 远程地址报 `握手超时`（501003） | 先读错误里的诊断字段：`收到 0 个报文` = 服务端未运行/安全组未放行/**本端源端口在 `ip_local_port_range` 之外**；`发送失败 >0` = 本机 raw socket 发包失败；`有回包但无 SYN+ACK` = 服务端缺 RST 抑制。**按「跨机部署 → 排查决策树」六步走**，并用 `telnet <服务端> 18099` 连正在运行的 faux 服务端做分半实验 |
-| 内核 TCP 能通、faux 连不上，且客户端一个入向包都没有 | 见「真机复盘：源端口不在本机 ephemeral 范围」：`sysctl net.ipv4.ip_local_port_range` 对比抓包里自己 SYN 的源端口；其次看服务端 `Out [S.]` 的源地址（`reply_src` 是否误填公网 IP） |
+| 内核 TCP 能通、faux 连不上，且客户端一个入向包都没有 | 见「真机复盘：源端口不在本机 ephemeral 范围」：`sysctl net.ipv4.ip_local_port_range` 对比抓包里自己 SYN 的源端口；其次看服务端 `Out [S.]` 的源地址是否为公网 IP（源地址被伪造） |
 | `invalid KCP segment length` | `faux_tcp.mss` 小于 KCP 线上包（半帧错位）：调大 MSS（默认 1448 安全） |
 | 控制面 RPC 偶发失败 | 控制通道已叠 KCP 可靠层；若仍失败多为 faux_tcp 物理层问题（权限/防火墙） |
 | `tls handshake timeout` / `certificate` 报错 | 证书未生成或 client/server 证书不属同一 CA：按「安全说明」重新生成并拷贝 |

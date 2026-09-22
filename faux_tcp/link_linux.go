@@ -32,21 +32,20 @@ type rawLink struct {
 
 	// 调试模式（Config.DebugPackets）计数：跳过 cBPF，用户态过滤并统计，
 	// 用于区分"网卡侧一个包都没收到"与"收到了但被过滤掉"。
-	// rx* 只统计**入向**报文（PACKET_OUTGOING 单独计入 txSeen）——否则本端自己
-	// 发出的 SYN 会因为"目的端口=对端端口"而被算进 rx_dropped，读数会误导。
+	// 注：协议限定的 AF_PACKET socket 收不到本端发出的报文（内核只把出向报文
+	// 镜像给 ETH_P_ALL 的 socket），所以这些计数天然只含入向。
 	debug     bool
 	rxTotal   atomic.Int64 // 入向报文总数
 	rxHit     atomic.Int64 // 入向且目的端口匹配（会被交付）
 	rxDropped atomic.Int64 // 入向但不匹配（被丢弃）
-	txSeen    atomic.Int64 // 本端发出的报文（AF_PACKET 回环可见，仅诊断）
 }
 
 // Describe 供错误信息展示本端链路细节（实现可选诊断接口 LinkDescriber）。
 func (l *rawLink) Describe() string {
 	desc := fmt.Sprintf("iface=%s local=%s:%d cooked(AF_PACKET/SOCK_DGRAM)", l.ifaceName, l.local, l.port)
 	if l.debug {
-		desc += fmt.Sprintf("; debug(未挂 cBPF) rx_total=%d rx_match=%d rx_dropped=%d tx_seen=%d",
-			l.rxTotal.Load(), l.rxHit.Load(), l.rxDropped.Load(), l.txSeen.Load())
+		desc += fmt.Sprintf("; debug(未挂 cBPF) rx_total=%d rx_match=%d rx_dropped=%d",
+			l.rxTotal.Load(), l.rxHit.Load(), l.rxDropped.Load())
 	}
 	return desc
 }
@@ -214,7 +213,7 @@ func (l *rawLink) WritePacket(bs []byte) error {
 // parsePacket 会为 Payload 独立分配，字段均为值拷贝，故调用侧安全。
 func (l *rawLink) ReadPacket() ([]byte, error) {
 	for {
-		n, sa, err := unix.Recvfrom(l.recvFd, l.rBuf, 0)
+		n, _, err := unix.Recvfrom(l.recvFd, l.rBuf, 0)
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -229,13 +228,7 @@ func (l *rawLink) ReadPacket() ([]byte, error) {
 			continue
 		}
 		// 调试模式：cBPF 未挂，这里在用户态过滤并统计，便于判断
-		// "socket 一个包都没收到" 还是 "收到了但不匹配被丢弃"。
-		// AF_PACKET 也会把本端发出的报文回环给 socket（tcpdump 的 Out 行同源），
-		// 单独计 txSeen，不计入 rx*。
-		if ll, ok := sa.(*unix.SockaddrLinklayer); ok && ll.Pkttype == unix.PACKET_OUTGOING {
-			l.txSeen.Add(1)
-			continue
-		}
+		// "socket 一个包都没收到" 还是 "收到了但不匹配被丢弃"
 		l.rxTotal.Add(1)
 		if matchTCPDstPort(l.rBuf[:n], l.port) {
 			l.rxHit.Add(1)
