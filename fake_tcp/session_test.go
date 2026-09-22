@@ -121,7 +121,6 @@ type pipeTestEnv struct {
 func newPipeTestEnv(t *testing.T, mutateCfg func(*Config)) *pipeTestEnv {
 	t.Helper()
 	cfg := Config{
-		Mode:             ModeRawTCP,
 		MTU:              1400,
 		Keepalive:        time.Hour, // 测试默认关闭保活干扰，需要的用例自行调小
 		HandshakeRetries: 3,
@@ -156,7 +155,7 @@ func newPipeTestEnv(t *testing.T, mutateCfg func(*Config)) *pipeTestEnv {
 		cancel()
 		t.Fatalf("Accept: %v", err)
 	}
-	env.srv = lc
+	env.srv = lc.(*Conn)
 	t.Cleanup(func() {
 		_ = env.l.Close()
 		_ = cliLink.Close()
@@ -486,10 +485,268 @@ func TestSessionReadTimeout(t *testing.T) {
 	}
 }
 
+// TestSessionSeqWrap seq 回绕（4GB 边界）下的收包规则：
+// 连续/空洞/重复的判定必须在回绕前后都正确（seqAfter int32 差值法）
+func TestSessionSeqWrap(t *testing.T) {
+	env := newPipeTestEnv(t, nil)
+
+	var srvSess *session
+	env.l.sessions.Range(func(_, v any) bool {
+		srvSess = v.(*session)
+		return false
+	})
+	if srvSess == nil {
+		t.Fatalf("服务端会话不存在")
+	}
+	// 直接把连续点拨到回绕边界前
+	const wrapBase = 0xFFFFFFF0
+	srvSess.rcvNxt.Store(wrapBase)
+	srvSess.rcvMax.Store(wrapBase)
+	peer := PeerAddr{IP: netip.MustParseAddr("10.1.1.2"), Port: 54321}
+	inject := func(seq uint32, payload string) {
+		srvSess.handle(env.ctx, &Segment{
+			Peer:    peer,
+			Flags:   FlagPSH | FlagACK,
+			Seq:     seq,
+			Ack:     srvSess.sndNxt.Load(),
+			TSval:   1,
+			Payload: []byte(payload),
+		})
+	}
+
+	// 跨越回绕点的连续段：[0xFFFFFFF0, 16) → end=0（回绕）
+	inject(wrapBase, "0123456789abcdef")
+	if got := srvSess.rcvNxt.Load(); got != 0 {
+		t.Fatalf("回绕后 rcvNxt=%#x, want 0", got)
+	}
+	// 回绕后的空洞段：seq=8（在 0 之后）应判定为空洞而非"过老"
+	inject(8, "HHHHHHHH")
+	// 填补空洞：seq=0
+	inject(0, "AAAAAAAA")
+	// 回绕前的旧段（end=4 <= rcvNxt）：重复，应丢弃
+	inject(wrapBase-4, "OLD!")
+	// 空洞段的重复（位图已吸收，end=16=rcvNxt）：应丢弃
+	inject(8, "HHHHHHHH")
+
+	want := []string{"0123456789abcdef", "HHHHHHHH", "AAAAAAAA"}
+	buf := make([]byte, 16)
+	for i, w := range want {
+		n, err := env.srv.Read(buf)
+		if err != nil || string(buf[:n]) != w {
+			t.Fatalf("第 %d 块: n=%d err=%v data=%q want %q", i, n, err, buf[:n], w)
+		}
+	}
+	if got := srvSess.rcvNxt.Load(); got != 16 {
+		t.Fatalf("最终 rcvNxt=%d, want 16", got)
+	}
+	srvSess.bitmapMu.Lock()
+	blen := len(srvSess.bitmap)
+	srvSess.bitmapMu.Unlock()
+	if blen != 0 {
+		t.Fatalf("位图应为空，实际 %d", blen)
+	}
+}
+
+// TestSessionKeepaliveRawTCP 保活探针-应答维持会话：空闲超过 3×Keepalive 仍不被回收
+func TestSessionKeepaliveRawTCP(t *testing.T) {
+	env := newPipeTestEnv(t, func(c *Config) {
+		c.Keepalive = 100 * time.Millisecond
+	})
+	// 空闲 450ms（>3×Keepalive）：探针-应答应双向刷新 lastActive
+	time.Sleep(450 * time.Millisecond)
+	if env.cli.sess.isClosed() || env.srv.sess.isClosed() {
+		t.Fatalf("空闲期会话被误回收")
+	}
+	// 空闲后仍可通信
+	msg := []byte("alive-after-idle")
+	if _, err := env.cli.Write(msg); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	buf := make([]byte, 64)
+	n, err := env.srv.Read(buf)
+	if err != nil || string(buf[:n]) != string(msg) {
+		t.Fatalf("Read: n=%d err=%v data=%q", n, err, buf[:n])
+	}
+
+	// 空闲期间客户端应发过纯 ACK（保活探针或探针应答；握手 ACK 只有 1 个，
+	// 空闲 450ms/保活 100ms 下探针+应答应远超于此）
+	cliWire := env.cliLink.writtenSnapshot()
+	srvWire := env.srvLink.writtenSnapshot()
+	pureAck := func(wire []Segment) int {
+		n := 0
+		for _, s := range wire {
+			if s.Flags == FlagACK && len(s.Payload) == 0 {
+				n++
+			}
+		}
+		return n
+	}
+	if pureAck(cliWire) < 2 || pureAck(srvWire) < 2 {
+		t.Fatalf("空闲期保活流量不足: cli 纯ACK=%d srv 纯ACK=%d", pureAck(cliWire), pureAck(srvWire))
+	}
+}
+
+// TestSessionDialTimeout 对端不应答时握手超时（pipe 无监听端，SYN 石沉大海）
+func TestSessionDialTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, cliLink := pipePair()
+	defer cliLink.Close()
+
+	cfg := Config{HandshakeRetries: 1, Keepalive: time.Hour}
+	start := time.Now()
+	_, err := dialLink(ctx, cfg, cliLink,
+		PeerAddr{IP: netip.MustParseAddr("10.3.3.2"), Port: 54321},
+		PeerAddr{IP: netip.MustParseAddr("10.3.3.1"), Port: 8443}, nil)
+	if err == nil {
+		t.Fatalf("应握手超时")
+	}
+	// 半开回收与握手重试在同一时间窗触发，两种错误码都合法
+	code := errors.AsCode(err)
+	if code == nil || (code.Code() != ErrHandshakeTimeout.Code() && code.Code() != ErrHandshakeRejected.Code()) {
+		t.Fatalf("应为 ErrHandshakeTimeout/ErrHandshakeRejected: %v", err)
+	}
+	if d := time.Since(start); d < time.Second || d > 10*time.Second {
+		t.Fatalf("超时时长异常: %v", d)
+	}
+}
+
+// TestSessionDatagramOnly 数据报模式：Write 超 MaxPayload 报错，未超限一次 Write 一个段
+func TestSessionDatagramOnly(t *testing.T) {
+	env := newPipeTestEnv(t, func(c *Config) {
+		c.DatagramOnly = true
+	})
+	max := env.cli.sess.link.MaxPayload() // pipe 默认 1300
+	if _, err := env.cli.Write(make([]byte, max+1)); err == nil {
+		t.Fatalf("超 MaxPayload 应报错")
+	} else if errors.AsCode(err) == nil || errors.AsCode(err).Code() != ErrPacketTooBig.Code() {
+		t.Fatalf("应为 ErrPacketTooBig: %v", err)
+	}
+	// 未超限：正常送达，且线上恰好一个数据段
+	msg := []byte("datagram")
+	if n, err := env.cli.Write(msg); err != nil || n != len(msg) {
+		t.Fatalf("Write: n=%d err=%v", n, err)
+	}
+	buf := make([]byte, 64)
+	n, err := env.srv.Read(buf)
+	if err != nil || string(buf[:n]) != string(msg) {
+		t.Fatalf("Read: n=%d err=%v data=%q", n, err, buf[:n])
+	}
+	dataSegs := 0
+	for _, s := range env.cliLink.writtenSnapshot() {
+		if len(s.Payload) > 0 {
+			dataSegs++
+		}
+	}
+	if dataSegs != 1 {
+		t.Fatalf("一次 Write 应恰好一个数据段，实际 %d", dataSegs)
+	}
+}
+
+// TestSessionHoleHeal 虚拟重传愈合（plan.md v3，移植自 faux_tcp healLocked）：
+// 丢包后先 dup ACK + SACK（rcvNxt 停在空洞处），HealDelay 后 rcvNxt 直接越过空洞
+// （线上呈现"丢包 → dup ACK/SACK → 快速重传恢复"外观，ack 不永久冻结）；
+// 愈合后位图清空、后续数据正常推进。
+func TestSessionHoleHeal(t *testing.T) {
+	env := newPipeTestEnv(t, func(c *Config) {
+		c.HealDelay = 100 * time.Millisecond
+		c.Keepalive = time.Hour // 隔离保活干扰；扫描周期由 HealDelay/2=50ms 决定
+	})
+
+	var srvSess *session
+	env.l.sessions.Range(func(_, v any) bool {
+		srvSess = v.(*session)
+		return false
+	})
+	if srvSess == nil {
+		t.Fatalf("服务端会话不存在")
+	}
+	base := srvSess.rcvNxt.Load()
+	peer := PeerAddr{IP: netip.MustParseAddr("10.1.1.2"), Port: 54321}
+	inject := func(seq uint32, payload string) {
+		srvSess.handle(env.ctx, &Segment{
+			Peer:    peer,
+			Flags:   FlagPSH | FlagACK,
+			Seq:     seq,
+			Ack:     srvSess.sndNxt.Load(),
+			TSval:   1,
+			Payload: []byte(payload),
+		})
+	}
+
+	// 空洞注入：跳过 8 字节直接发 "HHHHHHHH"
+	inject(base+8, "HHHHHHHH")
+	// 空洞数据照常上交
+	buf := make([]byte, 16)
+	n, err := env.srv.Read(buf)
+	if err != nil || string(buf[:n]) != "HHHHHHHH" {
+		t.Fatalf("空洞段应到达即交: n=%d err=%v data=%q", n, err, buf[:n])
+	}
+	// 愈合前：rcvNxt 停在空洞处，且已发过带 SACK 的 dup ACK
+	// （writeLoop 异步发送，轮询等待）
+	if got := srvSess.rcvNxt.Load(); got != base {
+		t.Fatalf("愈合前 rcvNxt=%d, want %d", got, base)
+	}
+	waitFor := func(cond func() bool, what string) {
+		deadline := time.Now().Add(2 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("等待 %s 超时", what)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitFor(func() bool {
+		for _, s := range env.srvLink.writtenSnapshot() {
+			if s.Flags == FlagACK && len(s.SACK) > 0 && len(s.Payload) == 0 {
+				return true
+			}
+		}
+		return false
+	}, "dup ACK + SACK")
+
+	// 等愈合（HealDelay 100ms + 扫描周期 50ms + 裕量）
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if srvSess.rcvNxt.Load() == base+16 { // 8+8：越过空洞并吸收空洞段
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("愈合未发生: rcvNxt=%d, want %d", srvSess.rcvNxt.Load(), base+16)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// 位图清空、愈合时钟归零
+	srvSess.bitmapMu.Lock()
+	blen := len(srvSess.bitmap)
+	srvSess.bitmapMu.Unlock()
+	if blen != 0 || srvSess.holeSince.Load() != 0 {
+		t.Fatalf("愈合后位图=%d holeSince=%d，应均为 0", blen, srvSess.holeSince.Load())
+	}
+	// 愈合后应发过推进后的 ACK（ack=新 rcvNxt；writeLoop 异步，轮询）
+	waitFor(func() bool {
+		for _, s := range env.srvLink.writtenSnapshot() {
+			if s.Flags == FlagACK && len(s.Payload) == 0 && s.Ack == base+16 {
+				return true
+			}
+		}
+		return false
+	}, "愈合后的推进 ACK")
+
+	// 愈合后继续正常通信：连续段推进
+	inject(base+16, "CCCC")
+	if got := srvSess.rcvNxt.Load(); got != base+20 {
+		t.Fatalf("愈合后连续段未推进: rcvNxt=%d, want %d", got, base+20)
+	}
+	n, err = env.srv.Read(buf)
+	if err != nil || string(buf[:n]) != "CCCC" {
+		t.Fatalf("愈合后数据读取: n=%d err=%v data=%q", n, err, buf[:n])
+	}
+}
+
 // TestSessionHalfOpenReap 半开连接被保活扫描回收
 func TestSessionHalfOpenReap(t *testing.T) {
 	cfg := Config{
-		Mode:             ModeRawTCP,
 		Keepalive:        100 * time.Millisecond,
 		HandshakeRetries: 1,
 	}

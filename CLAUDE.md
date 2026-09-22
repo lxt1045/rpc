@@ -245,21 +245,25 @@ the path before running one, and note the `socks` example is the one that actual
 proto), `nat` (NAT traversal), `proxy` (reverse proxy), `socks` (full remote SOCKS5/HTTP proxy,
 including uTLS browser fingerprints under `chrome/` and a `client_http_local` variant),
 `socks_nat`, `socks_trunk` (link aggregation over reliable transports), `socks_trunk_kcp`
-(KCP-based aggregation over unreliable networks), and `test_broadcast`. The `socks_stream`,
+(KCP-based aggregation over TCP/TLS), `socks_faux_trunk_kcp` (KCP aggregation over `faux_tcp`
+fake-TCP raw sockets — Linux + root), and `test_broadcast`. The `socks_stream`,
 `socks_quic`, and `webrtc` experiments no longer exist.
 
 The `socks*` examples follow the same shape: peer logic (the `*Peer`/service struct, e.g.
 `SocksSvc`) lives at the example root in `peer_client.go` / `peer_service.go` / `peer_proxy.go`,
 with thin `main.go` binaries under `client/`, `service/`, and (for `socks`) `proxy/`.
-`socks_trunk` and `socks_trunk_kcp` additionally keep config/session/protocol/relay logic at
-their roots, ship combined binaries under `cmd/` with Makefiles and deploy scripts, and carry
-their own unit tests (`go test ./test/socks_trunk ./test/socks_trunk_kcp` passes offline).
+`socks_trunk`, `socks_trunk_kcp`, and `socks_faux_trunk_kcp` additionally keep
+config/session/protocol/relay logic at their roots, ship combined binaries under `cmd/` with
+Makefiles and deploy scripts, and carry their own unit tests
+(`go test ./test/socks_trunk ./test/socks_trunk_kcp ./test/socks_faux_trunk_kcp` passes
+offline; the faux one runs the whole proxy path over an in-memory `faux_tcp` link, so it needs
+no root — `faux_tcp.DialWithLink`/`ListenWithLink` are the injection points).
 Config is read from an embed-relative `static/conf/default.yml`, so run each from its own
 directory.
 
 Run them from their own directory. Read `test/socks` first for the minimal shape (root
-`SocksSvc` + `service/main.go` client/server wiring), then `socks_trunk` / `socks_trunk_kcp`
-for the two link-aggregation flavors.
+`SocksSvc` + `service/main.go` client/server wiring), then `socks_trunk` / `socks_trunk_kcp` /
+`socks_faux_trunk_kcp` for the three link-aggregation flavors.
 
 `plan.md` (bilingual) and `TODO.md` at the repo root are the original trunk/trunk_kcp design
 notes; they describe intent, not guaranteed current behavior.

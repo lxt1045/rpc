@@ -5,7 +5,8 @@ import (
 )
 
 // packetio.go：session 层与底层报文通道之间的抽象。
-// 两种模式（RawTCP / UDP）各自实现 LinkIO，session 层只面对统一的 Segment。
+// LinkIO 由 raw_packetio_linux.go（Linux AF_PACKET/raw IP）实现；
+// 测试用内存管道（session_test.go pipeLink）与定距丢包包装（trunkkcp_bench_test.go）。
 
 // PeerAddr 对端地址（四元组中的一半；本地一半在监听/拨号时确定）
 type PeerAddr struct {
@@ -13,28 +14,26 @@ type PeerAddr struct {
 	Port uint16
 }
 
-// sessKey 会话路由键：RawTCP 模式 ConnID 恒为 0（四元组即唯一键）；
-// UDP 模式 ConnID 由客户端生成，叠加对端地址防止碰撞。
+// sessKey 会话路由键：对端端点 + 四元组哈希 ConnID
 type sessKey struct {
 	Peer   PeerAddr
 	ConnID uint64
 }
 
-// Segment 一次"报文事件"的统一抽象。
-// RawTCP 模式：由 TCP 头解析而来 / 序列化为 TCP 段（Flags/Seq/Ack/TS 有效）；
-// UDP 模式：由私有控制头映射而来（仅 Flags 语义与 Payload 有效）。
+// Segment 一个 TCP 段的统一抽象：由 TCP 头解析而来 / 序列化为 TCP 段发出。
 type Segment struct {
 	Peer   PeerAddr // 读：报文来源；写：报文目的
-	ConnID uint64
+	ConnID uint64   // 四元组哈希（plan.md §4.6）
 
-	Flags    uint8 // FlagSYN/FlagACK/FlagFIN/FlagRST/FlagPSH 语义
-	Seq      uint32
-	Ack      uint32
-	TSval    uint32
-	TSecr    uint32
-	Win      uint16
-	SACK     [][2]uint32 // RawTCP 模式：随 ACK 附带的外观 SACK block（plan.md §4.3）
-	Payload  []byte      // 读侧：生命周期到下次 ReadSegment 前；写侧：调用方持有
+	Flags   uint8 // FlagSYN/FlagACK/FlagFIN/FlagRST/FlagPSH 语义
+	Seq     uint32
+	Ack     uint32
+	TSval   uint32
+	TSecr   uint32
+	Win     uint16
+	SACK    [][2]uint32 // 随 ACK 附带的外观 SACK block（plan.md §4.3）
+	Payload []byte      // 读侧：生命周期到下次 ReadSegment 前；写侧：已拷贝
+	IPID    uint16      // 写侧：IPv4 ID（每连接计数器；0 时由链路层自增）
 }
 
 // LinkIO 底层报文通道。实现负责报文编解码与收发，必须满足：

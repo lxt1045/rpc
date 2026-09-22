@@ -4,6 +4,7 @@ package fake_tcp
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"hash/fnv"
 	"net"
@@ -32,8 +33,8 @@ type rawLinkIO struct {
 	packetFD int // AF_PACKET 收
 	sendFD   int // raw IP 发
 
-	ipID    atomic.Uint32 // IP ID 单调递增（模拟 per-flow 计数器）
-	srcMu   sync.Mutex
+	ipID     atomic.Uint32 // IP ID 单调递增（模拟 per-flow 计数器）
+	srcMu    sync.Mutex
 	srcCache map[netip.Addr]netip.Addr // 0.0.0.0 时按对端缓存源地址选择结果
 
 	rBuf   []byte
@@ -162,8 +163,22 @@ func ifaceIndexOf(ip netip.Addr) (int, error) {
 	return 0, ErrInvalidConfig.Newf("本地 IP %s 不属于任何网卡", ip)
 }
 
-// pickFreePort 借内核分配一个空闲 TCP 端口（RawTCP 客户端未指定本地端口时）
+// pickFreePort 挑选空闲端口：优先从真实 TCP 客户端的临时端口段（49152~65535）
+// 随机选取并验证可用；失败则退回让内核分配
 func pickFreePort() (uint16, error) {
+	for i := 0; i < 16; i++ {
+		var b [2]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			break
+		}
+		port := 49152 + binary.BigEndian.Uint16(b[:])%(65535-49152)
+		ln, err := net.ListenTCP("tcp4", &net.TCPAddr{Port: int(port)})
+		if err != nil {
+			continue // 被占用，换下一个
+		}
+		_ = ln.Close()
+		return port, nil
+	}
 	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{Port: 0})
 	if err != nil {
 		return 0, err
@@ -311,10 +326,15 @@ func (l *rawLinkIO) WriteSegment(seg *Segment) error {
 	if err != nil {
 		return err
 	}
+	// IP ID：优先用会话的每连接计数器（仿 Linux per-flow 行为），无则链路级自增
+	ipID := seg.IPID
+	if ipID == 0 {
+		ipID = uint16(l.ipID.Add(1))
+	}
 	pkt := MarshalIPv4(nil, IPv4Fields{
 		Src:      srcIP,
 		Dst:      dst.IP,
-		ID:       uint16(l.ipID.Add(1)),
+		ID:       ipID,
 		TTL:      DefaultTTL,
 		Protocol: ProtocolTCP,
 		DontFrag: true,

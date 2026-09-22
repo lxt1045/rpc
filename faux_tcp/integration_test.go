@@ -10,11 +10,8 @@ import (
 )
 
 // TestFauxTCPLoopback 真实链路集成测试（loopback + raw socket）。
-// 需要 root/CAP_NET_RAW，且需要抑制内核 RST：
-//
-//	sudo iptables -A OUTPUT -p tcp --sport 18099 --tcp-flags RST RST -j DROP
-//	sudo iptables -A OUTPUT -p tcp --dport 18099 --tcp-flags RST RST -j DROP
-//
+// 需要 root/CAP_NET_RAW；内核 RST 抑制规则由 Listen/Dial 自动安装
+// （Config.ManualFirewall=true 时需手工配置，见 README）。
 // 用 FAUXTCP_E2E=1 显式开启：
 //
 //	FAUXTCP_E2E=1 sudo -E go test -run TestFauxTCPLoopback -v ./faux_tcp/

@@ -3,11 +3,15 @@ package faux_tcp
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/lxt1045/errors"
 )
 
 // ---------------------------------------------------------------------------
@@ -305,9 +309,9 @@ func TestNoRetransmitUnderLoss(t *testing.T) {
 	}
 }
 
-// TestAckSemanticsWithHole 精确丢一个数据段，验证：
+// TestAckSemanticsWithHole 精确丢一个数据段（关闭愈合定时器），验证：
 //  1. 接收端 ack 停在空洞处（语义自洽）
-//  2. 不产生 dup ACK（空洞后的 ACK 数量 == 0）
+//  2. 空洞段触发 dup ACK + SACK（仿真实 Linux 接收端），但 ack 绝不越过空洞
 func TestAckSemanticsWithHole(t *testing.T) {
 	dropped := false
 	var dataCount int
@@ -326,7 +330,8 @@ func TestAckSemanticsWithHole(t *testing.T) {
 		}
 		return true
 	}
-	cli, srv, _, rec := testPair(t, nil, hook)
+	// HealDelay 调大：本用例只验证愈合前的 dup ACK/SACK 外观（愈合见 TestHoleHeal）
+	cli, srv, _, rec := testPair(t, func(c *Config) { c.HealDelay = time.Hour }, hook)
 
 	for i := 0; i < 6; i++ {
 		if _, err := cli.Write([]byte(fmt.Sprintf("msg-%d", i))); err != nil {
@@ -336,7 +341,7 @@ func TestAckSemanticsWithHole(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	// 找到被丢段的 seq 与前一个段的 end
+	// 找到被丢段的 seq
 	var cliSeqs []uint32
 	for _, p := range rec.snapshot() {
 		if p.Src.IP.As4() == testClientIP && len(p.Payload) > 0 {
@@ -348,14 +353,24 @@ func TestAckSemanticsWithHole(t *testing.T) {
 	}
 	holeSeq := cliSeqs[2] // 第 3 个段（0 起）
 
-	// 服务端（被动侧）在空洞后不应发出任何 ACK（无 dup ACK），
+	// 服务端（被动侧）应发出 dup ACK + SACK（ack == 空洞起点），
 	// 且 ack 绝不超过空洞起点
+	dupAck, withSack := 0, 0
 	for _, p := range rec.snapshot() {
-		if p.Src.Port == 8080 && p.Has(flagACK) && len(p.Payload) == 0 && !p.Has(flagSYN) {
+		if p.Src.Port == 8080 && p.Flags == flagACK && len(p.Payload) == 0 {
 			if seqAfter(p.Ack, holeSeq) {
 				t.Fatalf("ack %d beyond hole %d", p.Ack, holeSeq)
 			}
+			if p.Ack == holeSeq {
+				dupAck++
+				if len(p.SACK) > 0 {
+					withSack++
+				}
+			}
 		}
+	}
+	if dupAck == 0 || withSack == 0 {
+		t.Fatalf("want dup ACK+SACK on hole, got dupAck=%d withSack=%d", dupAck, withSack)
 	}
 
 	// 服务端仍应收到空洞后的数据（直投上层）
@@ -565,8 +580,442 @@ func TestDialTimeout(t *testing.T) {
 	defer cancel()
 	_, err := dialWithLink(ctx, cfg, net0.link(testClientIP),
 		testEndpoint(testClientIP, 40000), testEndpoint(testServerIP, 9999))
-	if err != errHandshakeTimeout {
+	if c := errors.AsCode(err); c == nil || c.Code() != ErrHandshakeTimeout.Code() {
 		t.Fatalf("want handshake timeout, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// delayed ACK / 空洞愈合 / 保活探测 / 会话回收
+// ---------------------------------------------------------------------------
+
+// TestHoleHeal 空洞逾 HealDelay 未愈时执行"虚拟重传愈合"：
+// ack 越过空洞跳变（线上呈现快速重传恢复外观），数据照常全部投递
+func TestHoleHeal(t *testing.T) {
+	dropped := false
+	var dataCount int
+	hook := func(src, dst [4]byte, bs []byte) bool {
+		if src != testClientIP {
+			return true
+		}
+		p, err := parsePacket(bs)
+		if err != nil || len(p.Payload) == 0 {
+			return true
+		}
+		dataCount++
+		if dataCount == 3 && !dropped {
+			dropped = true
+			return false
+		}
+		return true
+	}
+	cli, srv, _, rec := testPair(t, func(c *Config) { c.HealDelay = 50 * time.Millisecond }, hook)
+
+	for i := 0; i < 6; i++ {
+		if _, err := cli.Write([]byte(fmt.Sprintf("msg-%d", i))); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(3 * time.Millisecond)
+	}
+
+	var cliSeqs []uint32
+	for _, p := range rec.snapshot() {
+		if p.Src.IP.As4() == testClientIP && len(p.Payload) > 0 {
+			cliSeqs = append(cliSeqs, p.Seq)
+		}
+	}
+	if len(cliSeqs) != 6 {
+		t.Fatalf("want 6 data segments, got %d", len(cliSeqs))
+	}
+	lastEnd := cliSeqs[5] + uint32(len("msg-5"))
+
+	// 愈合：服务端的累计确认最终越过空洞，推进到最后一段的末端
+	waitFor(t, 2*time.Second, func() bool {
+		for _, p := range rec.snapshot() {
+			if p.Src.Port == 8080 && p.Flags == flagACK && p.Ack == lastEnd {
+				return true
+			}
+		}
+		return false
+	}, "healed cumulative ack reaching last segment end")
+
+	// 数据仍全部投递（丢的那条由上层负责，本层只见 5 条）
+	got := 0
+	buf := make([]byte, 64)
+	srv.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	for {
+		if _, err := srv.Read(buf); err != nil {
+			break
+		}
+		got++
+	}
+	if got != 5 {
+		t.Fatalf("got %d messages, want 5", got)
+	}
+}
+
+// TestDelayedAck 验证 delayed ACK：连续两个数据包只回一个 ACK；
+// 单个数据包的 ACK 在 ~40ms 冲刷前不出现
+func TestDelayedAck(t *testing.T) {
+	cli, _, _, rec := testPair(t, nil, nil)
+
+	srvPureAcks := func() []*Packet {
+		var out []*Packet
+		for _, p := range rec.snapshot() {
+			if p.Src.Port == 8080 && p.Flags == flagACK && len(p.Payload) == 0 {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	cliDataEnds := func() []uint32 {
+		var out []uint32
+		for _, p := range rec.snapshot() {
+			if p.Src.IP.As4() == testClientIP && len(p.Payload) > 0 {
+				out = append(out, p.Seq+uint32(len(p.Payload)))
+			}
+		}
+		return out
+	}
+
+	// 两个包快速连发 → 恰好一个立即 ACK（覆盖到第二个包末端）
+	if _, err := cli.Write([]byte("aaaa")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+	if _, err := cli.Write([]byte("bbbb")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return len(srvPureAcks()) >= 1 }, "first immediate ack")
+	time.Sleep(80 * time.Millisecond) // 超过 40ms 冲刷窗口：不应再有针对这两个包的 ACK
+	if n := len(srvPureAcks()); n != 1 {
+		t.Fatalf("2 quick packets should yield exactly 1 delayed ack, got %d", n)
+	}
+	ends := cliDataEnds()
+	if len(ends) != 2 || srvPureAcks()[0].Ack != ends[1] {
+		t.Fatalf("ack should cover 2nd packet end: acks=%v ends=%v", srvPureAcks()[0].Ack, ends)
+	}
+
+	// 单个包：短时间内无 ACK，40ms 冲刷后出现
+	if _, err := cli.Write([]byte("cc")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(15 * time.Millisecond)
+	for _, p := range srvPureAcks() {
+		if p.Ack == ends[1]+2 {
+			t.Fatal("single packet acked before 40ms flush window")
+		}
+	}
+	waitFor(t, time.Second, func() bool {
+		for _, p := range srvPureAcks() {
+			if p.Ack == ends[1]+2 {
+				return true
+			}
+		}
+		return false
+	}, "single packet ack after 40ms flush")
+}
+
+// TestKeepaliveProbe 空闲连接发标准 TCP keepalive 探测包（seq=sndNxt-1 纯 ACK），
+// 对端按规则应答（ack=rcvNxt 的纯 ACK）。
+// 注意：应答也会更新本端 lastSent，两端同间隔保活会互相"顶"开探测时点
+// （真实 TCP 亦然），所以断言双向合计，且窗口给足余量。
+func TestKeepaliveProbe(t *testing.T) {
+	cli, srv, _, rec := testPair(t, func(c *Config) { c.KeepAlive = 50 * time.Millisecond }, nil)
+	defer cli.Close()
+
+	// 无任何数据流量，空闲 300ms
+	time.Sleep(300 * time.Millisecond)
+
+	c, s := cli.(*Conn).c, srv.(*Conn).c
+	c.mu.Lock()
+	cSnd := c.sndNxt
+	c.mu.Unlock()
+	s.mu.Lock()
+	sSnd := s.sndNxt
+	s.mu.Unlock()
+
+	probes, replies := 0, 0
+	for _, p := range rec.snapshot() {
+		if p.Flags != flagACK || len(p.Payload) > 0 {
+			continue
+		}
+		switch p.Src.Port {
+		case 40000:
+			if p.Seq == cSnd-1 { // 客户端探测包
+				probes++
+			}
+			if p.Seq == cSnd && p.Ack == sSnd { // 客户端对服务端探测的应答
+				replies++
+			}
+		case 8080:
+			if p.Seq == sSnd-1 {
+				probes++
+			}
+			if p.Seq == sSnd && p.Ack == cSnd {
+				replies++
+			}
+		}
+	}
+	if probes < 2 {
+		t.Fatalf("want >=2 keepalive probes (both directions), got %d", probes)
+	}
+	// ≥2：排除握手 ACK（cli→srv 的第三包也匹配 replies 形状）
+	if replies < 2 {
+		t.Fatalf("peer never replied to keepalive probe, replies=%d", replies)
+	}
+}
+
+// TestPeerDeathReap 对端静默死亡（所有回包消失）后，3 个保活周期回收连接
+func TestPeerDeathReap(t *testing.T) {
+	var dropServerReply atomic.Bool
+	hook := func(src, dst [4]byte, bs []byte) bool {
+		if dropServerReply.Load() && src == testServerIP {
+			return false // 对端死亡：服务端方向全部消失
+		}
+		return true
+	}
+	cli, _, _, _ := testPair(t, func(c *Config) { c.KeepAlive = 40 * time.Millisecond }, hook)
+
+	dropServerReply.Store(true)
+	c := cli.(*Conn).c
+	waitFor(t, 3*time.Second, func() bool { return c.getState() == stClosed }, "peer death reap")
+	e, _ := c.err.Load().(error)
+	if code := errors.AsCode(e); code == nil || code.Code() != ErrPeerTimeout.Code() {
+		t.Fatalf("want ErrPeerTimeout, got %v", e)
+	}
+}
+
+// TestHalfOpenReap 只发 SYN 不回 ACK 的半开连接（SYN 扫描）应被超时回收
+func TestHalfOpenReap(t *testing.T) {
+	cfg := Config{
+		HandshakeTimeout: 30 * time.Millisecond,
+		HandshakeRetries: 1,                     // 半开窗口 = 60ms
+		KeepAlive:        40 * time.Millisecond, // 扫描 tick = 20ms
+	}
+	cfg.defaults()
+
+	net0 := newMemNet()
+	ln := listenWithLink(cfg, net0.link(testServerIP), testEndpoint(testServerIP, 8080))
+	defer ln.Close()
+	go func() { ln.Accept() }()
+
+	// 手工构造一个 SYN（不回 SYNACK 的 ACK）
+	cliEP := testEndpoint(testClientIP, 40000)
+	syn := buildPacket(&cfg, cliEP, testEndpoint(testServerIP, 8080),
+		12345, 0, flagSYN, clockMS(), 0, nil, 1)
+	if err := net0.link(testClientIP).WritePacket(syn); err != nil {
+		t.Fatal(err)
+	}
+
+	connCount := func() int {
+		ln.d.mu.Lock()
+		defer ln.d.mu.Unlock()
+		return len(ln.d.conns)
+	}
+	waitFor(t, time.Second, func() bool { return connCount() == 1 }, "half-open session created")
+	waitFor(t, 2*time.Second, func() bool { return connCount() == 0 }, "half-open session reaped")
+}
+
+// TestHalfCloseWrite 对端先 FIN：本端读到 EOF 后仍可写（半关闭），
+// 本端再 Close 后完成四次挥手
+func TestHalfCloseWrite(t *testing.T) {
+	cli, srv, _, _ := testPair(t, nil, nil)
+
+	// 服务端先关闭
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// 客户端读到 EOF
+	buf := make([]byte, 64)
+	cli.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := cli.Read(buf); err != io.EOF {
+		t.Fatalf("want EOF after peer FIN, got %v", err)
+	}
+	// 半关闭：客户端仍可写，服务端（stFinWait）仍能收
+	if _, err := cli.Write([]byte("still-alive")); err != nil {
+		t.Fatalf("write in half-close: %v", err)
+	}
+	srv.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := srv.Read(buf)
+	if err != nil || string(buf[:n]) != "still-alive" {
+		t.Fatalf("srv read in fin-wait: %q %v", buf[:n], err)
+	}
+	// 客户端关闭 → 四次挥手完成，双端 closed
+	if err := cli.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		return cli.(*Conn).c.getState() == stClosed && srv.(*Conn).c.getState() == stClosed
+	}, "both closed after 4-way handshake")
+}
+
+// ---------------------------------------------------------------------------
+// seq 回绕 / 出站队列背压
+// ---------------------------------------------------------------------------
+
+// TestSeqWrapAround 序号回绕（4GB/连接处）安全性：
+// 正序推进、空洞判定、dup ACK、愈合跳变都必须用 int32 差值法而非直接比大小。
+func TestSeqWrapAround(t *testing.T) {
+	_, srv, net0, rec := testPair(t, func(c *Config) { c.HealDelay = 40 * time.Millisecond }, nil)
+
+	sc := srv.(*Conn).c
+	base := uint32(0xFFFFFFF0) // 变量（非 const）：后续 base+16/24 需要在运行时回绕
+	sc.mu.Lock()
+	sc.rcvNxt = base
+	sc.mu.Unlock()
+
+	cfg := Config{}
+	cfg.defaults()
+	cliEP := testEndpoint(testClientIP, 40000)
+	srvEP := testEndpoint(testServerIP, 8080)
+	deliver := func(seq uint32, payload string, ipID uint16) {
+		t.Helper()
+		bs := buildPacket(&cfg, cliEP, srvEP, seq, 0, flagPSH|flagACK,
+			clockMS(), 0, []byte(payload), ipID)
+		net0.deliver(testClientIP, testServerIP, bs)
+	}
+	rcvNxt := func() uint32 {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+		return sc.rcvNxt
+	}
+
+	// 1) 回绕前的正序段：seq=base, 8 字节 → rcvNxt=base+8
+	deliver(base, "AAAAAAAA", 1)
+	waitFor(t, time.Second, func() bool { return rcvNxt() == base+8 }, "in-order advance before wrap")
+
+	// 2) 越过回绕点的空洞段：seq=base+16（已回绕为 0x00000000）→ dup ACK 停在 base+8
+	deliver(base+16, "CCCCCCCC", 2)
+	waitFor(t, time.Second, func() bool {
+		for _, p := range rec.snapshot() {
+			if p.Src.Port == 8080 && p.Flags == flagACK && p.Ack == base+8 {
+				return true
+			}
+		}
+		return false
+	}, "dup ack held at hole (wrap-safe)")
+	if got := rcvNxt(); got != base+8 {
+		t.Fatalf("hole must not advance rcvNxt: got %#x want %#x", got, base+8)
+	}
+
+	// 3) 愈合：rcvNxt 跳到空洞末端 base+24（回绕后 0x00000008）
+	waitFor(t, 2*time.Second, func() bool { return rcvNxt() == base+24 }, "heal across wrap boundary")
+
+	// 4) 愈合后回绕点之后的段按正序继续推进
+	deliver(base+24, "DDDD", 3)
+	waitFor(t, time.Second, func() bool { return rcvNxt() == base+28 }, "post-wrap in-order advance")
+
+	// 数据全部投递（A、C、D；B 本就没发）
+	got := map[string]bool{}
+	buf := make([]byte, 64)
+	srv.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	for {
+		n, err := srv.Read(buf)
+		if err != nil {
+			break
+		}
+		got[string(buf[:n])] = true
+	}
+	for _, want := range []string{"AAAAAAAA", "CCCCCCCC", "DDDD"} {
+		if !got[want] {
+			t.Fatalf("wrap data lost: want %q in %v", want, got)
+		}
+	}
+}
+
+// slowLink 可在建连后切换为"阻塞写"的链路包装，用于背压测试
+type slowLink struct {
+	Link
+	blocked atomic.Bool
+	release chan struct{}
+}
+
+func (s *slowLink) WritePacket(bs []byte) error {
+	if s.blocked.Load() {
+		<-s.release
+	}
+	return s.Link.WritePacket(bs)
+}
+
+// TestWriteBackpressure 出站队列满时 Write 按写超时返回 ErrWriteTimeout，
+// 链路恢复后写恢复正常且队列按序发出
+func TestWriteBackpressure(t *testing.T) {
+	cfg := Config{}
+	cfg.defaults()
+
+	net0 := newMemNet()
+	ln := listenWithLink(cfg, net0.link(testServerIP), testEndpoint(testServerIP, 8080))
+	defer ln.Close()
+	recvCh := make(chan net.Conn, 1)
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			recvCh <- c
+		}
+	}()
+
+	slow := &slowLink{Link: net0.link(testClientIP), release: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cli, err := dialWithLink(ctx, cfg, slow,
+		testEndpoint(testClientIP, 40000), testEndpoint(testServerIP, 8080))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer cli.Close()
+	var srv net.Conn
+	select {
+	case srv = <-recvCh:
+	case <-time.After(3 * time.Second):
+		t.Fatal("accept timeout")
+	}
+	defer srv.Close()
+	defer func() {
+		slow.blocked.Store(false)
+		select {
+		case <-slow.release:
+		default:
+			close(slow.release)
+		}
+	}()
+
+	// 堵住链路：writeLoop 卡在第一个报文上，队列很快填满
+	slow.blocked.Store(true)
+	cli.SetWriteDeadline(time.Now().Add(150 * time.Millisecond))
+	var werr error
+	sent := 0
+	for i := 0; i < outQueueCap+64; i++ {
+		if _, err := cli.Write(make([]byte, 64)); err != nil {
+			werr = err
+			break
+		}
+		sent++
+	}
+	if werr == nil {
+		t.Fatal("write should time out when queue is full and link blocked")
+	}
+	if code := errors.AsCode(werr); code == nil || code.Code() != ErrWriteTimeout.Code() {
+		t.Fatalf("want ErrWriteTimeout, got %v", werr)
+	}
+	if sent == 0 {
+		t.Fatal("no packet was accepted before backpressure")
+	}
+
+	// 恢复链路：出站队列排空后写恢复正常
+	slow.blocked.Store(false)
+	close(slow.release)
+	waitFor(t, 5*time.Second, func() bool {
+		return len(cli.(*Conn).c.outCh) == 0
+	}, "out queue drained after link unblocked")
+	cli.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := cli.Write([]byte("after-unblock")); err != nil {
+		t.Fatalf("write after unblock: %v", err)
+	}
+	// 服务端能读到数据（链路确实恢复）
+	srv.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 2048)
+	if _, err := srv.Read(buf); err != nil {
+		t.Fatalf("read after unblock: %v", err)
 	}
 }
 

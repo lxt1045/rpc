@@ -166,9 +166,9 @@ func TestSACKOption(t *testing.T) {
 // TestParseBadPacket 畸形报文必须报错而不是 panic
 func TestParseBadPacket(t *testing.T) {
 	cases := [][]byte{
-		nil,                                   // 空
-		{0x45},                                // 过短
-		{0x65, 0, 0, 20},                      // 非法版本 6
+		nil,              // 空
+		{0x45},           // 过短
+		{0x65, 0, 0, 20}, // 非法版本 6
 		append([]byte{0x45, 0, 0, 10}, make([]byte, 16)...), // TotalLen < IHL
 	}
 	for i, c := range cases {

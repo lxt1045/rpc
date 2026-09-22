@@ -3,8 +3,6 @@ package faux_tcp
 import (
 	"encoding/binary"
 	"net/netip"
-
-	"github.com/lxt1045/errors"
 )
 
 // TCP flags
@@ -45,7 +43,10 @@ type Packet struct {
 	Window   uint16
 
 	TSval, TSecr uint32 // 时间戳选项（0 表示不存在）
-	Payload      []byte // 引用原始缓冲区，调用方需要时自行拷贝
+	SACK         [][2]uint32
+	// Payload 数据载荷。parsePacket 为每个报文独立分配（所有权归 Packet，
+	// 投递时无需再拷贝）；手工构造的 Packet 由调用方持有。
+	Payload []byte
 }
 
 // Has 判断标志位
@@ -61,7 +62,7 @@ func tcpOptionsSyn(mss int, wscale uint8, tsval uint32) []byte {
 	opts := make([]byte, 20)
 	opts[0], opts[1] = 2, 4 // MSS
 	binary.BigEndian.PutUint16(opts[2:4], uint16(mss))
-	opts[4], opts[5] = 4, 2 // SACK permitted
+	opts[4], opts[5] = 4, 2  // SACK permitted
 	opts[6], opts[7] = 8, 10 // TS
 	binary.BigEndian.PutUint32(opts[8:12], tsval)
 	binary.BigEndian.PutUint32(opts[12:16], 0) // TSecr=0
@@ -80,15 +81,42 @@ func tcpOptionsData(tsval, tsecr uint32) []byte {
 	return opts
 }
 
+// tcpOptionsSack 仿 Linux 的 SACK ACK 选项布局：
+// NOP|NOP|TS(10) + NOP|NOP|SACK(2+8n)，总长 16+8n（恒为 8 的倍数）
+func tcpOptionsSack(tsval, tsecr uint32, blocks [][2]uint32) []byte {
+	n := len(blocks)
+	opts := make([]byte, 16+8*n)
+	opts[0], opts[1] = 1, 1 // NOP NOP
+	opts[2], opts[3] = 8, 10
+	binary.BigEndian.PutUint32(opts[4:8], tsval)
+	binary.BigEndian.PutUint32(opts[8:12], tsecr)
+	opts[12], opts[13] = 1, 1           // NOP NOP
+	opts[14], opts[15] = 5, byte(2+8*n) // SACK
+	for i, blk := range blocks {
+		binary.BigEndian.PutUint32(opts[16+8*i:20+8*i], blk[0])
+		binary.BigEndian.PutUint32(opts[20+8*i:24+8*i], blk[1])
+	}
+	return opts
+}
+
 // buildPacket 构造完整的 IPv4+TCP 报文（含两个校验和）。
 // 发送侧不计算校验和的硬件 offload 场景不存在于 raw socket，故始终软件计算。
 func buildPacket(cfg *Config, src, dst Endpoint, seq, ack uint32, flags uint8,
 	tsval, tsecr uint32, payload []byte, ipID uint16) []byte {
+	return buildPacketSack(cfg, src, dst, seq, ack, flags, tsval, tsecr, payload, ipID, nil)
+}
+
+// buildPacketSack 同 buildPacket，可附带 SACK 块（仅用于空洞时的 dup ACK 外观）
+func buildPacketSack(cfg *Config, src, dst Endpoint, seq, ack uint32, flags uint8,
+	tsval, tsecr uint32, payload []byte, ipID uint16, sack [][2]uint32) []byte {
 
 	var opts []byte
-	if flags&flagSYN != 0 {
+	switch {
+	case flags&flagSYN != 0:
 		opts = tcpOptionsSyn(cfg.MSS, cfg.WScale, tsval)
-	} else {
+	case len(sack) > 0:
+		opts = tcpOptionsSack(tsval, tsecr, sack)
+	default:
 		opts = tcpOptionsData(tsval, tsecr)
 	}
 
@@ -160,29 +188,29 @@ func checksumContinue(sum uint32, bs []byte) uint16 {
 // 校验 IPv4 头校验和与 TCP 校验和；非 TCP/校验失败返回错误。
 func parsePacket(bs []byte) (p *Packet, err error) {
 	if len(bs) < ipv4HeaderLen+tcpHeaderLen {
-		return nil, errors.Errorf("packet too short: %d", len(bs))
+		return nil, ErrInvalidPacket.Newf("packet too short: %d", len(bs))
 	}
 	if bs[0]>>4 != 4 {
-		return nil, errors.Errorf("not IPv4")
+		return nil, ErrInvalidPacket.New("not IPv4")
 	}
 	ihl := int(bs[0]&0x0f) * 4
 	if ihl < ipv4HeaderLen || len(bs) < ihl+tcpHeaderLen {
-		return nil, errors.Errorf("bad IHL: %d", ihl)
+		return nil, ErrInvalidPacket.Newf("bad IHL: %d", ihl)
 	}
 	totalLen := int(binary.BigEndian.Uint16(bs[2:4]))
 	if totalLen < ihl+tcpHeaderLen || len(bs) < totalLen {
-		return nil, errors.Errorf("bad total length: %d", totalLen)
+		return nil, ErrInvalidPacket.Newf("bad total length: %d", totalLen)
 	}
 	if bs[9] != protoTCP {
-		return nil, errors.Errorf("not TCP: %d", bs[9])
+		return nil, ErrInvalidPacket.Newf("not TCP: %d", bs[9])
 	}
 	if checksum(bs[:ihl]) != 0 {
-		return nil, errors.Errorf("bad IPv4 checksum")
+		return nil, ErrInvalidPacket.New("bad IPv4 checksum")
 	}
 	// 分片包不支持（我们发送侧始终 DF，收到的分片包直接丢弃）
 	frag := binary.BigEndian.Uint16(bs[6:8])
 	if frag&0x3fff != 0 || frag&0x2000 != 0 {
-		return nil, errors.Errorf("fragmented packet")
+		return nil, ErrInvalidPacket.New("fragmented packet")
 	}
 
 	srcIP, _ := netip.AddrFromSlice(bs[12:16])
@@ -199,7 +227,7 @@ func parsePacket(bs []byte) (p *Packet, err error) {
 	}
 	dataOffset := int(tcp[12]>>4) * 4
 	if dataOffset < tcpHeaderLen || len(tcp) < dataOffset {
-		return nil, errors.Errorf("bad TCP data offset: %d", dataOffset)
+		return nil, ErrInvalidPacket.Newf("bad TCP data offset: %d", dataOffset)
 	}
 
 	// TCP 校验和
@@ -208,13 +236,17 @@ func parsePacket(bs []byte) (p *Packet, err error) {
 	sum += uint32(binary.BigEndian.Uint16(bs[16:18])) + uint32(binary.BigEndian.Uint16(bs[18:20]))
 	sum += uint32(protoTCP) + uint32(uint16(len(tcp)))
 	if checksumContinue(sum, tcp) != 0 {
-		return nil, errors.Errorf("bad TCP checksum")
+		return nil, ErrInvalidPacket.New("bad TCP checksum")
 	}
 
-	// 解析选项（只关心 TS）
+	// 解析选项（只关心 TS 与 SACK）
 	parseOptions(tcp[tcpHeaderLen:dataOffset], p)
 
-	p.Payload = tcp[dataOffset:]
+	// Payload 独立分配（所有权归 Packet）：raw 链路的读缓冲是复用的，
+	// Packet 会经 chPkt 异步投递，不能引用读缓冲。
+	if pl := tcp[dataOffset:]; len(pl) > 0 {
+		p.Payload = append([]byte(nil), pl...)
+	}
 	return p, nil
 }
 
@@ -235,9 +267,17 @@ func parseOptions(opts []byte, p *Packet) {
 		if l < 2 || i+l > len(opts) {
 			return
 		}
-		if kind == 8 && l == 10 { // TS
+		switch {
+		case kind == 8 && l == 10: // TS
 			p.TSval = binary.BigEndian.Uint32(opts[i+2 : i+6])
 			p.TSecr = binary.BigEndian.Uint32(opts[i+6 : i+10])
+		case kind == 5 && (l-2)%8 == 0: // SACK
+			for j := i + 2; j+8 <= i+l; j += 8 {
+				p.SACK = append(p.SACK, [2]uint32{
+					binary.BigEndian.Uint32(opts[j : j+4]),
+					binary.BigEndian.Uint32(opts[j+4 : j+8]),
+				})
+			}
 		}
 		i += l
 	}

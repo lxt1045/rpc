@@ -6,20 +6,8 @@ import (
 	"time"
 )
 
-// Mode 传输模式
-type Mode string
-
-const (
-	// ModeUDP 直连 UDP（对照/无权限回退）
-	ModeUDP Mode = "udp"
-	// ModeFakeTCP UDP 载荷伪装成 TCP 线上特征（无重传/拥塞控制/滑动窗口）
-	ModeFakeTCP Mode = "fauxtcp"
-)
-
 // Config faux_tcp 配置
 type Config struct {
-	Mode Mode
-
 	// MSS 单个 TCP 段的最大载荷（默认 1448：1500 MTU - 20 IP - 20 TCP - 12 TS 选项，
 	// 与真实 Linux 一致且不分片）。faux_tcp 保留数据报边界：一次 Write = 一个 TCP 段，
 	// 超过 MSS 的 Write 直接报错（由上层分段，如 KCP 的 MSS 1376）
@@ -31,7 +19,9 @@ type Config struct {
 	// TTL IPv4 TTL（默认 64，仿 Linux）
 	TTL uint8
 
-	// KeepAlive 空闲保活间隔（默认 25s，防 NAT/防火墙表项老化；0 禁用）
+	// KeepAlive 空闲保活间隔（默认 25s，防 NAT/防火墙表项老化；0 禁用）。
+	// 保活包为标准 TCP keepalive 探测包形式（seq=sndNxt-1 的纯 ACK）；
+	// 连续 3 个周期无任何入站报文判定对端死亡并关闭连接。
 	KeepAlive time.Duration
 	// HandshakeTimeout 握手单次超时（默认 1s）
 	HandshakeTimeout time.Duration
@@ -39,15 +29,40 @@ type Config struct {
 	HandshakeRetries int
 	// CloseGrace 挥手宽限时间（默认 500ms；超时直接关闭，不重传 FIN）
 	CloseGrace time.Duration
+	// HealDelay 空洞"虚拟重传愈合"等待时间（默认 200ms，约一个 RTT 量级）。
+	// 丢包后接收端先按真实 Linux 行为回 dup ACK + SACK；若 HealDelay 内空洞未被
+	// （不可能发生的）重传填补，则直接越过空洞推进累计确认——线上呈现
+	// "丢包 → dup ACK/SACK → 快速重传恢复"的完整外观，避免 ack 永久冻结。
+	HealDelay time.Duration
 
-	// PSK 可选预共享密钥：非空时对载荷做 AEAD 封装并防注入/防重放
+	// ManualFirewall 置 true 表示 RST 抑制规则由用户手工维护（README 有命令），
+	// 本包不碰 iptables/nft；默认 false：Listen/Dial 自动安装、Close 自动卸载。
+	ManualFirewall bool
+
+	// PSK 预留字段（AEAD 封装/防注入，尚未实现）：当前版本置非空会返回配置错误，
+	// 避免"以为加密了其实没有"的静默风险。
 	PSK []byte
 }
 
+// delayed ACK 参数（仿 Linux：每 2 个数据包或 40ms 回一次 ACK）
+const (
+	ackEveryPackets = 2
+	ackMaxDelay     = 40 * time.Millisecond
+)
+
+// 接收位图容量上限（空洞去重与 SACK 外观用，超出时丢弃新条目——不影响投递）
+const bitmapCap = 4096
+
+// 出站队列容量（报文数，约 1.4MB）：Write 在此排队等待发出（本地队列背压，
+// 非线上限速）；控制段（ACK/FIN/探测）队列满时同步兜底直发，不丢。
+const outQueueCap = 1024
+
+// 接收队列容量（报文数，约 1.4MB）：上层来不及读时满则丢包（本层不背压，
+// 可靠性由上层 KCP 负责）。容量与出站队列对齐，避免发送侧突发导致
+// "非链路原因的"丢包/重传。
+const recvQueueCap = 1024
+
 func (c *Config) defaults() {
-	if c.Mode == "" {
-		c.Mode = ModeFakeTCP
-	}
 	if c.MSS <= 0 || c.MSS > 1448 {
 		c.MSS = 1448
 	}
@@ -72,6 +87,22 @@ func (c *Config) defaults() {
 	if c.CloseGrace <= 0 {
 		c.CloseGrace = 500 * time.Millisecond
 	}
+	if c.HealDelay <= 0 {
+		c.HealDelay = 200 * time.Millisecond
+	}
+}
+
+// validate 校验配置（defaults 之后调用）
+func (c *Config) validate() error {
+	if len(c.PSK) > 0 {
+		return ErrInvalidConfig.New("PSK 为预留字段，当前版本未启用 AEAD 封装，请留空")
+	}
+	return nil
+}
+
+// handshakeWindow 半开连接的最大存活时间（超时回收 SYN 扫描留下的半连接）
+func (c *Config) handshakeWindow() time.Duration {
+	return c.HandshakeTimeout * time.Duration(c.HandshakeRetries+1)
 }
 
 // newISN 生成初始序号（RFC 6528：随机）

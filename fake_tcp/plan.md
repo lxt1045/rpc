@@ -4,6 +4,55 @@
 
 ---
 
+## v3 修订（虚拟重传愈合，2026-09-22）
+
+二次评审（两套都完成各自重构后）确认的唯一实质性设计差距是 faux_tcp 的
+`healLocked`——fake_tcp 的 `rcvNxt` 会永久冻结在第一个 seq 空洞处，
+长寿代理连接有丢包后 ack 不再推进，对状态跟踪型 DPI 是显著异常。
+已按方案 1 移植（评审结论见本仓库对话记录）：
+
+- [x] `session.maybeHeal`：dup ACK+SACK 之后逾 `HealDelay`（默认 200ms，
+      配置项 `Config.HealDelay`）未愈合，`rcvNxt` 直接越过第一空洞、
+      吸收位图紧随的连续段、发推进后的 ACK——线上呈现
+      "丢包 → dup ACK/SACK → 快速重传恢复"完整闭环（`TestSessionHoleHeal` 覆盖）。
+- [x] 实现适配本包架构：不用每连接定时器（保留共享扫描的资源优势），
+      `holeSince` 时间戳 + `scanTick` 周期检查；keepaliveLoop 周期收紧到
+      `HealDelay/2` 保证 ~200ms 触发精度。
+- [x] 移植后功能上为 faux_tcp 的严格超集（其余差异为工程件：errno/资源占用/背压），
+      faux_tcp 可降级为参考实现或删除。
+
+---
+
+## v2 修订（faux_tcp 评审合并，2026-09-22）
+
+仓库内曾并存两套同目标实现（本包与 `faux_tcp/`）。评审结论：架构同构约 80%，
+`faux_tcp` 在协议细节上有三个更合理的决策，本包在生产完备性上更全。
+按评审合并，本包吸收前者优点并**删除 UDP 兜底模式**：
+
+1. **seq 回绕修复**：收包规则全部改用 `seqAfter/seqBefore`（int32 差值法）。
+   uint32 seq 在 4GB/连接处回绕，此前直接比大小会在回绕点把合法未来段误判为"过老"——
+   高速代理场景下真实可撞，是 bug 级问题。`TestSessionSeqWrap` 覆盖回绕前后的
+   连续/空洞/重复判定。
+2. **`Config.DatagramOnly`**：一次 Write = 一个 TCP 段，超 MaxPayload 报 `ErrPacketTooBig`。
+   叠 trunk_kcp 时必开——从构造上杜绝"半帧丢失导致流式重组永久错位"
+   （M4 实测踩过的坑，此前只能靠 MTU≥1464 的部署戒律规避；戒律仍然需要，但现在
+   违反时会显式报错而不是静默错位）。
+3. **标准接口与指纹**：`Listen` 实现 `net.Listener`（`Accept() net.Conn`、
+   `Addr() net.Addr`）；每连接 IP ID 计数器（随机起步，仿 Linux per-flow）；
+   客户端缺省端口从临时端口段 49152~65535 随机选取。
+4. **删除 ModeUDP 兜底模式**：`Config.Mode`、`udp_packetio.go`、UDP 私有头/控制消息、
+   及全部 UDP 模式测试一并删除。理由：
+   - 两条路线本就不能在同一条连接内混用（§4.8 已有结论），"同包双模式"实际只服务
+     "无权限环境凑合用"一个场景；
+   - 该场景由外挂 udp2raw 更优地覆盖（deploy/udp2raw，M0 基线，还自带 Windows 方案）；
+   - 两套会话语义（TCP flags vs 私有控制消息）的维护/测试成本高于其价值。
+   `faux_tcp` 包的去留由其维护者决定（建议作为指纹/行为对照参考或删除）。
+
+下文保留 v1 的设计记录；与 v2 冲突处以本节为准（主要影响：§2.2 方案 C、
+§4.6/4.7/4.8 UDP 模式封装、§6 文件布局、§7 API、M2 范围）。
+
+---
+
 ## 1. 背景与目标 / Goals
 
 ### 1.1 要解决的问题
@@ -317,44 +366,33 @@ nft add rule inet filter output tcp sport <port> tcp flags rst drop
 
 ---
 
-## 7. API 设计（草图，以最终代码为准）
+## 7. API 设计（v2 现状；v1 草图见 git 历史）
 
 ```go
 package fake_tcp
 
-type Mode int
-const (
-    ModeRawTCP Mode = iota + 1 // 主模式：线路上是 TCP（Linux + CAP_NET_RAW）
-    ModeUDP                    // 兜底：UDP + 私有头
-)
-
 type Config struct {
-    Mode             Mode
-    LocalAddr        string        // "0.0.0.0:8443"（服务端）/ 本地端口（客户端，RST 抑制需要）
-    RemoteAddr       string        // 客户端必填
-    Magic            uint32        // payload 私有头魔数，默认随机派生
-    MTU              int           // payload 切片上限，默认 1400
-    Ordered          bool          // 接收是否按序上交（默认 false：到达即交，配 KCP）
+    LocalAddr  string // "0.0.0.0:8443"（服务端）/ 本地端口（客户端，RST 抑制需要）
+    RemoteAddr string // 客户端必填
+    Magic      uint32 // payload 私有头魔数，默认随机派生
+
+    MTU              int           // 默认 1400；叠 trunk_kcp 需 ≥1464（MaxPayload=MTU-64 ≥ KCP 段 1400）
+    DatagramOnly     bool          // 一次 Write = 一个 TCP 段，超限报 ErrPacketTooBig（叠 trunk_kcp 必开）
     Keepalive        time.Duration // 默认 30s
     HandshakeRetries int           // 默认 5
     AutoFirewall     bool          // 默认 true：自动装/卸 RST 抑制规则
+    RecvQueue        int           // 默认 1024（满则丢）
+    Ordered          bool          // 保留字段：置 true 返回配置错误（见 doc.go）
 }
 
-// 服务端
+// 服务端：Listener 实现标准 net.Listener（Accept() net.Conn / Addr() net.Addr / Close()）
 func Listen(ctx context.Context, cfg Config) (*Listener, error)
-type Listener struct { /* ... */ }
-func (l *Listener) Accept() (*Conn, error)
-func (l *Listener) Close() error
 
-// 客户端
+// 客户端：Conn 实现 net.Conn，可直接喂 trunk_kcp.NewTrunkKCP / rpc.NewPeer
 func Dial(ctx context.Context, cfg Config) (*Conn, error)
-
-// 连接：满足 io.ReadWriteCloser，可直接喂 trunk_kcp.NewTrunkKCP / rpc.NewPeer
-type Conn struct { /* ... */ }
-func (c *Conn) Read(p []byte) (int, error)
-func (c *Conn) Write(p []byte) (int, error)   // 内部按 MTU 切片成多个 TCP 段
-func (c *Conn) Close() error                   // 发 FIN，走完四次挥手（超时降级 RST）
 ```
+
+注：v2 已删除 `Mode` 字段与 `ModeUDP`（见文首"v2 修订"）。
 
 ---
 

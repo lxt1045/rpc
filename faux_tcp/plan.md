@@ -25,17 +25,27 @@
 
 - [x] 三次握手：SYN / SYN+ACK / ACK，ISN 随机化（RFC 6528）—— `stack.go` + `TestHandshakeAndEcho`
 - [x] 序号/确认号单调推进，语义自洽（ack 不超过已"接收"的字节）—— `TestAckSemanticsWithHole`
+- [x] 空洞外观闭环：dup ACK + SACK + HealDelay 后 ack 跳变愈合—— `TestHoleHeal`（2026-09 改进，取代"空洞静默"）
+- [x] delayed ACK（2 包 / 40ms 冲刷，仿 Linux）—— `TestDelayedAck`（2026-09 改进）
 - [x] 数据段 PSH+ACK，MSS 协商，不分片（DF）—— `packet.go` 构包常量
 - [x] 选项指纹模拟主流 OS（Linux: MSS,SACK,TS,NOP,WS；顺序与初值逼真）—— `tcpOptionsSyn/tcpOptionsData`（真机指纹比对待阶段 3）
-- [x] 四次挥手 FIN/ACK，RST 处理—— `TestCloseHandshake` / `TestRstToUnknownPort`
+- [x] 四次挥手 FIN/ACK + 半关闭写，RST 处理—— `TestCloseHandshake` / `TestHalfCloseWrite` / `TestRstToUnknownPort`
 - [x] 窗口通告固定大窗口（如 65535 + wscale=7），不出现零窗口—— `Config.Window/WScale`
+- [x] 保活为标准 TCP 探测包（seq=sndNxt-1）+ 对端死亡回收；半开连接超时回收—— `TestKeepaliveProbe` / `TestPeerDeathReap` / `TestHalfOpenReap`（2026-09 改进）
+- [x] 内核 RST 抑制自动装拆（iptables/nft 幂等）+ 收包 cBPF 过滤—— `firewall_linux.go` / `link_linux.go`（2026-09 改进，真机验证仍待阶段 2/3）
 
 ### 必须去掉的 TCP 机制
 
 - [x] 重传：RTO 定时器、重传队列、快速重传、SACK 驱动重传 —— 不存在（`TestNoRetransmitUnderLoss` 验证）
 - [x] 拥塞控制：cwnd/ssthresh/慢启动/拥塞避免/reno/cubic —— 不存在
 - [x] 滑动窗口流控：不依据对端通告窗口节流；接收侧不做窗口收紧 —— 不存在
-- [x] 发送积压：不维护未确认队列；写出即发出，背压直接抛给上层 —— chData 满即丢包
+- [x] 发送积压：不维护"未确认队列"（无重传依据）；仅保留有界出站队列做本地背压 ——
+  数据段满则等待（受 `SetWriteDeadline` 约束，超时报 `ErrWriteTimeout`），
+  控制段（ACK/FIN/探测）队列满时同步兜底直发，接收侧 chData 满即丢包
+- [x] 异步发包：构包在调用方 goroutine（保证 seq/ipID 顺序），发出交给每连接
+  writeLoop 协程——事件循环/读循环绝不阻塞在链路写系统调用上（慢链路不拖垮
+  ACK 与状态机，消除双端互等的 ABBA 风险）；关闭时排空队列再退出
+  （`TestWriteBackpressure`）
 
 ### 架构需求
 
@@ -141,15 +151,21 @@ UDP 端口，我们的 c/s 把 trunk 物理连接指到本机 udp2raw 端口即�
 数据（双向对称）：
   每个应用层包 → 一个 TCP 段: PSH+ACK, seq=发送侧已发字节数(单调), ack=最近接收序号
   seq 只增不减，与对端 ack 无关；发送端不保留副本、永不重发。
-  接收端：按 seq 维护"最高连续序号"，ack 单调递增；丢包产生空洞时 ack 停在空洞处
-  （保持语义自洽），绝不发 dup ACK/SACK（丢包对 DPI 不可见）。
+  接收端：按 seq 维护"最高连续序号"，ack 单调递增；delayed ACK（每 2 包或 40ms，
+  仿 Linux）；丢包产生空洞时 ack 停在空洞处并回 dup ACK + SACK（仿真实接收端），
+  空洞逾 HealDelay（默认 200ms ≈ 重传时延）未愈则执行"虚拟重传愈合"：
+  累计确认越过空洞跳变（空洞数据早已投递上层 KCP，无需线上重演）。
+  → 线上呈现"丢包 → dup ACK/SACK → 快速恢复"完整闭环，ack 永不冻结。
 
 关闭：
-  FIN+ACK → ACK → FIN+ACK → ACK（四次挥手完整模拟），超时 TIME_WAIT 省略。
-  任一端异常消失：对端靠应用层心跳超时（KCP 心跳/模块自带心跳）清理。
+  FIN+ACK → ACK → FIN+ACK → ACK（四次挥手完整模拟），支持半关闭
+  （对端 FIN 后读侧 EOF，本端仍可写直到 Close），超时 TIME_WAIT 省略。
+  FIN 不重传；宽限期（默认 500ms）或周期扫描兜底回收卡死的关闭流程。
 
 保活：
-  无数据时每 N 秒发 ACK 保活段（防 NAT/状态防火墙表项老化，N 默认 25s 可配）。
+  无数据时每 N 秒发标准 TCP keepalive 探测包（seq=sndNxt-1 纯 ACK，N 默认 25s 可配），
+  对端按 RFC 规则应答；连续 3 个周期无任何入站报文判定对端死亡并关闭连接。
+  半开连接（SYN 扫描）超过握手窗口未建立则自动回收。
 ```
 
 ### 丢包语义 / Loss Semantics
@@ -158,15 +174,22 @@ UDP 端口，我们的 c/s 把 trunk 物理连接指到本机 udp2raw 端口即�
 - 接收端允许 seq 空洞；数据直接交给上层（KCP 负责排序/重传）。
 - 关键约束：**ack 绝不能超过已收到的最高连续序号**（否则状态跟踪型 DPI
   能识别异常）；seq 可以有空洞（对 DPI 表现为"观察者漏看"，无害）。
+- 空洞不是沉默的：回 dup ACK + SACK（真实 Linux 接收端在 SACK 协商后必然如此），
+  并在 HealDelay 后"愈合"（ack 跳变）——完全静默或永久冻结的 ack 都是显著异常，
+  愈合机制用接收端单边动作补齐了"重传恢复"的外观（代价：发送端永不重发这一段，
+  只有做全流重组的高级 DPI 才能发现，可接受）。
 
 ### 与内核共存 / Kernel Coexistence
 
 内核协议栈看到不属于任何 socket 的 SYN+ACK/数据段会回 RST，必须抑制：
 
-- Linux：文档化 iptables 规则（udp2raw 同款）：
+- Linux：**默认自动装拆**（`firewall_linux.go`，iptables 优先、nft 兜底，幂等、
+  Close 时卸载，运维手工配置的同名规则不重复安装也不卸载）；
+  `ManualFirewall=true` 时完全由用户手工维护：
   `iptables -A OUTPUT -p tcp --sport <listen_port> --tcp-flags RST RST -j DROP`
-  （发送侧）；接收经 AF_PACKET 旁路内核，无需额外规则。
-- 无 root 权限：自动回退 `udp` 模式并打 warn 日志。
+  （发送侧）；接收经 AF_PACKET 旁路内核，并附 cBPF 只收目的端口匹配的 TCP 帧。
+- 无 root 权限：fail-fast 返回明确错误（不静默降级成 UDP——那会失去伪装意义；
+  需要 UDP 对照时直接使用 `trunk_kcp` 原生 UDP 链路）。
 - Windows/macOS：本期不做；预留 `LinkLayer` 接口抽象（后续可接 WinDivert）。
 
 ### 安全 / Security
@@ -200,7 +223,13 @@ func Dial(ctx context.Context, cfg Config, laddr, raddr string) (net.Conn, error
   拆分后任一片段丢失都会让上层（trunk_kcp 按长度流式重组）永久错位。
   整段投递使"丢包 = 丢整条报文"，与 UDP 语义一致，KCP 可正确重传。
   KCP 线上包 1400B ≤ MSS 1448，天然兼容。
-- 无 root 时 `Listen/Dial` 返回明确错误，由上层（`conn/` 适配器）回退 UDP。
+- 无 root 时 `Listen/Dial` 返回明确错误，由上层（`conn/` 适配器）决定回退/上报。
+- **错误码（errno.go）**：所有自定义错误统一在 501000 段定义（`ErrNeedRoot`/
+  `ErrHandshakeTimeout`/`ErrConnReset`/`ErrPeerTimeout`/`ErrConnClosed`/
+  `ErrReadTimeout`/`ErrPacketTooBig`/`ErrInvalidConfig`/`ErrInvalidAddr`/
+  `ErrRawSocket`/`ErrFirewall`/`ErrInvalidPacket`/`ErrUnsupportedPlatform`），
+  调用方用 `errors.AsCode(err).Code()` 分类；干净 EOF 仍返回标准 `io.EOF`。
+  （2026-09 改进：原为裸 `errors.New` 哨兵，无法跨进程/日志稳定分类。）
 
 ---
 
@@ -302,7 +331,7 @@ udp2raw 过渡链路可承载 trunk_kcp 流量（下载压测通过）。
   - [x] 握手三包、选项顺序与值逼真（`TestHandshakeAndEcho`/`TestPacketRoundTrip` 内存链路断言；真机抓包待验）
   - [x] 数据段 PSH+ACK，seq 单调（`TestHandshakeAndEcho`）
   - [x] 每个 seq 全程只出现一次（无重传）—— 丢包下亦然（`TestNoRetransmitUnderLoss` 20% 丢包断言）
-  - [x] ack 不超过最高连续接收序号，无 dup ACK（`TestAckSemanticsWithHole`）
+  - [x] ack 不超过最高连续接收序号；空洞回 dup ACK+SACK，HealDelay 后愈合跳变（`TestAckSemanticsWithHole`/`TestHoleHeal`）
   - [x] 挥手四包完整；无异常 RST（`TestCloseHandshake`/`TestRstToUnknownPort`）
 - **性能基准**：`BenchmarkThroughput`（内存链路 736MB/s，已建）；与 UDP 直连对照待真机。
 - **回归**：复用 `trunk_kcp/wire_amplification_test.go` 的段计数器测放大率。

@@ -1,0 +1,279 @@
+package socks_faux_kcp
+
+import (
+	"fmt"
+	"net"
+	"net/netip"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/lxt1045/rpc/faux_tcp"
+	"github.com/lxt1045/rpc/trunk_kcp"
+)
+
+// TrunkKCPConfig 控制底层 trunk_kcp 链路参数。
+type TrunkKCPConfig struct {
+	Conv           uint32 `yaml:"conv"`
+	MinConns       int    `yaml:"min_conns"`
+	MaxConns       int    `yaml:"max_conns"`
+	MaxVirtualConn int    `yaml:"max_virtual_conn"`
+
+	// KCP NoDelay 参数（语义同 kcp.KCP.NoDelay），nil 表示使用库默认值 (1,10,32,1)。
+	// 客户端与服务端必须配置成相同的值。
+	//
+	// 注意：本示例的物理连接是 faux_tcp（**不可靠**、语义等价 UDP 的数据报），
+	// 丢包是真实链路丢包，所以适合库默认的快速模式 (1,10,32,1)；
+	// socks_trunk_kcp 里"KCP over TCP/TLS 伪重传"那套保守参数（nodelay=0,
+	// interval=20~40, resend=0）不适用于本示例。
+	KCPNoDelay  *int `yaml:"kcp_nodelay"`
+	KCPInterval *int `yaml:"kcp_interval"`
+	KCPResend   *int `yaml:"kcp_resend"`
+	KCPNc       *int `yaml:"kcp_nc"`
+}
+
+// NoDelayParam 返回配置的 KCP NoDelay 四元组；未配置项为 -1（保持库当前值）。
+func (c *TrunkKCPConfig) NoDelayParam() (nodelay, interval, resend, nc int) {
+	nodelay, interval, resend, nc = -1, -1, -1, -1
+	if c == nil {
+		return
+	}
+	if c.KCPNoDelay != nil {
+		nodelay = *c.KCPNoDelay
+	}
+	if c.KCPInterval != nil {
+		interval = *c.KCPInterval
+	}
+	if c.KCPResend != nil {
+		resend = *c.KCPResend
+	}
+	if c.KCPNc != nil {
+		nc = *c.KCPNc
+	}
+	return
+}
+
+// ApplyKCPParam 将配置的 KCP NoDelay 参数应用到 trunk（未配置项保持库默认）。
+func (c *TrunkKCPConfig) ApplyKCPParam(t *trunk_kcp.TrunkKCP) {
+	if c == nil || t == nil {
+		return
+	}
+	nodelay, interval, resend, nc := c.NoDelayParam()
+	if nodelay < 0 && interval < 0 && resend < 0 && nc < 0 {
+		return
+	}
+	t.SetNoDelay(nodelay, interval, resend, nc)
+}
+
+// FauxTCPConfig 伪装 TCP 底层参数；零值即 faux_tcp 的推荐默认值。
+type FauxTCPConfig struct {
+	// MSS 单个 TCP 段最大载荷，默认 1448。必须 ≥ KCP 线上包（默认 1400），
+	// 否则上层（trunk_kcp 按长度流式重组）会因半帧丢失永久错位。
+	MSS int `yaml:"mss"`
+	// TTL IPv4 TTL，默认 64（仿 Linux）。
+	TTL int `yaml:"ttl"`
+	// KeepAliveSeconds 空闲保活间隔（标准 TCP keepalive 探测包），默认 25。
+	KeepAliveSeconds int `yaml:"keepalive_seconds"`
+	// HandshakeTimeoutMS 握手单次超时，默认 1000ms。
+	HandshakeTimeoutMS int `yaml:"handshake_timeout_ms"`
+	// HandshakeRetries SYN 重试次数，默认 3。
+	HandshakeRetries int `yaml:"handshake_retries"`
+	// CloseGraceMS 挥手宽限，默认 500ms。
+	CloseGraceMS int `yaml:"close_grace_ms"`
+	// HealDelayMS 丢包后 ack "虚拟重传愈合"等待，默认 200ms。
+	HealDelayMS int `yaml:"heal_delay_ms"`
+	// ManualFirewall true 表示 RST 抑制规则由运维手工维护（faux_tcp 默认自动装拆）。
+	ManualFirewall bool `yaml:"manual_firewall"`
+}
+
+// ToFauxTCP 转换为 faux_tcp.Config（零值字段交给 faux_tcp 填默认）。
+func (c FauxTCPConfig) ToFauxTCP() faux_tcp.Config {
+	cfg := faux_tcp.Config{
+		MSS:              c.MSS,
+		TTL:              uint8(c.TTL),
+		HandshakeRetries: c.HandshakeRetries,
+		ManualFirewall:   c.ManualFirewall,
+	}
+	if c.KeepAliveSeconds > 0 {
+		cfg.KeepAlive = time.Duration(c.KeepAliveSeconds) * time.Second
+	}
+	if c.HandshakeTimeoutMS > 0 {
+		cfg.HandshakeTimeout = time.Duration(c.HandshakeTimeoutMS) * time.Millisecond
+	}
+	if c.CloseGraceMS > 0 {
+		cfg.CloseGrace = time.Duration(c.CloseGraceMS) * time.Millisecond
+	}
+	if c.HealDelayMS > 0 {
+		cfg.HealDelay = time.Duration(c.HealDelayMS) * time.Millisecond
+	}
+	return cfg
+}
+
+// ConnConfig 服务端监听 / 客户端拨号地址（本示例无 TLS：faux_tcp 自带 TCP 外观，
+// 但尚不含加密/认证传输层，token 以明文过线，详见 README）。
+type ConnConfig struct {
+	Addr string `yaml:"addr"`
+	// LocalAddr 客户端可选：指定本地 IP:端口（默认按对端路由自动选择 IP + 随机端口）
+	LocalAddr string `yaml:"local_addr"`
+}
+
+// ServerConfig 是服务端运行时配置。
+type ServerConfig struct {
+	Token      string         `yaml:"token"`
+	MaxClients int            `yaml:"max_clients"`
+	Conn       ConnConfig     `yaml:"conn"`
+	Trunk      TrunkKCPConfig `yaml:"trunk_kcp"`
+	FauxTCP    FauxTCPConfig  `yaml:"faux_tcp"`
+	ACL        ACLConfig      `yaml:"acl"`
+}
+
+// ClientConfig 是客户端运行时配置。
+type ClientConfig struct {
+	Token      string         `yaml:"token"`
+	ClientConn ConnConfig     `yaml:"client_conn"`
+	Trunk      TrunkKCPConfig `yaml:"trunk_kcp"`
+	FauxTCP    FauxTCPConfig  `yaml:"faux_tcp"`
+}
+
+// ACLConfig 简单访问控制。
+type ACLConfig struct {
+	Enabled       bool     `yaml:"enabled"`
+	AllowNetworks []string `yaml:"allow_networks"`
+	DenyHosts     []string `yaml:"deny_hosts"`
+}
+
+func (c *TrunkKCPConfig) defaults() {
+	if c.Conv == 0 {
+		c.Conv = 0x5a0b0001
+	}
+	if c.MinConns <= 0 {
+		c.MinConns = 1
+	}
+	if c.MaxConns < c.MinConns {
+		c.MaxConns = 4
+	}
+	if c.MaxVirtualConn <= 0 {
+		c.MaxVirtualConn = 256
+	}
+}
+
+// NormalizeTrunkKCPConfig 补全 trunk_kcp 默认值。
+func NormalizeTrunkKCPConfig(c *TrunkKCPConfig) {
+	c.defaults()
+}
+
+// ValidateMSS 校验 faux_tcp MSS 与 KCP 线上包的兼容性（数据报边界硬约束）。
+func (c *FauxTCPConfig) ValidateMSS(kcpMTU int) error {
+	mss := c.MSS
+	if mss <= 0 {
+		mss = 1448 // faux_tcp 默认
+	}
+	if kcpMTU <= 0 {
+		kcpMTU = 1400 // trunk_kcp 默认 KCP 线上包
+	}
+	if mss < kcpMTU {
+		return fmt.Errorf("faux_tcp MSS(%d) 小于 KCP 线上包(%d)：丢包会造成半帧错位，请调大 MSS", mss, kcpMTU)
+	}
+	return nil
+}
+
+func (c *ServerConfig) defaults() {
+	c.Trunk.defaults()
+	if c.MaxClients <= 0 {
+		c.MaxClients = 1024
+	}
+}
+
+func (c *ClientConfig) defaults() {
+	c.Trunk.defaults()
+}
+
+// ValidateClientConfig 校验客户端配置。
+func ValidateClientConfig(c *ClientConfig) error {
+	c.defaults()
+	if c.Token == "" {
+		return fmt.Errorf("client token is required")
+	}
+	if c.ClientConn.Addr == "" {
+		return fmt.Errorf("client-conn.addr is required")
+	}
+	if err := c.FauxTCP.ValidateMSS(0); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateServerConfig 校验服务端配置。
+func ValidateServerConfig(c *ServerConfig) error {
+	c.defaults()
+	if c.Token == "" {
+		return fmt.Errorf("server token is required")
+	}
+	if c.Conn.Addr == "" {
+		return fmt.Errorf("conn.addr is required")
+	}
+	if err := c.FauxTCP.ValidateMSS(0); err != nil {
+		return err
+	}
+	return nil
+}
+
+var acl = struct {
+	sync.RWMutex
+	cfg      ACLConfig
+	networks []netip.Prefix
+}{}
+
+// ConfigureACL 设置 ACL。
+func ConfigureACL(c ACLConfig) error {
+	var networks []netip.Prefix
+	for _, s := range c.AllowNetworks {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			return fmt.Errorf("invalid allow network %q: %w", s, err)
+		}
+		networks = append(networks, p)
+	}
+	acl.Lock()
+	acl.cfg = c
+	acl.networks = networks
+	acl.Unlock()
+	return nil
+}
+
+// CheckACL 判断目标是否被允许。
+func CheckACL(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	host = strings.Trim(host, "[]")
+	host = strings.ToLower(host)
+
+	acl.RLock()
+	defer acl.RUnlock()
+	cfg := acl.cfg
+	if !cfg.Enabled {
+		return true
+	}
+	for _, deny := range cfg.DenyHosts {
+		d := strings.TrimSuffix(strings.ToLower(deny), ".")
+		h := strings.TrimSuffix(host, ".")
+		if h == d || strings.HasSuffix(h, "."+d) {
+			return false
+		}
+	}
+	addr, perr := netip.ParseAddr(host)
+	if perr == nil {
+		if len(cfg.AllowNetworks) > 0 {
+			for _, p := range acl.networks {
+				if p.Contains(addr) {
+					return true
+				}
+			}
+			return false
+		}
+		return true
+	}
+	return len(cfg.AllowNetworks) == 0
+}

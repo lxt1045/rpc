@@ -51,18 +51,18 @@ func (l *lossyLink) WriteSegment(seg *Segment) error {
 }
 
 // benchEnv 一组带丢包的 fake_tcp 管道连接
-func benchEnv(t *testing.T, dropEvery uint64) (cli *Conn, srv *Conn, lossy *lossyLink, cleanup func()) {
+func benchEnv(t *testing.T, dropEvery uint64, datagram bool) (cli *Conn, srv *Conn, lossy *lossyLink, cleanup func()) {
 	t.Helper()
 	cfg := Config{
-		Mode:             ModeRawTCP,
 		MTU:              1500, // MaxPayload=1436 ≥ KCP 段 1400，帧对齐
+		DatagramOnly:     datagram,
 		Keepalive:        time.Hour,
 		HandshakeRetries: 3,
 		RecvQueue:        65536,
 	}
 	srvLink, cliLink := pipePair()
 	// 帧对齐关键：MaxPayload 必须 ≥ KCP 最大段（1400），保证一个 KCP 段一个 fake_tcp 段。
-	// 生产对应：RawTCP 模式 MTU ≥ 1464（MaxPayload=MTU-64），UDP 模式 MTU ≥ 1413。
+	// 生产对应：RawTCP 模式 MTU ≥ 1464（MaxPayload=MTU-64）。
 	srvLink.maxPayload = 1436
 	cliLink.maxPayload = 1436
 	lossy = &lossyLink{LinkIO: srvLink, dropEvery: dropEvery} // 服务端→客户端方向丢包
@@ -81,7 +81,7 @@ func benchEnv(t *testing.T, dropEvery uint64) (cli *Conn, srv *Conn, lossy *loss
 		cancel()
 		t.Fatalf("Accept: %v", err)
 	}
-	return conn, sc, lossy, func() {
+	return conn, sc.(*Conn), lossy, func() {
 		_ = l.Close()
 		_ = cliLink.Close()
 		_ = srvLink.Close()
@@ -108,7 +108,7 @@ func (r benchRow) util() float64    { return float64(r.AppBytes) / float64(r.Wir
 // benchTrunkKCP  trunk_kcp over fake_tcp：交付率恒 100%（KCP 重传），看线上放大与吞吐
 func benchTrunkKCP(t *testing.T, dropEvery uint64, nbytes int64) benchRow {
 	t.Helper()
-	cli, srv, lossy, cleanup := benchEnv(t, dropEvery)
+	cli, srv, lossy, cleanup := benchEnv(t, dropEvery, true) // 数据报模式：帧原子性由构造保证
 	defer cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -189,7 +189,7 @@ func benchTrunkKCP(t *testing.T, dropEvery uint64, nbytes int64) benchRow {
 // benchRawFakeTCP 裸 fake_tcp（无 KCP）：不重传，交付率即 (1-丢包率)
 func benchRawFakeTCP(t *testing.T, dropEvery uint64, nbytes int64) (delivery float64, dur time.Duration) {
 	t.Helper()
-	cli, srv, _, cleanup := benchEnv(t, dropEvery)
+	cli, srv, _, cleanup := benchEnv(t, dropEvery, false) // 流式模式：大 Write 内部切片
 	defer cleanup()
 	_ = cli
 

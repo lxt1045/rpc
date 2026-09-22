@@ -34,7 +34,6 @@ func TestRawTCPLoopback(t *testing.T) {
 	defer cancel()
 
 	cfg := Config{
-		Mode:             ModeRawTCP,
 		LocalAddr:        "127.0.0.1:0", // 端口 0：自动挑选空闲端口
 		Magic:            0x66aa55cc,
 		Keepalive:        time.Hour,
@@ -46,7 +45,7 @@ func TestRawTCPLoopback(t *testing.T) {
 		t.Skipf("RawTCP 不可用（%v），跳过", err) // 无 iptables/权限不全时降级为 Skip
 	}
 	defer l.Close()
-	addr := fmt.Sprintf("127.0.0.1:%d", l.Addr().Port)
+	addr := fmt.Sprintf("127.0.0.1:%d", l.Addr().(Addr).port)
 
 	ccfg := cfg
 	ccfg.LocalAddr = "127.0.0.1:0"
@@ -74,8 +73,8 @@ func TestRawTCPLoopback(t *testing.T) {
 	rDone := make(chan result, 2)
 
 	go func() { wDone <- writeSeqChunks(cli, chunk, nChunks, 0) }()
-	go func() { wDone <- writeSeqChunks(srv, chunk, nChunks, 1<<20) }()
-	go func() { st, err := checkSeqChunks(srv, chunk, nChunks, 0); rDone <- result{st, err} }()
+	go func() { wDone <- writeSeqChunks(srv.(*Conn), chunk, nChunks, 1<<20) }()
+	go func() { st, err := checkSeqChunks(srv.(*Conn), chunk, nChunks, 0); rDone <- result{st, err} }()
 	go func() { st, err := checkSeqChunks(cli, chunk, nChunks, 1<<20); rDone <- result{st, err} }()
 
 	if err := <-wDone; err != nil {
@@ -120,7 +119,6 @@ func TestRawTCPKernelRSTSuppressed(t *testing.T) {
 	defer cancel()
 
 	cfg := Config{
-		Mode:         ModeRawTCP,
 		LocalAddr:    "127.0.0.1:0",
 		Magic:        0x66aa55cc,
 		Keepalive:    200 * time.Millisecond,
@@ -131,7 +129,7 @@ func TestRawTCPKernelRSTSuppressed(t *testing.T) {
 		t.Skipf("RawTCP 不可用（%v），跳过", err)
 	}
 	defer l.Close()
-	addr := fmt.Sprintf("127.0.0.1:%d", l.Addr().Port)
+	addr := fmt.Sprintf("127.0.0.1:%d", l.Addr().(Addr).port)
 
 	ccfg := cfg
 	ccfg.LocalAddr = "127.0.0.1:0"
@@ -148,7 +146,7 @@ func TestRawTCPKernelRSTSuppressed(t *testing.T) {
 
 	// 空闲 1s（跨越多个保活周期）：若内核 RST 未被抑制，会话早被重置
 	time.Sleep(time.Second)
-	if cli.sess.isClosed() || srv.sess.isClosed() {
+	if cli.sess.isClosed() || srv.(*Conn).sess.isClosed() {
 		t.Fatalf("会话被意外关闭（内核 RST 抑制失效？）")
 	}
 	if _, err := cli.Write([]byte("still alive")); err != nil {

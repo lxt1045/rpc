@@ -4,7 +4,7 @@
 
 This repository is the `github.com/lxt1045/rpc` Go module, a gRPC-stub-compatible RPC library with its own framing and dispatch layer. Root-level files implement peer, client, service, middleware, and methods. `base/` contains protobuf definitions and generated types, `codec/` owns wire framing, `conn/` wraps transports, `socket/` provides listener/dial helpers, and `trunk/` implements connection aggregation. `trunk_kcp/` is a KCP trunk variant.
 
-Root `*_test.go` files cover the library. `test/` contains runnable examples and integration programs; `test/proxy`, `test/socks_trunk`, and `test/socks_trunk_kcp` also carry real unit tests that pass offline. Keep generated `*.pb.go` files beside their matching `*.proto` source. `plan.md`/`TODO.md` at the root are trunk/trunk_kcp design notes.
+Root `*_test.go` files cover the library. `test/` contains runnable examples and integration programs; `test/proxy`, `test/socks_trunk`, `test/socks_trunk_kcp`, and `test/socks_faux_trunk_kcp` also carry real unit tests that pass offline. Keep generated `*.pb.go` files beside their matching `*.proto` source. `plan.md`/`TODO.md` at the root are trunk/trunk_kcp design notes.
 
 ## Build, Test, and Development Commands
 
@@ -16,7 +16,7 @@ go build ./...                                                                  
 go vet .                                                                            # root package checks
 go test -run '^TestPipe$' -count=1 -timeout 60s .
 go test -run '^TestUint16$' -count=1 ./trunk
-go test -count=1 ./codec ./trunk ./test/proxy ./test/socks_trunk ./test/socks_trunk_kcp # offline suites
+go test -count=1 ./codec ./trunk ./test/proxy ./test/socks_trunk ./test/socks_trunk_kcp ./test/socks_faux_trunk_kcp # offline suites
 ```
 
 Use targeted tests during development. `go test ./trunk` is fully green; `go test ./trunk_kcp` has one known failure (`TestReviewHeaderID/ParseHeader2`, an experimental header-codec pair unused in production); `go test ./socket` hangs forever in `TestListen`'s infinite accept loop — run its tests by name. Some full-suite tests depend on fixed ports, local certificates, or QUIC/KCP timing; interpret `go test ./...` failures accordingly.

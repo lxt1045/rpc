@@ -21,4 +21,5 @@ var (
 	ErrTimeout             = errors.NewCode(0, moduleCode+10, "fake_tcp: 操作超时")
 	ErrFirewall            = errors.NewCode(0, moduleCode+11, "fake_tcp: RST 抑制规则安装失败")
 	ErrAddrRequired        = errors.NewCode(0, moduleCode+12, "fake_tcp: 缺少本地或对端地址")
+	ErrPacketTooBig        = errors.NewCode(0, moduleCode+13, "fake_tcp: Write 超过 MaxPayload（数据报模式一次 Write = 一个 TCP 段）")
 )

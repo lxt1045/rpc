@@ -30,39 +30,32 @@ func newSession(ctx context.Context, cfg Config, link LinkIO, local, peer PeerAd
 		cfg.RecvQueue = recvQueueCap
 	}
 	s := &session{
-		cfg:      cfg,
-		link:     link,
-		local:    local,
-		peer:     peer,
-		connID:   connID,
-		recvCh:   make(chan []byte, cfg.RecvQueue),
-		outCh:    make(chan *Segment, outQueueCap),
-		finCh:    make(chan struct{}),
-		closeCh:  make(chan struct{}),
-		estCh:    make(chan struct{}),
-		tsEpoch:  time.Now(),
-		bitmap:   make(map[uint32]uint32),
+		cfg:     cfg,
+		link:    link,
+		local:   local,
+		peer:    peer,
+		connID:  connID,
+		recvCh:  make(chan []byte, cfg.RecvQueue),
+		outCh:   make(chan *Segment, outQueueCap),
+		finCh:   make(chan struct{}),
+		closeCh: make(chan struct{}),
+		estCh:   make(chan struct{}),
+		tsEpoch: time.Now(),
+		bitmap:  make(map[uint32]uint32),
 	}
+	s.ipID.Store(randUint32()) // IP ID 随机起步（仿 Linux per-flow 计数器）
 	s.touch()
 	go s.writeLoop(ctx)
 	return s
 }
 
-// randUint32 加密随机数（ISN / ConnID 用）
+// randUint32 加密随机数（ISN / Magic / IP ID 起步用）
 func randUint32() uint32 {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return uint32(time.Now().UnixNano())
 	}
 	return binary.LittleEndian.Uint32(b[:])
-}
-
-func randUint64() uint64 {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return uint64(time.Now().UnixNano())
-	}
-	return binary.LittleEndian.Uint64(b[:])
 }
 
 // Read 读取数据。语义：到达即交、不保序（plan.md §4.3；需要有序请在上层叠 KCP）。
@@ -114,8 +107,12 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 	}
 }
 
-// Write 写入数据：按 MaxPayload 切片为多个报文直发（不重传、不限速、不背压）。
-// 全部切片成功才返回 len(p)，中途失败返回已发送字节数与错误。
+// Write 写入数据。两种语义（Config.DatagramOnly）：
+//   - 数据报模式：一次 Write = 一个 TCP 段，超过 MaxPayload 直接报错（由上层分段；
+//     叠加 trunk_kcp 时必须开启，杜绝半帧丢失导致流式重组错位）；
+//   - 流式模式（默认关闭时）：内部按 MaxPayload 切片为多个段直发。
+//
+// 不重传、不限速、不做线上背压（仅本地出站队列容量等待）。
 func (c *Conn) Write(p []byte) (n int, err error) {
 	s := c.sess
 	switch s.getState() {
@@ -127,6 +124,18 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 	max := s.link.MaxPayload()
 	if max <= 0 {
 		max = defaultMTU
+	}
+	if s.cfg.DatagramOnly {
+		if len(p) > max {
+			return 0, ErrPacketTooBig.Newf("%d > %d", len(p), max)
+		}
+		if len(p) == 0 {
+			return 0, nil
+		}
+		if err = s.sendData(p); err != nil {
+			return 0, err
+		}
+		return len(p), nil
 	}
 	for len(p) > 0 {
 		m := max
@@ -161,22 +170,14 @@ func (a Addr) String() string {
 	return net.JoinHostPort(a.ip.String(), strconv.Itoa(int(a.port)))
 }
 
-// LocalAddr 本地地址
+// LocalAddr 本地地址（线路上是 TCP，按 TCPAddr 外观呈现）
 func (c *Conn) LocalAddr() net.Addr {
-	network := "tcp"
-	if c.sess.cfg.Mode == ModeUDP {
-		network = "udp"
-	}
-	return Addr{network: network, ip: c.sess.local.IP, port: c.sess.local.Port}
+	return Addr{network: "tcp", ip: c.sess.local.IP, port: c.sess.local.Port}
 }
 
 // RemoteAddr 对端地址
 func (c *Conn) RemoteAddr() net.Addr {
-	network := "tcp"
-	if c.sess.cfg.Mode == ModeUDP {
-		network = "udp"
-	}
-	return Addr{network: network, ip: c.sess.peer.IP, port: c.sess.peer.Port}
+	return Addr{network: "tcp", ip: c.sess.peer.IP, port: c.sess.peer.Port}
 }
 
 // SetDeadline 读/写截止时间
