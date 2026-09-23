@@ -75,6 +75,11 @@ type TrunkKCP struct {
 	kcp     *kcp.KCP
 	kcpLock sync.Mutex
 	mtu     int // KCP 线上包 MTU（含 KCP 头；0 表示用默认 KcpMtu）
+	// ackNoDelay 透传给 kcp.Input 的第三个参数（true = 收到段立即回 ACK）。
+	// **默认 false，且实测不要打开**：kcp-go 的 ackNoDelay 走 flush(true) 的"仅 ACK"路径，
+	// 会连带把窗口探测/旧段一起发出去，内存链路实测重传率从 68% 飙到 90%、goodput 掉到
+	// 0.1MB/s（见 ratelimit_test.go 的固定窗口场景）。保留开关仅供实验。
+	ackNoDelay atomic.Bool
 
 	// 发送窗口自动调节与线路统计（见 autownd.go）
 	stats        *trunkStats
@@ -91,12 +96,15 @@ type TrunkKCP struct {
 	ampHistIdx   int
 	ampHistCnt   int
 	// 说明：ampEWMA/ampHighTicks 的读取在 Stats 里经 ctrlMu 保护
-	lastTickWire  int64     // 上一控制周期的线上字节
-	lastTickAcked int64     // 上一控制周期被 ACK 确认的段数
-	lastLogAcked  int64     // 上次日志时被 ACK 确认的段数
-	lastLogAt     time.Time // 上次自诊断日志时间
-	lastLogWire   int64     // 上次日志时的线上字节
-	lastLogDeliv  int64     // 上次日志时的交付字节
+	lastTickWire   int64       // 上一控制周期的线上字节
+	lastTickAcked  int64       // 上一控制周期被 ACK 确认的段数
+	lastLogAcked   int64       // 上次日志时被 ACK 确认的段数
+	lastLogAt      time.Time   // 上次自诊断日志时间
+	lastLogWire    int64       // 上次日志时的线上字节
+	lastLogDeliv   int64       // 上次日志时的交付字节
+	lastLogPush    int64       // 上次日志时的 PUSH 段数（算区间重传率）
+	lastLogRetrans int64       // 上次日志时的重传段数（算区间重传率）
+	lastLogSnap    logSnapshot // 上次日志的收线/收段/重传来源采样（见 autownd.go）
 
 	// 数据通道
 	sendChan chan []byte // KCP 输出 -> 网络发送
@@ -158,6 +166,7 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 	// SetAutoWindow（见 autownd.go 与 README「KCP 参数」）。接收窗口只做缓冲，
 	// 不要跟着调小：调小会在应用稍有停顿时把对端饿死（真机踩过）。
 	t.kcp.WndSize(autoWindowDefaultMax, autoWindowDefaultRcv)
+	t.ackNoDelay.Store(false) // 默认延迟 ACK；打开 ackNoDelay 的实测副作用见字段注释
 	// 设置 MTU 为 1400（典型以太网 MTU 1500 - IP/UDP 头部）
 	// MSS = MTU - KCP头部(24) = 1376，更大的 MSS 减少分片
 	t.mtu = KcpMtu
@@ -170,7 +179,7 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 	// conn.kcp.NoDelay(0, 10, 0, 0) // 默认模式
 	//conn.kcp.NoDelay(0, 10, 0, 1) // 普通模式，关闭流控等
 	//conn.kcp.NoDelay(1, 10, 2, 1) // 启动快速模式
-	t.kcp.NoDelay(1, 10, 32, 1)
+	t.kcp.NoDelay(0, 10, 88, 0) // min_conns: 8  max_conns: 16 网速和网路占用都比较理想
 
 	return t
 }
@@ -207,6 +216,12 @@ func (t *TrunkKCP) SetNoDelay(nodelay, interval, resend, nc int) {
 	t.kcpLock.Lock()
 	defer t.kcpLock.Unlock()
 	t.kcp.NoDelay(nodelay, interval, resend, nc)
+}
+
+// SetAckNoDelay 设置"收到段立即回 ACK"。默认 true（低延迟、减少发送端 RTO 伪重传）；
+// 置 false 恢复 kcp-go 默认的延迟 ACK（ACK 更少但更晚）。
+func (t *TrunkKCP) SetAckNoDelay(v bool) {
+	t.ackNoDelay.Store(v)
 }
 
 // SetWindowSize 设置 KCP 发送/接收窗口（单位：KCP 段，一段载荷 = mtu-24 字节）。
@@ -422,7 +437,7 @@ func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 		case packet := <-t.recvChan:
 			t.stats.recordRecvPacket(packet, time.Now()) // ACK → RTT 估计
 			t.kcpLock.Lock()
-			if ret := t.kcp.Input(packet, true, false); ret < 0 {
+			if ret := t.kcp.Input(packet, true, t.ackNoDelay.Load()); ret < 0 {
 				t.kcpLock.Unlock()
 				return errors.Errorf("kcp input failed: %d", ret)
 			}
@@ -567,7 +582,7 @@ func (t *TrunkKCP) newConnLocked(connID uint16, notify bool) *VirtualConn {
 	t.conns[connID] = &VirtualConn{
 		TrunkKCP: t,
 		connID:   connID,
-		readChan: make(chan []byte, 64),
+		readChan: make(chan []byte, 256), // 单条虚拟连接的读缓冲：64 太浅，下游（浏览器）一停顿就会阻塞 kcpInputLoop、推迟所有连接的 ACK
 		readDone: make(chan struct{}),
 	}
 	if notify && t.onNewConnFn != nil {

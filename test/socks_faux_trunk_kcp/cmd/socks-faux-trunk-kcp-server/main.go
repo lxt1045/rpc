@@ -57,6 +57,7 @@ func main() {
 		return
 	}
 	log.Ctx(ctx).Info().Str("conf", confSource).Msg("config loaded")
+	socks.LogEffectiveTrunkKCP(ctx, "server", &conf.TrunkKCP)
 
 	token := os.Getenv("SOCKS_TRUNK_TOKEN")
 	if token == "" {

@@ -1,6 +1,7 @@
 package socks_faux_kcp
 
 import (
+	"context"
 	"crypto/tls"
 	"embed"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/lxt1045/rpc/faux_tcp"
 	"github.com/lxt1045/rpc/trunk_kcp"
 	"github.com/lxt1045/utils/config"
+	"github.com/lxt1045/utils/log"
 )
 
 // TrunkKCPConfig 控制底层 trunk_kcp 链路参数。
@@ -183,6 +185,43 @@ func (c FauxTCPConfig) HandshakeBudget() time.Duration {
 		retries = 3 // faux_tcp 默认 HandshakeRetries
 	}
 	return timeout * time.Duration(retries+1)
+}
+
+// LogEffective 启动时打印**实际生效**的底层参数。踩过坑：yml 里 kcp_sndwnd 设了 192，
+// 但同文件的 kcp_auto_wnd: true 把窗口改成了自动调节并缩到下限（32 段），吞吐掉到 1/4，
+// 而日志里不打印有效参数时完全看不出配置没生效。
+func LogEffectiveTrunkKCP(ctx context.Context, tag string, c *TrunkKCPConfig) {
+	autoWnd := c.KCPAutoWnd != nil && *c.KCPAutoWnd
+	snd, rcv := c.KCPSndWnd, c.KCPRcvWnd
+	if snd <= 0 {
+		snd = 1024 // 库默认
+	}
+	if rcv <= 0 {
+		rcv = 1024
+	}
+	nodelay, interval, resend, nc := c.NoDelayParam()
+	ev := log.Ctx(ctx).Info().
+		Bool("auto_wnd", autoWnd).
+		Int("sndwnd", snd).
+		Int("rcvwnd", rcv).
+		Int("mtu", c.KCPMtu).
+		Int("nodelay", orDefault(nodelay, 1)).
+		Int("interval", orDefault(interval, 10)).
+		Int("resend", orDefault(resend, 32)).
+		Int("nc", orDefault(nc, 1))
+	if autoWnd {
+		ev.Msgf("%s: trunk_kcp 参数（★ auto_wnd=true 为实验性：会覆盖 sndwnd，真机实测曾把"+
+			"窗口缩到下限导致吞吐掉到 1/4；生产建议 auto_wnd=false 并用 kcp_sndwnd 按 BDP 设）", tag)
+	} else {
+		ev.Msgf("%s: trunk_kcp 参数（窗口按 BDP 设：sndwnd ≈ 速率(B/s)×RTT(s)/(kcp_mtu-24)）", tag)
+	}
+}
+
+func orDefault(v, def int) int {
+	if v < 0 {
+		return def
+	}
+	return v
 }
 
 // ConnConfig 服务端监听 / 客户端拨号地址。

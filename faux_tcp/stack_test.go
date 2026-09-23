@@ -1078,3 +1078,57 @@ func TestSynAckEchoesTimestamp(t *testing.T) {
 		t.Fatalf("SYN+ACK TSecr=%d, want echo of SYN TSval=%d", pkts[1].TSecr, pkts[0].TSval)
 	}
 }
+
+// TestDeliverAfterPeerFinDoesNotPanic 对端 FIN 之后仍可能有数据段到达（在途数据/重传）。
+// 此时读侧已关闭（chData 关闭 → Read 返回 EOF），deliverLocked 必须显式丢弃，
+// 否则会 send on closed channel —— 真机客户端在 InitTrunk 重试期间就这么崩过
+// （panic: send on closed channel，栈顶 deliverLocked ← handleEstablished）。
+func TestDeliverAfterPeerFinDoesNotPanic(t *testing.T) {
+	_, srv, net0, _ := testPair(t, nil, nil)
+	sc := srv.(*Conn).c
+
+	sc.mu.Lock()
+	seq := sc.rcvNxt
+	sc.mu.Unlock()
+
+	cfg := Config{}
+	cfg.defaults()
+	cliEP := testEndpoint(testClientIP, 40000)
+	srvEP := testEndpoint(testServerIP, 8080)
+
+	// 1) 正序 FIN：服务端转 stCloseWait 并关闭读侧
+	fin := buildPacket(&cfg, cliEP, srvEP, seq, 0, flagFIN|flagACK, clockMS(), 0, nil, 1)
+	net0.deliver(testClientIP, testServerIP, fin)
+	waitFor(t, time.Second, func() bool {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+		return sc.state == stCloseWait && sc.chDataClosed
+	}, "peer FIN → read EOF")
+
+	// 2) FIN 之后的正序数据段（旧实现：send on closed channel → panic）
+	sc.mu.Lock()
+	before := sc.rcvNxt
+	sc.mu.Unlock()
+	late := buildPacket(&cfg, cliEP, srvEP, seq+1, 0, flagPSH|flagACK, clockMS(), 0, []byte("late"), 2)
+	net0.deliver(testClientIP, testServerIP, late)
+	waitFor(t, time.Second, func() bool {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+		return sc.rcvNxt != before
+	}, "late data 是否走了正序投递分支")
+
+	// 3) FIN 之后的乱序（空洞）数据段同样不能 panic
+	hole := buildPacket(&cfg, cliEP, srvEP, seq+100, 0, flagPSH|flagACK, clockMS(), 0, []byte("hole"), 3)
+	net0.deliver(testClientIP, testServerIP, hole)
+
+	// 4) 重复 FIN 也不应再次关闭通道
+	net0.deliver(testClientIP, testServerIP,
+		buildPacket(&cfg, cliEP, srvEP, seq, 0, flagFIN|flagACK, clockMS(), 0, nil, 4))
+
+	// 读侧应干净返回 EOF，而不是 panic 或返回迟到数据
+	buf := make([]byte, 16)
+	srv.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if n, err := srv.Read(buf); err == nil {
+		t.Fatalf("对端 FIN 之后不应再读出数据: n=%d %q", n, buf[:n])
+	}
+}

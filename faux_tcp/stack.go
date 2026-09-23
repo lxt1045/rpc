@@ -211,14 +211,17 @@ type fconn struct {
 	ackTimer   *time.Timer
 	ackTimerC  <-chan time.Time
 
-	chPkt    chan *Packet // demux 投递的 inbound 报文
-	outCh    chan []byte  // 已构好的待发报文（writeLoop 消费）
-	chData   chan []byte  // 投递给上层的数据（满则丢包，无积压）
-	chReady  chan error   // 握手结果（cap 1）
-	done     chan struct{}
-	once     sync.Once
-	dataOnce sync.Once    // chData 只关闭一次
-	err      atomic.Value // 关闭原因
+	chPkt   chan *Packet // demux 投递的 inbound 报文
+	outCh   chan []byte  // 已构好的待发报文（writeLoop 消费）
+	chData  chan []byte  // 投递给上层的数据（满则丢包，无积压）
+	chReady chan error   // 握手结果（cap 1）
+	done    chan struct{}
+	once    sync.Once
+	// chDataClosed 读侧是否已关闭（对端 FIN 或连接关闭）。持有 c.mu 读写：
+	// deliverLocked 必须先看这个标志再发送，否则"FIN 之后仍到达的数据段"会
+	// send on closed channel —— 真机客户端在 InitTrunk 重试期间崩过。
+	chDataClosed bool
+	err          atomic.Value // 关闭原因
 
 	// outMu 串行化"构包 + 入队"（仅数据路径 Write 使用：保证并发 Write 的
 	// seq 分配与入队顺序一致，同时允许队列满时等待而不持有 c.mu）。
@@ -733,11 +736,26 @@ func (c *fconn) sendDupAckLocked() {
 // deliverLocked 把载荷投递给上层；Packet 拥有 Payload 所有权，直接转交。
 // chData 满时丢包（无积压，背压以丢包形式传导给上层，由 KCP 重传）。
 func (c *fconn) deliverLocked(p *Packet) {
+	if c.chDataClosed {
+		// 读侧已 EOF（对端 FIN / 连接已关闭）：其后到达的数据按真实栈语义丢弃。
+		// 必须显式判断——向已关闭的 chData 发送会 panic（真机踩过）。
+		return
+	}
 	select {
 	case c.chData <- p.Payload:
 	case <-c.done:
 	default:
 	}
+}
+
+// closeReadEOFLocked 关闭读侧（chData 关闭 → Read 返回 EOF）。持有 c.mu 调用。
+// 幂等；与 deliverLocked 共用 c.mu，故不会出现"发送到已关闭通道"。
+func (c *fconn) closeReadEOFLocked() {
+	if c.chDataClosed {
+		return
+	}
+	c.chDataClosed = true
+	close(c.chData)
 }
 
 // onPeerFinLocked 对端 FIN 到达（FIN 序号已处理）。
@@ -758,7 +776,7 @@ func (c *fconn) onPeerFinLocked() {
 			c.state = stCloseWait
 		}
 		// 读侧 EOF（保留 chData 里已投递的数据，由 Read 排空后返回 EOF）
-		c.dataOnce.Do(func() { close(c.chData) })
+		c.closeReadEOFLocked()
 	}
 }
 
@@ -776,7 +794,7 @@ func (c *fconn) closeLocked(err error) {
 	c.once.Do(func() {
 		close(c.done)
 		c.d.remove(c)
-		c.dataOnce.Do(func() { close(c.chData) })
+		c.closeReadEOFLocked()
 	})
 }
 

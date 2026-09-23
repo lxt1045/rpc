@@ -355,6 +355,19 @@ RTT 40ms、排队上限 50ms）上用 `trunk_kcp/ratelimit_test.go` 扫窗口：
 即：**窗口 ≫ BDP 时排队溢出→重传放大，窗口 ≪ BDP 时浪费链路；kcp-go 自带的拥塞控制
 爬升太慢、填不满链路**。所以限速出口上应"关拥塞控制 + 按 BDP 设窗口"：
 
+**2026-09-23 再补充（真机三组对照 + 源码级机理，详见 `test/socks_faux_trunk_kcp`
+的 README/CHANGELOG）**：在 faux_tcp 同构示例上跑同一条真机链路（RTT 54ms），
+`snd=96 nc=1 resend=32` 得到 "线上 5~6.6Mbps / 下载 250kB/s / 放大 2.0x / 区间重传 50%"。
+机理已用 `trunk_kcp/ratelimit_test.go` 的 `TestWindowOvershootSpuriousRTO` 复现并量化：
+snd=96（≈3×BDP）→ 瓶颈丢包 33%、重传 43.7%、放大 1.82x；snd=32（≈BDP）→ 丢包 0%、
+放大 1.2x、链路利用仍 100%。另外两点修正：
+
+- `kcp_resend` 调小（2）**没用**：窗口对了之后 resend=2 与 32 的重传率相同（都是多连接
+  乱序造成的伪重传，见 `TestTrunkConnCountReorderingCausesRetransmit`：4 连接比 1 连接
+  白丢 ~16% 带宽）。
+- `kcp_nc=0` 的失败原因不是"爬升太慢"而是 kcp-go 的 cwnd 被钉死：任何 RTO 直接
+  `cwnd=1`，任何提前重传走 `cwnd=inflight/2+resend`，`resend=2` 时在途只剩 4~6 段。
+
 ```yaml
 trunk_kcp:
   # 按 BDP 显式设置发送窗口（两端一致）；不设则用库默认 1024 段（可能偏大）

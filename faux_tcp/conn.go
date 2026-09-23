@@ -184,6 +184,25 @@ func (cn *Conn) Write(bs []byte) (n int, err error) {
 // 上层分段大小（本层 cfg.MSS 需相应调小）。
 func (cn *Conn) PeerMSS() int { return cn.c.PeerMSS() }
 
+// PacketCounters 报文级计数快照（诊断用）：
+//
+//	sent = 本连接交给链路发出的报文数（含握手/FIN 等控制段）
+//	recv = 链路收到并归属本连接的报文数（**在 demux 之后、投递给上层之前**）
+//
+// 这两个数放在两端对比，就能把"丢包发生在哪一段"钉死（真机排查用）：
+//
+//	对端 sent ≈ 本端 recv  → 公网路径没丢，问题在本端用户态（收包队列/上层处理）
+//	对端 sent ≫ 本端 recv  → 公网路径在丢（或本端内核 socket 缓冲溢出）
+//
+// 再与本端上层（如 trunk_kcp 的"收线/收段"）对比，可区分"链路没收到"与
+// "收到了但没交给上层"（如 faux_tcp 接收队列满时丢包，见 stack.go deliverLocked）。
+func (cn *Conn) PacketCounters() (sent, recv int64) {
+	return cn.c.SentPackets.Load(), cn.c.RecvPackets.Load()
+}
+
+// Done 连接完全关闭后关闭（诊断/收尾协程可据此退出，避免泄露）。
+func (cn *Conn) Done() <-chan struct{} { return cn.c.done }
+
 // Close 关闭连接：发 FIN（消耗一个序号），随后走完整四次挥手；
 // 宽限期后对端仍无回应则强制关闭（FIN 不重传）。幂等。
 func (cn *Conn) Close() error {
