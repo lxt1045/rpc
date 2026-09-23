@@ -241,14 +241,14 @@ func (s *session) writeLoop(ctx context.Context) {
 		select {
 		case seg := <-s.outCh:
 			if err := s.link.WriteSegment(seg); err != nil && !s.isClosed() {
-				log.Ctx(ctx).Debug().Msgf("fake_tcp: 发包失败: %v", err)
+				log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 发包失败: %v", err)
 			}
 		case <-s.closeCh:
 			for {
 				select {
 				case seg := <-s.outCh:
 					if err := s.link.WriteSegment(seg); err != nil {
-						log.Ctx(ctx).Debug().Msgf("fake_tcp: 收尾发包失败: %v", err)
+						log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 收尾发包失败: %v", err)
 					}
 				default:
 					return
@@ -294,7 +294,7 @@ func (s *session) handle(ctx context.Context, seg *Segment) {
 
 	if seg.Flags&FlagRST != 0 {
 		s.reset.Store(true)
-		log.Ctx(ctx).Debug().Msgf("fake_tcp: 收到 RST, peer=%v", s.peer)
+		log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 收到 RST, peer=%v", s.peer)
 		s.teardown()
 		return
 	}
@@ -315,7 +315,7 @@ func (s *session) handleSynSent(ctx context.Context, seg *Segment) {
 		return // 不是 SYNACK，忽略
 	}
 	if seg.Ack != s.sndNxt.Load() { // SYN 已消耗 isn+1
-		log.Ctx(ctx).Debug().Msgf("fake_tcp: SYNACK 的 ack 不符: %d != %d", seg.Ack, s.sndNxt.Load())
+		log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: SYNACK 的 ack 不符: %d != %d", seg.Ack, s.sndNxt.Load())
 		return
 	}
 	s.rcvNxt.Store(seg.Seq + 1)
@@ -324,7 +324,7 @@ func (s *session) handleSynSent(ctx context.Context, seg *Segment) {
 	s.sndUna.Store(seg.Ack)
 	s.markEstablished()
 	if err := s.sendSeg(FlagACK, nil); err != nil { // 三次握手最后一击
-		log.Ctx(ctx).Debug().Msgf("fake_tcp: 握手 ACK 发送失败: %v", err)
+		log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 握手 ACK 发送失败: %v", err)
 	}
 }
 
@@ -352,7 +352,7 @@ func (s *session) resendSynAck(ctx context.Context) {
 	s.sndNxt.Store(isn)
 	s.sendMu.Unlock()
 	if err := s.sendSeg(FlagSYN|FlagACK, nil); err != nil {
-		log.Ctx(ctx).Debug().Msgf("fake_tcp: 重发 SYNACK 失败: %v", err)
+		log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 重发 SYNACK 失败: %v", err)
 	}
 }
 
@@ -462,7 +462,7 @@ func (s *session) handlePureAck(ctx context.Context, seg *Segment, st sessState)
 	// 普通 ACK（seq == rcvNxt）不应答，避免乒乓。
 	if seg.Seq+1 == s.rcvNxt.Load() && seg.Flags == FlagACK && st == stateEstablished {
 		if err := s.sendSeg(FlagACK, nil); err != nil {
-			log.Ctx(ctx).Debug().Msgf("fake_tcp: keepalive 应答发送失败: %v", err)
+			log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: keepalive 应答发送失败: %v", err)
 		}
 		return
 	}
@@ -486,7 +486,7 @@ func (s *session) handleFIN(ctx context.Context, seg *Segment, st sessState) {
 		s.state.Store(int32(stateCloseWait))
 		// 回复 FIN|ACK（合并段；真实 TCP 亦常见）
 		if err := s.sendSeg(FlagFIN|FlagACK, nil); err != nil {
-			log.Ctx(ctx).Debug().Msgf("fake_tcp: 回复 FIN|ACK 失败: %v", err)
+			log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 回复 FIN|ACK 失败: %v", err)
 		}
 	case stateFinWait:
 		// 本端先关，对端的 FIN|ACK 到达：回最后的 ACK，收尾
@@ -495,13 +495,13 @@ func (s *session) handleFIN(ctx context.Context, seg *Segment, st sessState) {
 		}
 		s.signalFIN()
 		if err := s.sendSeg(FlagACK, nil); err != nil {
-			log.Ctx(ctx).Debug().Msgf("fake_tcp: 回复最终 ACK 失败: %v", err)
+			log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 回复最终 ACK 失败: %v", err)
 		}
 		s.teardown()
 	case stateCloseWait:
 		// 对端重试的 FIN：重发 FIN|ACK
 		if err := s.sendSeg(FlagFIN|FlagACK, nil); err != nil {
-			log.Ctx(ctx).Debug().Msgf("fake_tcp: 重发 FIN|ACK 失败: %v", err)
+			log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 重发 FIN|ACK 失败: %v", err)
 		}
 	default:
 	}
@@ -516,13 +516,13 @@ func (s *session) deliver(ctx context.Context, payload []byte) {
 	select {
 	case s.recvCh <- b:
 	default:
-		log.Ctx(ctx).Info().Msgf("fake_tcp: 接收队列满，丢弃 %d 字节, peer=%v", len(payload), s.peer)
+		log.Ctx(ctx).Info().Caller().Msgf("fake_tcp: 接收队列满，丢弃 %d 字节, peer=%v", len(payload), s.peer)
 	}
 }
 
 func (s *session) sendAck(ctx context.Context) {
 	if err := s.sendSeg(FlagACK, nil); err != nil {
-		log.Ctx(ctx).Debug().Msgf("fake_tcp: ACK 发送失败: %v", err)
+		log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: ACK 发送失败: %v", err)
 	}
 }
 
@@ -538,7 +538,7 @@ func (s *session) sendAckWithSACK(ctx context.Context) {
 	}
 	s.bitmapMu.Unlock()
 	if err := s.sendSegSACK(FlagACK, nil, blocks); err != nil {
-		log.Ctx(ctx).Debug().Msgf("fake_tcp: SACK ACK 发送失败: %v", err)
+		log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: SACK ACK 发送失败: %v", err)
 	}
 }
 
@@ -592,7 +592,7 @@ func (s *session) maybeHeal(ctx context.Context, now time.Time) {
 	s.bitmapMu.Unlock()
 	// 推进后的累计确认立即发出（对应真实栈收到重传后的 ACK 跳变）
 	s.sendAck(ctx)
-	log.Ctx(ctx).Debug().Msgf("fake_tcp: 空洞虚拟愈合, rcvNxt=%d, peer=%v", minKey, s.peer)
+	log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 空洞虚拟愈合, rcvNxt=%d, peer=%v", minKey, s.peer)
 }
 
 // ---- 保活扫描（由 keepalive 协程周期调用）----
@@ -612,7 +612,7 @@ func (s *session) scanTick(ctx context.Context, now time.Time) bool {
 	case stateSynSent, stateSynReceived:
 		// 半开连接超时回收
 		if idle > time.Duration(s.cfg.HandshakeRetries+1)*handshakeRetryInterval {
-			log.Ctx(ctx).Debug().Msgf("fake_tcp: 半开连接超时回收, peer=%v", s.peer)
+			log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 半开连接超时回收, peer=%v", s.peer)
 			s.teardown()
 			return false
 		}
@@ -625,14 +625,14 @@ func (s *session) scanTick(ctx context.Context, now time.Time) bool {
 	case stateEstablished:
 		if idle > 3*s.cfg.Keepalive {
 			// 对端死亡
-			log.Ctx(ctx).Info().Msgf("fake_tcp: 对端保活超时，回收会话, peer=%v", s.peer)
+			log.Ctx(ctx).Info().Caller().Msgf("fake_tcp: 对端保活超时，回收会话, peer=%v", s.peer)
 			s.reset.Store(true)
 			s.teardown()
 			return false
 		}
 		if idle >= s.cfg.Keepalive {
 			if err := s.sendKeepalive(); err != nil {
-				log.Ctx(ctx).Debug().Msgf("fake_tcp: 保活发送失败: %v", err)
+				log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: 保活发送失败: %v", err)
 			}
 		}
 		// delayed ACK 冲刷
@@ -653,14 +653,14 @@ func (s *session) closeInitiate(ctx context.Context) {
 	if st == stateEstablished {
 		s.state.Store(int32(stateFinWait))
 		if err := s.sendSeg(FlagFIN|FlagACK, nil); err != nil {
-			log.Ctx(ctx).Debug().Msgf("fake_tcp: FIN 发送失败: %v", err)
+			log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: FIN 发送失败: %v", err)
 		}
 		return
 	}
 	// 握手未完成或已在关闭流程中：直接收尾（发 RST 让对端立即知道）
 	if st == stateSynSent || st == stateSynReceived {
 		if err := s.sendSeg(FlagRST, nil); err != nil {
-			log.Ctx(ctx).Debug().Msgf("fake_tcp: RST 发送失败: %v", err)
+			log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: RST 发送失败: %v", err)
 		}
 	}
 	s.teardown()

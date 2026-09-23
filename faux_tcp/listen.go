@@ -97,7 +97,7 @@ func (l *Listener) onSyn(d *demux, p *Packet) {
 	if p.MSS > 0 {
 		peerMSS = fmt.Sprint(p.MSS)
 	}
-	log.Ctx(context.Background()).Debug().
+	log.Ctx(context.Background()).Debug().Caller().
 		Msgf("faux_tcp: 收到 SYN %s -> %s, seq=%d, 对端通告 MSS=%s", p.Src, p.Dst, p.Seq, peerMSS)
 
 	c := newFConn(l.cfg, d, local, p.Src)

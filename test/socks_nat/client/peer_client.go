@@ -154,10 +154,10 @@ func (p *peerCli) connect2(ctx context.Context, addr string, rc net.Conn) (err e
 				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("connect2 upgrade->rc")
 			}
 			if e := upgrade.Close(); e != nil {
-				log.Ctx(ctx).Debug().Err(e).Caller().Msg("upgrade.Close()")
+				log.Ctx(ctx).Debug().Caller().Err(e).Caller().Msg("upgrade.Close()")
 			}
 			if e := rc.Close(); e != nil {
-				log.Ctx(ctx).Debug().Err(e).Caller().Msg("rc.Close()")
+				log.Ctx(ctx).Debug().Caller().Err(e).Caller().Msg("rc.Close()")
 			}
 			if p.AfterConnUpgradeClose != nil {
 				p.AfterConnUpgradeClose()
@@ -181,10 +181,10 @@ func (p *peerCli) connect2(ctx context.Context, addr string, rc net.Conn) (err e
 		case <-time.After(time.Minute * 10):
 		}
 		if e := rc.Close(); e != nil {
-			log.Ctx(ctx).Debug().Err(e).Caller().Msg("rc.Close()")
+			log.Ctx(ctx).Debug().Caller().Err(e).Caller().Msg("rc.Close()")
 		}
 		if e := upgrade.Close(); e != nil {
-			log.Ctx(ctx).Debug().Err(e).Caller().Msg("upgrade.Close()")
+			log.Ctx(ctx).Debug().Caller().Err(e).Caller().Msg("upgrade.Close()")
 		}
 	}()
 	socket.Copy(ctx, upgrade, rc)

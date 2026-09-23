@@ -23,13 +23,13 @@ func SetReadWriteBuff(ctx context.Context, rwc io.ReadWriteCloser, read, write i
 			if read != 0 {
 				err = setBuffer.SetReadBuffer(read)
 				if err != nil {
-					log.Ctx(ctx).Error().Err(err).Send()
+					log.Ctx(ctx).Error().Caller().Err(err).Send()
 				}
 			}
 			if write != 0 {
 				err = setBuffer.SetWriteBuffer(write)
 				if err != nil {
-					log.Ctx(ctx).Error().Err(err).Send()
+					log.Ctx(ctx).Error().Caller().Err(err).Send()
 				}
 			}
 		}

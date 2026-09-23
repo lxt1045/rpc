@@ -56,7 +56,7 @@ func main() {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
-	log.Ctx(ctx).Info().Str("conf", confSource).Msg("config loaded")
+	log.Ctx(ctx).Info().Caller().Str("conf", confSource).Msg("config loaded")
 	socks.LogEffectiveTrunkKCP(ctx, "server", &conf.TrunkKCP)
 
 	token := os.Getenv("SOCKS_TRUNK_TOKEN")
@@ -101,7 +101,7 @@ func main() {
 			log.Ctx(ctx).Error().Caller().Err(lerr).Send()
 			return
 		}
-		log.Ctx(ctx).Warn().Str("addr", srvCfg.Conn.Addr).
+		log.Ctx(ctx).Warn().Caller().Str("addr", srvCfg.Conn.Addr).
 			Msg("PLAIN TCP 诊断监听已启动（内核 TCP，非 faux_tcp）：用于对照验证端口映射/回程")
 		for {
 			c, aerr := ln.Accept()
@@ -109,7 +109,7 @@ func main() {
 				log.Ctx(ctx).Error().Caller().Err(aerr).Send()
 				return
 			}
-			log.Ctx(ctx).Info().Str("remote", c.RemoteAddr().String()).Msg("PLAIN TCP 连接已建立")
+			log.Ctx(ctx).Info().Caller().Str("remote", c.RemoteAddr().String()).Msg("PLAIN TCP 连接已建立")
 			go func(c net.Conn) {
 				defer c.Close()
 				_, _ = io.Copy(c, c)
@@ -167,7 +167,7 @@ func main() {
 		}()
 	}
 
-	log.Ctx(ctx).Info().Str("addr", srvCfg.Conn.Addr).
+	log.Ctx(ctx).Info().Caller().Str("addr", srvCfg.Conn.Addr).
 		Int("trunk_conns", srvCfg.Trunk.MaxConns).
 		Msg("server started (faux_tcp transport)")
 
@@ -188,7 +188,7 @@ func main() {
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	select {
 	case s := <-done:
-		log.Ctx(ctx).Info().Str("signal", s.String()).Msg("shutdown")
+		log.Ctx(ctx).Info().Caller().Str("signal", s.String()).Msg("shutdown")
 	case <-ctx.Done():
 	}
 	cancel()

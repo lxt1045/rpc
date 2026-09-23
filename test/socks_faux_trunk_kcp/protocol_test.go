@@ -76,35 +76,34 @@ func TestConfigDefaults(t *testing.T) {
 func TestNoDelayParam(t *testing.T) {
 	// 未配置：全部 -1，ApplyKCPParam 不动库默认值
 	var empty *TrunkKCPConfig
-	n, i, r, nc := empty.NoDelayParam()
-	if n != -1 || i != -1 || r != -1 || nc != -1 {
-		t.Fatalf("nil config should yield all -1, got %d %d %d %d", n, i, r, nc)
+	n, nc := empty.NoDelayParam()
+	if n != -1 || nc != -1 {
+		t.Fatalf("nil config should yield -1/-1, got %d %d", n, nc)
 	}
 	cfg := &TrunkKCPConfig{}
-	n, i, r, nc = cfg.NoDelayParam()
-	if n != -1 || i != -1 || r != -1 || nc != -1 {
-		t.Fatalf("empty config should yield all -1, got %d %d %d %d", n, i, r, nc)
+	n, nc = cfg.NoDelayParam()
+	if n != -1 || nc != -1 {
+		t.Fatalf("empty config should yield -1/-1, got %d %d", n, nc)
 	}
 	empty.ApplyKCPParam(nil) // must not panic
 	cfg.ApplyKCPParam(nil)   // must not panic
 
 	// 部分配置：未配置项保持 -1
-	zero, twenty := 0, 20
-	cfg = &TrunkKCPConfig{KCPNoDelay: &zero, KCPInterval: &twenty}
-	n, i, r, nc = cfg.NoDelayParam()
-	if n != 0 || i != 20 || r != -1 || nc != -1 {
-		t.Fatalf("partial config mapping wrong, got %d %d %d %d", n, i, r, nc)
+	zero, one := 0, 1
+	cfg = &TrunkKCPConfig{KCPNoDelay: &zero, KCPNc: &one}
+	n, nc = cfg.NoDelayParam()
+	if n != 0 || nc != 1 {
+		t.Fatalf("partial config mapping wrong, got %d %d", n, nc)
 	}
 }
 
 // TestKCPWindowConfig 钉住窗口配置语义：
-//   - 默认**不覆盖**库窗口（保持 1024/1024），限速链路上由使用者按 BDP 显式设置；
-//   - 显式 kcp_sndwnd/kcp_rcvwnd → 固定窗口（关闭自动调窗）；
-//   - kcp_auto_wnd: true → 走 trunk_kcp 的自动调窗。
+//   - 默认**不覆盖**库窗口（保持 1024/1024），由使用者按链路显式设置；
+//   - 显式 kcp_sndwnd/kcp_rcvwnd → 固定窗口，并且实际生效值要从 Stats 里读得到。
 //
 // 背景（真机）：库默认 1024 段在 30Mbps 限速出口上相当于 8×BDP，带宽被重传吃掉
 // （实测放大 3.2~3.8x）；但把收发窗口一起写死成 128 段又把长 RTT 链路饿死
-// （实测只占 7Mbps、下载 300kB/s）——所以不能写死，要么按 BDP 设，要么自动调。
+// （实测只占 7Mbps、下载 300kB/s）——所以窗口必须按链路设，不能设完不检查。
 func TestKCPWindowConfig(t *testing.T) {
 	var zero TrunkKCPConfig
 	NormalizeTrunkKCPConfig(&zero)
@@ -118,18 +117,10 @@ func TestKCPWindowConfig(t *testing.T) {
 	}
 	cfg.ApplyKCPParam(nil) // must not panic
 
-	// 固定窗口：默认（未开 auto）保持关闭自动调窗
 	tr := trunk_kcp.NewTrunkKCP(0x5a0b0009, nil)
 	(&TrunkKCPConfig{KCPSndWnd: 256, KCPRcvWnd: 1024}).ApplyKCPParam(tr)
-	if st := tr.Stats(); st.AutoWnd || st.SndWnd != 256 || st.RcvWnd != 1024 {
-		t.Fatalf("固定窗口未生效: auto=%v snd=%d rcv=%d", st.AutoWnd, st.SndWnd, st.RcvWnd)
-	}
-	// 自动调窗：显式打开
-	yes := true
-	tr2 := trunk_kcp.NewTrunkKCP(0x5a0b000a, nil)
-	(&TrunkKCPConfig{KCPAutoWnd: &yes}).ApplyKCPParam(tr2)
-	if st := tr2.Stats(); !st.AutoWnd {
-		t.Fatal("kcp_auto_wnd=true 未打开自动调窗")
+	if st := tr.Stats(); st.SndWnd != 256 || st.RcvWnd != 1024 {
+		t.Fatalf("固定窗口未生效: snd=%d rcv=%d", st.SndWnd, st.RcvWnd)
 	}
 }
 

@@ -354,7 +354,7 @@ func (t *Trunk) Run(ctx context.Context) {
 		close(ch)
 	}()
 	if err := t.SavePackLoop(ch); err != nil {
-		log.Ctx(ctx).Info().Err(err).Msg("SavePackLoop")
+		log.Ctx(ctx).Info().Caller().Err(err).Msg("SavePackLoop")
 	}
 	t.Close()
 	<-finished

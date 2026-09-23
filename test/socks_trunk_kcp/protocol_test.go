@@ -53,23 +53,23 @@ func TestConfigDefaults(t *testing.T) {
 func TestNoDelayParam(t *testing.T) {
 	// 未配置：全部 -1，ApplyKCPParam 不动库默认值
 	var empty *TrunkKCPConfig
-	n, i, r, nc := empty.NoDelayParam()
-	if n != -1 || i != -1 || r != -1 || nc != -1 {
-		t.Fatalf("nil config should yield all -1, got %d %d %d %d", n, i, r, nc)
+	n, nc := empty.NoDelayParam()
+	if n != -1 || nc != -1 {
+		t.Fatalf("nil config should yield -1/-1, got %d %d", n, nc)
 	}
 	cfg := &TrunkKCPConfig{}
-	n, i, r, nc = cfg.NoDelayParam()
-	if n != -1 || i != -1 || r != -1 || nc != -1 {
-		t.Fatalf("empty config should yield all -1, got %d %d %d %d", n, i, r, nc)
+	n, nc = cfg.NoDelayParam()
+	if n != -1 || nc != -1 {
+		t.Fatalf("empty config should yield -1/-1, got %d %d", n, nc)
 	}
 	empty.ApplyKCPParam(nil) // must not panic
 	cfg.ApplyKCPParam(nil)   // must not panic
 
 	// 部分配置：未配置项保持 -1
-	zero, twenty := 0, 20
-	cfg = &TrunkKCPConfig{KCPNoDelay: &zero, KCPInterval: &twenty}
-	n, i, r, nc = cfg.NoDelayParam()
-	if n != 0 || i != 20 || r != -1 || nc != -1 {
-		t.Fatalf("partial config mapping wrong, got %d %d %d %d", n, i, r, nc)
+	zero, one := 0, 1
+	cfg = &TrunkKCPConfig{KCPNoDelay: &zero, KCPNc: &one}
+	n, nc = cfg.NoDelayParam()
+	if n != 0 || nc != 1 {
+		t.Fatalf("partial config mapping wrong, got %d %d", n, nc)
 	}
 }

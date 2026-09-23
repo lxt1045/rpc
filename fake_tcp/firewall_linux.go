@@ -46,14 +46,14 @@ func iptablesRSTDrop(ctx context.Context, iptables string, port uint16) (func(),
 	// -C 检查幂等：已存在（可能运维手工配过）则不重复添加，清理时也不删别人的规则
 	check := append([]string{"-C", "OUTPUT"}, rule...)
 	if _, err := fwRun(ctx, iptables, check...); err == nil {
-		log.Ctx(ctx).Info().Msgf("fake_tcp: RST 抑制规则已存在（非本进程安装）, port=%d", port)
+		log.Ctx(ctx).Info().Caller().Msgf("fake_tcp: RST 抑制规则已存在（非本进程安装）, port=%d", port)
 		return func() {}, nil
 	}
 	add := append([]string{"-A", "OUTPUT"}, rule...)
 	if out, err := fwRun(ctx, iptables, add...); err != nil {
 		return nil, ErrFirewall.Clonef("iptables -A 失败: %v, %s", err, strings.TrimSpace(out))
 	}
-	log.Ctx(ctx).Info().Msgf("fake_tcp: 已安装 RST 抑制规则, port=%d", port)
+	log.Ctx(ctx).Info().Caller().Msgf("fake_tcp: 已安装 RST 抑制规则, port=%d", port)
 
 	var once bool = true
 	return func() {
@@ -63,7 +63,7 @@ func iptablesRSTDrop(ctx context.Context, iptables string, port uint16) (func(),
 		once = false
 		del := append([]string{"-D", "OUTPUT"}, rule...)
 		if out, err := fwRun(context.Background(), iptables, del...); err != nil {
-			log.Ctx(context.Background()).Warn().Msgf("fake_tcp: RST 抑制规则卸载失败: %v, %s", err, strings.TrimSpace(out))
+			log.Ctx(context.Background()).Warn().Caller().Msgf("fake_tcp: RST 抑制规则卸载失败: %v, %s", err, strings.TrimSpace(out))
 		}
 	}, nil
 }
@@ -92,7 +92,7 @@ func nftRSTDrop(ctx context.Context, nft string, port uint16) (func(), error) {
 		"tcp", "sport", fmt.Sprint(port), "tcp", "flags", "rst", "counter", "drop"); err != nil {
 		return nil, ErrFirewall.Clonef("nft add rule 失败: %v, %s", err, strings.TrimSpace(out))
 	}
-	log.Ctx(ctx).Info().Msgf("fake_tcp: 已安装 RST 抑制规则(nft), port=%d", port)
+	log.Ctx(ctx).Info().Caller().Msgf("fake_tcp: 已安装 RST 抑制规则(nft), port=%d", port)
 
 	return func() {
 		// 用 handle 精确定位并删除本端口规则（其它端口的规则保留）

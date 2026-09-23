@@ -63,7 +63,7 @@ func (p *SocksCli) GetPeer() (peer *Peer) {
 	}
 	if peer != nil {
 		if !peer.Peer.IsClosed() {
-			log.Ctx(context.TODO()).Debug().Msg("reuser peer----------------------------")
+			log.Ctx(context.TODO()).Debug().Caller().Msg("reuser peer----------------------------")
 			return
 		}
 		peer.Close(context.TODO())
@@ -251,10 +251,10 @@ func (p *SocksCli) connectHttp(ctx context.Context, inConn net.Conn, mode int) (
 	}
 	address := req.Host
 
-	log.Ctx(ctx).Info().Str("address", address).Msg("use proxy")
+	log.Ctx(ctx).Info().Caller().Str("address", address).Msg("use proxy")
 	err = p.OutToTCPPeer2(ctx, address, inConn, &req)
 	if err != nil {
-		log.Ctx(ctx).Error().Str("address", address).Err(err).Msg("connect fail")
+		log.Ctx(ctx).Error().Caller().Str("address", address).Err(err).Msg("connect fail")
 		utils.CloseConn(&inConn)
 	}
 	return
@@ -492,7 +492,7 @@ func (p *SocksCli) OutToTCPPeer2(ctx context.Context, address string, inConn net
 	if req.IsHTTPS() {
 		req.HTTPSReply() // http 回复建立连接
 	}
-	log.Ctx(ctx).Info().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn connected")
+	log.Ctx(ctx).Info().Caller().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn connected")
 
 	// 两个方向的拷贝：浏览器->upgrade / upgrade->浏览器。
 	// 任一方向结束都应唤醒另一方向，避免 goroutine 泄漏。
@@ -518,7 +518,7 @@ func (p *SocksCli) OutToTCPPeer2(ctx context.Context, address string, inConn net
 		utils.CloseConn(&inConn)
 		// upgrade 场景下连接会被 RPC 接管，单个 peer 只能服务一个 upgrade；
 		// 结束后必须关闭 peer，否则复用会失败
-		log.Ctx(ctx).Info().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn closed")
+		log.Ctx(ctx).Info().Caller().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn closed")
 	}()
 	socket.Copy(ctx, inConn, conn)
 	return
@@ -594,7 +594,7 @@ func (p *SocksCli) connectTrunk(ctx context.Context, tgtAddr string, rc net.Conn
 		return
 	}
 
-	log.Ctx(ctx).Debug().Str("addr", tgtAddr).Str("local", rc.RemoteAddr().String()).Msg("trunk conn connected")
+	log.Ctx(ctx).Debug().Caller().Str("addr", tgtAddr).Str("local", rc.RemoteAddr().String()).Msg("trunk conn connected")
 
 	go func() {
 		defer func() {

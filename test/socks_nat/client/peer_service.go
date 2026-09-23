@@ -192,7 +192,7 @@ func (p *peerSvc) ConnUpgrade(ctx context.Context, req *pb.ConnUpgradeReq) (resp
 			// 延迟 closeGrace 再强制关闭，既避免截断响应，又保证 rc 最终回收，
 			// 防止 rc 与 goroutine 永久泄漏（见 closeGrace 注释）。
 			if e := rcTCP.CloseWrite(); e != nil {
-				log.Ctx(ctx).Debug().Err(e).Caller().Msg("rcTCP.CloseWrite()")
+				log.Ctx(ctx).Debug().Caller().Err(e).Caller().Msg("rcTCP.CloseWrite()")
 			}
 			time.AfterFunc(time.Second*30, func() {
 				rcTCP.SetDeadline(time.Now()) // 唤醒另一方向在 rc 上阻塞的读

@@ -1,5 +1,28 @@
 # Changelog - socks_faux_trunk_kcp
 
+## 2026-09-23 - 清理实验性配置：删掉实测无效的旋钮与自动调窗
+
+调参阶段加的开关里，实测**无效或有害**的全部删除，配置收敛为 5 项，逻辑只剩
+"设窗口 + 打自诊断日志"：
+
+- **删除 `kcp_auto_wnd`（含 `trunk_kcp.SetAutoWindow` 与整个 AIMD 控制器）**：真机实测
+  会把窗口缩到下限 32 段、吞吐掉到 1/4，而且覆盖 yml 里的 `kcp_sndwnd`（日志只显示
+  `snd=32`，看不出配置没生效）。窗口改回"使用者按链路显式设定"。
+- **删除 `kcp_resend` / `kcp_interval`**：窗口设对后 `resend=2` 与 `resend=32` 的重传率
+  几乎相同（17.9% vs 17.0%）；45% 随机丢包下 `resend`/`minRTO` 的收益也远小于窗口、
+  重复跑抖动很大。示例只保留 `kcp_nodelay`（`NoDelay` 第 1 参）与 `kcp_nc`（第 4 参），
+  其余固定库默认值；库侧 `SetNoDelay` 仍接受完整四元组（未配置项传 -1 = 保持库默认）。
+- **删除 `trunk_kcp.SetAckNoDelay`**（透传 `kcp.Input` 第三参）：打开后重传率 68% → 90%、
+  goodput 掉到 1/25，现在固定 false 并在调用处写明原因。
+- **删除死代码 `TrunkKCP.wIdx`**（从未被读）。
+- `trunk_kcp/autownd.go` 收敛为 `trunk_kcp/stats.go`：只留线路统计与 3s 自诊断日志。
+- `Stats()` 去掉 `AutoWnd/Amp/AmpHigh`；`ratelimit_test.go` 去掉 `auto` 参数与
+  `TestAutoWindowAdapts`，`TestLossyPathTuning` 只断言"有损链路上窗口越大吞吐越高"。
+- yml/README 同步删掉这些项，结论收敛为一句话：**限速按 BDP 设、有损越大越好**，
+  修复时延只能靠 `nodelay` 微调。
+
+可配置项最终为：`kcp_mtu`、`kcp_sndwnd`、`kcp_rcvwnd`、`kcp_nodelay`、`kcp_nc`。
+
 ## 2026-09-23 - 有损配置生效：60 → 230kB/s（3.8x）；但发现"重传白做功"，并评估 FEC
 
 **真机**（RTT 54ms、2 连接、`snd=192 resend=2 nodelay=1 nc=1`）：下载 **230kB/s**（上一轮

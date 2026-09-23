@@ -74,7 +74,7 @@ func logPacketCounters(cn *faux_tcp.Conn) {
 			if secs <= 0 {
 				secs = 1
 			}
-			log.Ctx(context.Background()).Info().
+			log.Ctx(context.Background()).Info().Caller().
 				Str("local", cn.LocalAddr().String()).
 				Str("remote", cn.RemoteAddr().String()).
 				Int64("sent_pkts", sent-lastSent).

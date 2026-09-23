@@ -109,7 +109,7 @@ func main() {
 		// mode 3 is the Trunk-backed HTTP proxy path.
 		go cli.RunHttpProxy(ctx, httpAddr, 3)
 	}
-	log.Ctx(ctx).Info().Str("socks", socksAddr).Str("http", httpAddr).Msg("client started")
+	log.Ctx(ctx).Info().Caller().Str("socks", socksAddr).Str("http", httpAddr).Msg("client started")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

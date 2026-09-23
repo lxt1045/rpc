@@ -129,8 +129,8 @@ func (vc *VirtualConn) Read(p []byte) (n int, err error) {
 	}
 }
 
-// sendBacklogSoftLimit 发送队列积压软上限（段）。取 2×自动调窗上限，留一个窗口的
-// 应用缓冲；超过就等（背压），避免无限缓冲。单段载荷 ≈ mtu-24 字节。
+// sendBacklogSoftLimit 发送队列积压软上限（段）。取 2×默认窗口（1024 段），留一个
+// 窗口的应用缓冲；超过就等（背压），避免无限缓冲。单段载荷 ≈ mtu-24 字节。
 const sendBacklogSoftLimit = 2048
 
 // sendBacklogWait 背压等待超时（防止对端彻底无响应时永久阻塞）

@@ -60,7 +60,7 @@ func (s *Server) Serve(ln net.Listener) error {
 func (s *Server) dispatchConn(conn net.Conn) {
 	var t [1]byte
 	if _, err := io.ReadFull(conn, t[:]); err != nil {
-		log.Ctx(s.ctx).Debug().Err(err).Str("remote", conn.RemoteAddr().String()).Msg("read conn type failed")
+		log.Ctx(s.ctx).Debug().Caller().Err(err).Str("remote", conn.RemoteAddr().String()).Msg("read conn type failed")
 		_ = conn.Close()
 		return
 	}
@@ -70,7 +70,7 @@ func (s *Server) dispatchConn(conn net.Conn) {
 	case connTypePhysical:
 		s.serveConn(conn)
 	default:
-		log.Ctx(s.ctx).Debug().Str("remote", conn.RemoteAddr().String()).
+		log.Ctx(s.ctx).Debug().Caller().Str("remote", conn.RemoteAddr().String()).
 			Msgf("unknown conn type %d", t[0])
 		_ = conn.Close()
 	}
@@ -90,7 +90,7 @@ func (s *Server) serveControlConn(conn net.Conn) {
 		if cfg := serverTLSConfig(); cfg != nil {
 			tlsConn, err := wrapTLSServer(s.ctx, vconn, conn.LocalAddr(), conn.RemoteAddr(), cfg, 10*time.Second)
 			if err != nil {
-				log.Ctx(s.ctx).Debug().Err(err).Str("remote", conn.RemoteAddr().String()).
+				log.Ctx(s.ctx).Debug().Caller().Err(err).Str("remote", conn.RemoteAddr().String()).
 					Msg("control channel tls handshake failed")
 				_ = vconn.Close()
 				return
@@ -102,7 +102,7 @@ func (s *Server) serveControlConn(conn net.Conn) {
 	}, conn)
 	go func() {
 		if err := ctrl.Run(s.ctx); err != nil && s.ctx.Err() == nil {
-			log.Ctx(s.ctx).Debug().Err(err).Msg("control mini-trunk stopped")
+			log.Ctx(s.ctx).Debug().Caller().Err(err).Msg("control mini-trunk stopped")
 		}
 	}()
 }
@@ -121,7 +121,7 @@ func (s *Server) serveRWC(rwc io.ReadWriteCloser, carrier net.Conn) {
 	}
 	peer, err := s.gPeer.Clone(s.ctx, rwc, svc)
 	if err != nil {
-		log.Ctx(s.ctx).Warn().Err(err).Str("remote", svc.RemoteAddr).Msg("clone peer failed")
+		log.Ctx(s.ctx).Warn().Caller().Err(err).Str("remote", svc.RemoteAddr).Msg("clone peer failed")
 		_ = rwc.Close()
 		return
 	}

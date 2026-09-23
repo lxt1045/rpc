@@ -53,7 +53,7 @@ func main() {
 		log.Ctx(ctx).Error().Caller().Err(err).Send()
 		return
 	}
-	log.Ctx(ctx).Info().Str("conf", confSource).Msg("config loaded")
+	log.Ctx(ctx).Info().Caller().Str("conf", confSource).Msg("config loaded")
 	socks.LogEffectiveTrunkKCP(ctx, "client", &conf.TrunkKCP)
 
 	token := os.Getenv("SOCKS_TRUNK_TOKEN")
@@ -131,7 +131,7 @@ func main() {
 				}
 			}()
 		}
-		log.Ctx(ctx).Info().Str("socks", socksAddr).Str("http", httpAddr).
+		log.Ctx(ctx).Info().Caller().Str("socks", socksAddr).Str("http", httpAddr).
 			Str("server", cli.PeerAddr).Msg("client started (faux_tcp transport)")
 	}()
 

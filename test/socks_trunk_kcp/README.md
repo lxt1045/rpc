@@ -364,7 +364,7 @@ snd=96（≈3×BDP）→ 瓶颈丢包 33%、重传 43.7%、放大 1.82x；snd=32
 
 - `kcp_resend` 调小（2）**没用**：窗口对了之后 resend=2 与 32 的重传率相同（都是多连接
   乱序造成的伪重传，见 `TestTrunkConnCountReorderingCausesRetransmit`：4 连接比 1 连接
-  白丢 ~16% 带宽）。
+  白丢 ~16% 带宽）。因此 `kcp_resend` 与 `kcp_interval` 已从配置项里删除。
 - `kcp_nc=0` 的失败原因不是"爬升太慢"而是 kcp-go 的 cwnd 被钉死：任何 RTO 直接
   `cwnd=1`，任何提前重传走 `cwnd=inflight/2+resend`，`resend=2` 时在途只剩 4~6 段。
 
@@ -384,7 +384,7 @@ trunk_kcp:
 
 | 参数 | 线上/载荷 | 吞吐 | 评价 |
 | --- | --- | --- | --- |
-| `NoDelay(1,10,32,1)`（库默认） | 1.88x | 2.6 MB/s | — |
+| `NoDelay(1,10,32,1)`（nodelay 模式） | 1.88x | 2.6 MB/s | — |
 | `NoDelay(0,40,0,1)`（minRTO=100ms） | 1.54x | 2.3 MB/s | 有缓解 |
 | `NoDelay(1,10,32,0)`（开拥塞控制） | 1.50x | 0.2 MB/s | 吞吐崩溃 |
 | `NoDelay(0,40,0,0)`（普通模式） | — | 卡死 | KCP cwnd 在持续丢包下饿死 |
@@ -393,9 +393,10 @@ trunk_kcp:
 
 ### 缓解：KCP 参数配置化
 
-`TrunkKCPConfig` 新增 4 个可选项（对应 `kcp.KCP.NoDelay` 的四个参数），
-库侧通过 `TrunkKCP.SetNoDelay(nodelay, interval, resend, nc)` 应用，
-`default.yml` 的 `trunk_kcp` 节下配置，**客户端与服务端必须一致**：
+`TrunkKCPConfig` 只暴露**实测有效**的两项 NoDelay 参数（`nodelay`、`nc`），
+库侧通过 `TrunkKCP.SetNoDelay(nodelay, interval, resend, nc)` 应用
+（未配置的项传 -1 = 保持库默认），`default.yml` 的 `trunk_kcp` 节下配置，
+**客户端与服务端必须一致**：
 
 ```yaml
 trunk_kcp:
@@ -403,13 +404,13 @@ trunk_kcp:
   min_conns: 8
   max_conns: 16
   max_virtual_conn: 8096
-  kcp_nodelay: 0   # 0: 普通模式 minRTO=100ms；1: nodelay 模式 minRTO=30ms（库默认，仅建议 UDP 底层）
-  kcp_interval: 20 # KCP 内部时钟 ms，>=10
-  kcp_resend: 0    # 快速重传阈值，0 关闭
+  kcp_nodelay: 0   # 0: 普通模式 minRTO=100ms（可靠底层建议）；1: nodelay 模式 minRTO=30ms
   kcp_nc: 1        # 1: 关闭 KCP 拥塞控制；0: 开启
 ```
 
-不配置（或某项不配置）时保持库默认值 `(1, 10, 32, 1)`。
+不配置时保持库默认值 `(0, 10, 88, 0)`（minRTO=100ms、拥塞控制开启、不启用快速重传）。
+`interval`/`resend` **不开放**：实测对吞吐/重传率没有可测影响（见上文"`kcp_resend` 调小
+没用"），固定用库默认值即可。
 
 ### 建议（按优先级）
 

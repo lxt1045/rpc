@@ -43,7 +43,7 @@ func (p *SocksCli) GetPeer() (peer *Peer) {
 		}
 		if peer != nil {
 			if peer.TsCreate > tsReuse && !peer.Peer.IsClosed() {
-				log.Ctx(context.TODO()).Debug().Msg("reuser peer----------------------------")
+				log.Ctx(context.TODO()).Debug().Caller().Msg("reuser peer----------------------------")
 				return
 			}
 			peer.Close(context.TODO())
@@ -220,27 +220,27 @@ func (p *SocksCli) connectHttp(ctx context.Context, inConn net.Conn, mode int) (
 	}
 	address := req.Host
 
-	log.Ctx(ctx).Info().Str("address", address).Msg("use proxy")
+	log.Ctx(ctx).Info().Caller().Str("address", address).Msg("use proxy")
 	//os.Exit(0)
 	switch mode {
 	case 0:
 		err = p.OutToTCPPeer(ctx, address, &inConn, &req)
 		if err != nil {
-			log.Ctx(ctx).Error().Str("address", address).Err(err).Msg("connect fail")
+			log.Ctx(ctx).Error().Caller().Str("address", address).Err(err).Msg("connect fail")
 
 			utils.CloseConn(&inConn)
 		}
 	case 1:
 		err = p.OutToTCPPeer1(ctx, address, inConn, &req)
 		if err != nil {
-			log.Ctx(ctx).Error().Str("address", address).Err(err).Msg("connect fail")
+			log.Ctx(ctx).Error().Caller().Str("address", address).Err(err).Msg("connect fail")
 
 			utils.CloseConn(&inConn)
 		}
 	case 2:
 		err = p.OutToTCPLocal(ctx, address, &inConn, &req)
 		if err != nil {
-			log.Ctx(ctx).Error().Str("address", address).Err(err).Msg("connect fail")
+			log.Ctx(ctx).Error().Caller().Str("address", address).Err(err).Msg("connect fail")
 
 			utils.CloseConn(&inConn)
 		}
@@ -284,7 +284,7 @@ func (p *SocksCli) OutToTCPPeer(ctx context.Context, address string, inConn *net
 	if req.IsHTTPS() {
 		req.HTTPSReply() // http 回复建立连接
 	}
-	log.Ctx(ctx).Info().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn connected")
+	log.Ctx(ctx).Info().Caller().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn connected")
 
 	// 两个方向的拷贝：浏览器->upgrade / upgrade->浏览器。
 	// 任一方向结束都应唤醒另一方向，避免 goroutine 泄漏。
@@ -311,7 +311,7 @@ func (p *SocksCli) OutToTCPPeer(ctx context.Context, address string, inConn *net
 		// upgrade 场景下连接会被 RPC 接管，单个 peer 只能服务一个 upgrade；
 		// 结束后必须关闭 peer，否则复用会失败
 		peer.Close(context.TODO())
-		log.Ctx(ctx).Info().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn closed")
+		log.Ctx(ctx).Info().Caller().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn closed")
 	}()
 	socket.Copy(ctx, *inConn, upgrade)
 	return
@@ -341,7 +341,7 @@ func (p *SocksCli) OutToTCPPeer1(ctx context.Context, address string, inConn net
 	if req.IsHTTPS() {
 		req.HTTPSReply() // http 回复建立连接
 	}
-	log.Ctx(ctx).Info().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn connected")
+	log.Ctx(ctx).Info().Caller().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("host", req.Host).Msg("conn connected")
 
 	go func() {
 		defer func() {
@@ -482,7 +482,7 @@ func (p *SocksCli) OutToTCPLocal(ctx context.Context, address string, inConn *ne
 		utils.CloseConn(inConn)
 		utils.CloseConn(&outConn)
 	}, func(n int, d bool) {}, 0)
-	log.Ctx(ctx).Info().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("outLocalAddr", outLocalAddr).Str("outAddr", outAddr).Str("host", req.Host).Msg("conn connected")
+	log.Ctx(ctx).Info().Caller().Str("inAddr", inAddr).Str("inLocalAddr", inLocalAddr).Str("outLocalAddr", outLocalAddr).Str("outAddr", outAddr).Str("host", req.Host).Msg("conn connected")
 	return
 }
 
@@ -560,10 +560,10 @@ func (p *SocksCli) connect(ctx context.Context, tgtAddr string, rc net.Conn) (er
 				log.Ctx(ctx).Error().Caller().Interface("recover", e).Msg("connect upgrade->rc")
 			}
 			if e := upgrade.Close(); e != nil {
-				log.Ctx(ctx).Debug().Err(e).Caller().Msg("upgrade.Close()")
+				log.Ctx(ctx).Debug().Caller().Err(e).Caller().Msg("upgrade.Close()")
 			}
 			if e := rc.Close(); e != nil {
-				log.Ctx(ctx).Debug().Err(e).Caller().Msg("rc.Close()")
+				log.Ctx(ctx).Debug().Caller().Err(e).Caller().Msg("rc.Close()")
 			}
 		}()
 		socket.Copy(ctx, rc, upgrade)
@@ -586,10 +586,10 @@ func (p *SocksCli) connect(ctx context.Context, tgtAddr string, rc net.Conn) (er
 		case <-time.After(time.Minute * 10):
 		}
 		if e := rc.Close(); e != nil {
-			log.Ctx(ctx).Debug().Err(e).Caller().Msg("rc.Close()")
+			log.Ctx(ctx).Debug().Caller().Err(e).Caller().Msg("rc.Close()")
 		}
 		if e := upgrade.Close(); e != nil {
-			log.Ctx(ctx).Debug().Err(e).Caller().Msg("upgrade.Close()")
+			log.Ctx(ctx).Debug().Caller().Err(e).Caller().Msg("upgrade.Close()")
 		}
 		peer.Close(context.TODO())
 	}()

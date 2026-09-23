@@ -75,36 +75,19 @@ type TrunkKCP struct {
 	kcp     *kcp.KCP
 	kcpLock sync.Mutex
 	mtu     int // KCP 线上包 MTU（含 KCP 头；0 表示用默认 KcpMtu）
-	// ackNoDelay 透传给 kcp.Input 的第三个参数（true = 收到段立即回 ACK）。
-	// **默认 false，且实测不要打开**：kcp-go 的 ackNoDelay 走 flush(true) 的"仅 ACK"路径，
-	// 会连带把窗口探测/旧段一起发出去，内存链路实测重传率从 68% 飙到 90%、goodput 掉到
-	// 0.1MB/s（见 ratelimit_test.go 的固定窗口场景）。保留开关仅供实验。
-	ackNoDelay atomic.Bool
 
-	// 发送窗口自动调节与线路统计（见 autownd.go）
-	stats        *trunkStats
-	ctrlMu       sync.Mutex
-	autoWnd      bool                     // true = 发送窗口自动调节（默认开启）
-	sndWnd       int                      // 当前发送窗口（段）
-	rcvWnd       int                      // 接收窗口（段，只做缓冲）
-	wndMax       int                      // 自动调节上限（段）
-	lastCtrlAt   time.Time                // 上次调节时间
-	ampEWMA      float64                  // 线上放大率（线上字节/已确认字节）的平滑值
-	ampHighTicks int                      // 放大率连续超标的周期数
-	ampHistWire  [autoWindowAmpSpan]int64 // 放大率滑动窗口：线上字节
-	ampHistAcked [autoWindowAmpSpan]int64 // 放大率滑动窗口：已确认段数
-	ampHistIdx   int
-	ampHistCnt   int
-	// 说明：ampEWMA/ampHighTicks 的读取在 Stats 里经 ctrlMu 保护
-	lastTickWire   int64       // 上一控制周期的线上字节
-	lastTickAcked  int64       // 上一控制周期被 ACK 确认的段数
+	// 线路统计与自诊断日志（见 stats.go）
+	stats          *trunkStats
+	ctrlMu         sync.Mutex
+	sndWnd         int         // 发送窗口（段）
+	rcvWnd         int         // 接收窗口（段，只做缓冲）
 	lastLogAcked   int64       // 上次日志时被 ACK 确认的段数
 	lastLogAt      time.Time   // 上次自诊断日志时间
 	lastLogWire    int64       // 上次日志时的线上字节
 	lastLogDeliv   int64       // 上次日志时的交付字节
 	lastLogPush    int64       // 上次日志时的 PUSH 段数（算区间重传率）
 	lastLogRetrans int64       // 上次日志时的重传段数（算区间重传率）
-	lastLogSnap    logSnapshot // 上次日志的收线/收段/重传来源采样（见 autownd.go）
+	lastLogSnap    logSnapshot // 上次日志的收线/收段/重传来源采样（见 stats.go）
 
 	// 数据通道
 	sendChan chan []byte // KCP 输出 -> 网络发送
@@ -116,9 +99,6 @@ type TrunkKCP struct {
 	onNewConnFn   OnNewConnFunc  // 新连接回调函数
 	onIdleConnFn  OnIdleConnFunc // 连接空闲/慢速回调函数
 	nextVirtualID int
-
-	// 写索引（轮询发送）
-	wIdx atomic.Int32
 
 	// 空闲检测配置
 	idleTimeout time.Duration // 连接空闲超时时间，0 表示禁用
@@ -146,10 +126,8 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 		onNewConnFn: onNewConn,
 		idleTimeout: 0, // 默认禁用空闲检测
 		stats:       newTrunkStats(),
-		autoWnd:     false, // 固定窗口为默认；自动调窗需显式 SetAutoWindow（见 autownd.go）
-		sndWnd:      autoWindowDefaultMax,
-		rcvWnd:      autoWindowDefaultRcv,
-		wndMax:      autoWindowDefaultMax,
+		sndWnd:      defaultSndWnd,
+		rcvWnd:      defaultRcvWnd,
 	}
 
 	// 创建 KCP 实例，output 回调写入 sendChan
@@ -161,12 +139,10 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 		case <-t.done:
 		}
 	})
-	// 默认：发送窗口 1024 段、接收窗口 1024 段（保持既有行为）。
-	// 发送窗口是"在途数据上限"，限速链路上必须按 BDP 设——用 SetWindowSize 或
-	// SetAutoWindow（见 autownd.go 与 README「KCP 参数」）。接收窗口只做缓冲，
+	// 默认发送/接收窗口各 1024 段（保持既有行为）。发送窗口是"在途数据上限"，
+	// 必须按链路设——用 SetWindowSize（见 README「KCP 参数」）。接收窗口只做缓冲，
 	// 不要跟着调小：调小会在应用稍有停顿时把对端饿死（真机踩过）。
-	t.kcp.WndSize(autoWindowDefaultMax, autoWindowDefaultRcv)
-	t.ackNoDelay.Store(false) // 默认延迟 ACK；打开 ackNoDelay 的实测副作用见字段注释
+	t.kcp.WndSize(defaultSndWnd, defaultRcvWnd)
 	// 设置 MTU 为 1400（典型以太网 MTU 1500 - IP/UDP 头部）
 	// MSS = MTU - KCP头部(24) = 1376，更大的 MSS 减少分片
 	t.mtu = KcpMtu
@@ -218,12 +194,6 @@ func (t *TrunkKCP) SetNoDelay(nodelay, interval, resend, nc int) {
 	t.kcp.NoDelay(nodelay, interval, resend, nc)
 }
 
-// SetAckNoDelay 设置"收到段立即回 ACK"。默认 true（低延迟、减少发送端 RTO 伪重传）；
-// 置 false 恢复 kcp-go 默认的延迟 ACK（ACK 更少但更晚）。
-func (t *TrunkKCP) SetAckNoDelay(v bool) {
-	t.ackNoDelay.Store(v)
-}
-
 // SetWindowSize 设置 KCP 发送/接收窗口（单位：KCP 段，一段载荷 = mtu-24 字节）。
 //
 // 为什么重要：KCP 的窗口就是"在途数据上限"。若窗口远大于链路 BDP 而瓶颈又有限速/
@@ -242,11 +212,9 @@ func (t *TrunkKCP) SetAckNoDelay(v bool) {
 // 再留 20%~50% 余量覆盖瓶颈排队抖动即可；盲目调大只会退化成上面的第一行。
 // 关闭拥塞控制（NoDelay 的 nc=1，本包默认）时窗口是**唯一**的流控手段，必须设对。
 //
-// 传 0 表示该项保持当前值。**调用本方法会关闭发送窗口自动调节**（显式固定值优先）；
-// 想让库自动调窗（默认）请用 SetAutoWindow，或什么都不调用。
+// 传 0 表示该项保持当前值。
 func (t *TrunkKCP) SetWindowSize(sndwnd, rcvwnd int) {
 	t.ctrlMu.Lock()
-	t.autoWnd = false
 	if sndwnd > 0 {
 		t.sndWnd = sndwnd
 	}
@@ -331,7 +299,7 @@ func (t *TrunkKCP) Run(ctx context.Context) error {
 // sendLoop 从 sendChan 读取 KCP 输出的数据包并写到指定物理连接。
 // 用 sendChan 做中介，起到了主动负载均衡的目的，发的快的消费的也快
 func (t *TrunkKCP) sendLoop(ctx context.Context, ac *activeConn) {
-	log.Ctx(ctx).Info().Msgf("sendLoop conn %d", ac.id)
+	log.Ctx(ctx).Info().Caller().Msgf("sendLoop conn %d", ac.id)
 	for {
 		select {
 		case <-ctx.Done():
@@ -347,7 +315,7 @@ func (t *TrunkKCP) sendLoop(ctx context.Context, ac *activeConn) {
 				err = io.ErrShortWrite
 			}
 			if err != nil {
-				log.Ctx(ctx).Warn().Err(err).Msgf("sendLoop conn %d write error, remove", ac.id)
+				log.Ctx(ctx).Warn().Caller().Err(err).Msgf("sendLoop conn %d write error, remove", ac.id)
 				t.RemoveConn(ac.id)
 				return
 			}
@@ -397,7 +365,7 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, ac *activeConn) {
 				mtu = KcpMtu
 			}
 			if payloadLen > uint32(mtu-kcpHeaderSize) {
-				log.Ctx(ctx).Warn().Msgf("recvLoop conn %d invalid KCP segment length: %d", ac.id, payloadLen)
+				log.Ctx(ctx).Warn().Caller().Msgf("recvLoop conn %d invalid KCP segment length: %d", ac.id, payloadLen)
 				t.RemoveConn(ac.id)
 				return
 			}
@@ -417,7 +385,7 @@ func (t *TrunkKCP) recvLoop(ctx context.Context, ac *activeConn) {
 			}
 		}
 		if readErr != nil {
-			log.Ctx(ctx).Warn().Err(readErr).Msgf("recvLoop conn %d read error, remove", ac.id)
+			log.Ctx(ctx).Warn().Caller().Err(readErr).Msgf("recvLoop conn %d read error, remove", ac.id)
 			t.RemoveConn(ac.id)
 			return
 		}
@@ -437,7 +405,9 @@ func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 		case packet := <-t.recvChan:
 			t.stats.recordRecvPacket(packet, time.Now()) // ACK → RTT 估计
 			t.kcpLock.Lock()
-			if ret := t.kcp.Input(packet, true, t.ackNoDelay.Load()); ret < 0 {
+			// 第三参 ackNoDelay 固定 false：kcp-go 打开它时走 flush(true) 的"仅 ACK"
+			// 路径，会连带发出窗口探测/旧段，实测重传率 68% → 90%、goodput 掉到 1/25。
+			if ret := t.kcp.Input(packet, true, false); ret < 0 {
 				t.kcpLock.Unlock()
 				return errors.Errorf("kcp input failed: %d", ret)
 			}
@@ -522,9 +492,7 @@ func (t *TrunkKCP) kcpUpdateLoop(ctx context.Context) error {
 			t.kcpLock.Lock()
 			t.kcp.Update()
 			t.kcpLock.Unlock()
-			now := time.Now()
-			t.autoWindowStep(ctx, now)
-			t.statsTick(ctx, now)
+			t.statsTick(ctx, time.Now())
 		}
 	}
 }
@@ -659,7 +627,7 @@ func (t *TrunkKCP) checkIdleConns(ctx context.Context) {
 
 	// 处理空闲连接
 	for _, id := range idleConns {
-		log.Ctx(ctx).Info().Int("conn_id", id).Msg("connection idle timeout detected")
+		log.Ctx(ctx).Info().Caller().Int("conn_id", id).Msg("connection idle timeout detected")
 
 		// 如果有回调函数，调用它获取新连接
 		var newConn io.ReadWriteCloser
@@ -669,17 +637,17 @@ func (t *TrunkKCP) checkIdleConns(ctx context.Context) {
 
 		// 先移除旧连接
 		if err := t.RemoveConn(id); err != nil {
-			log.Ctx(ctx).Warn().Err(err).Int("conn_id", id).Msg("failed to remove idle connection")
+			log.Ctx(ctx).Warn().Caller().Err(err).Int("conn_id", id).Msg("failed to remove idle connection")
 		}
 
 		// 如果有新连接，添加它
 		if newConn != nil {
 			newID, err := t.AddConn(newConn)
 			if err != nil {
-				log.Ctx(ctx).Warn().Err(err).Msg("failed to add replacement connection")
+				log.Ctx(ctx).Warn().Caller().Err(err).Msg("failed to add replacement connection")
 				_ = newConn.Close()
 			} else {
-				log.Ctx(ctx).Info().Int("old_conn_id", id).Int("new_conn_id", newID).Msg("idle connection replaced")
+				log.Ctx(ctx).Info().Caller().Int("old_conn_id", id).Int("new_conn_id", newID).Msg("idle connection replaced")
 			}
 		}
 	}
@@ -811,7 +779,7 @@ func (t *TrunkKCP) checkSlowConns(ctx context.Context) {
 
 	// 打印速率统计
 	for _, s := range stats {
-		log.Ctx(ctx).Info().
+		log.Ctx(ctx).Info().Caller().
 			Int("conn_id", s.id).
 			Dur("age", s.age).
 			Int64("send_bytes", s.sendBytes).
@@ -835,7 +803,7 @@ func (t *TrunkKCP) checkSlowConns(ctx context.Context) {
 		slowRecv := avgRecvRate > 0 && s.recvRate < avgRecvRate*slowConnThreshold
 
 		if slowSend || slowRecv {
-			log.Ctx(ctx).Warn().
+			log.Ctx(ctx).Warn().Caller().
 				Int("conn_id", s.id).
 				Dur("age", s.age).
 				Float64("send_rate", s.sendRate).
@@ -854,17 +822,17 @@ func (t *TrunkKCP) checkSlowConns(ctx context.Context) {
 
 			// 先移除旧连接
 			if err := t.RemoveConn(s.id); err != nil {
-				log.Ctx(ctx).Warn().Err(err).Int("conn_id", s.id).Msg("failed to remove slow connection")
+				log.Ctx(ctx).Warn().Caller().Err(err).Int("conn_id", s.id).Msg("failed to remove slow connection")
 			}
 
 			// 如果有新连接，添加它
 			if newConn != nil {
 				newID, err := t.AddConn(newConn)
 				if err != nil {
-					log.Ctx(ctx).Warn().Err(err).Msg("failed to add replacement connection")
+					log.Ctx(ctx).Warn().Caller().Err(err).Msg("failed to add replacement connection")
 					_ = newConn.Close()
 				} else {
-					log.Ctx(ctx).Info().Int("old_conn_id", s.id).Int("new_conn_id", newID).Msg("slow connection replaced")
+					log.Ctx(ctx).Info().Caller().Int("old_conn_id", s.id).Int("new_conn_id", newID).Msg("slow connection replaced")
 				}
 			}
 		}

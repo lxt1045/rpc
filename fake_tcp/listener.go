@@ -94,7 +94,7 @@ func (l *Listener) newServerSession(ctx context.Context, key sessKey, seg *Segme
 		select {
 		case l.acceptCh <- &Conn{sess: s}:
 		default:
-			log.Ctx(ctx).Info().Msgf("fake_tcp: accept 队列满，拒绝新连接, peer=%v", s.peer)
+			log.Ctx(ctx).Info().Caller().Msgf("fake_tcp: accept 队列满，拒绝新连接, peer=%v", s.peer)
 			_ = s.sendSeg(FlagRST, nil)
 			s.teardown()
 		}
@@ -108,7 +108,7 @@ func (l *Listener) newServerSession(ctx context.Context, key sessKey, seg *Segme
 
 	// 回 SYNACK（等三次握手最后一个 ACK 后 Established）
 	if err := s.sendSeg(FlagSYN|FlagACK, nil); err != nil {
-		log.Ctx(ctx).Debug().Msgf("fake_tcp: SYNACK 发送失败: %v", err)
+		log.Ctx(ctx).Debug().Caller().Msgf("fake_tcp: SYNACK 发送失败: %v", err)
 		s.teardown()
 		return
 	}

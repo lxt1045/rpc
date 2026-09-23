@@ -18,8 +18,7 @@ import (
 //     trunk_kcp KCP 窗口（库默认 1024 段 ≈ 8×BDP 时，限速出口队列被灌爆，带宽全变重传）。
 //  2. 窗口到底该多大？——取决于 BDP = 速率×RTT，写死任何值都会踩坑：大了拥塞崩溃，
 //     小了把发送端饿死（真机实测 128 段 → 只有 7Mbps 占用、300kB/s 下载）。
-//     所以 autownd.go 用"RTT 被排队抬高才收缩"的 Vegas 判据自动调窗；本文件同时验证
-//     固定窗口的规律与自动调窗的收敛性。
+//     本文件把"限速"与"有损"两种链路的窗口规律分别固化下来。
 //
 // 指标：goodput（接收端有效字节/时间）、放大率（发送端推入瓶颈的字节/有效字节，
 // 等价于真机上"网卡 30Mbps vs 下载 1MB/s"）、重传率（重复 SN 的 PUSH 段占比）、
@@ -172,13 +171,9 @@ type linkMetrics struct {
 	retransPct  float64       // 发送侧重复 SN 段占比（用库自身统计）
 	dropPct     float64       // 被瓶颈丢弃的段占比
 	linkUsePct  float64       // 瓶颈利用率（passed / 理论限速）
-	sndWnd      int           // 结束时发送窗口（自动调窗时即收敛值）
-	backlog     int           // 结束时应用侧发送积压（段）
-	ampE        float64       // 结束时放大率平滑值
-	ampHigh     int           // 结束时"放大率超标"周期数
 	srtt        time.Duration // 平滑 RTT
 	minRtt      time.Duration // 最小 RTT（仅诊断）
-	// 下面几项是"浪费发生在哪"的判据，见 autownd.go/trunk_kcp 日志判读
+	// 下面几项是"浪费发生在哪"的判据，见 trunk_kcp/stats.go 的日志判读
 	inFlight   int64   // 发送侧在途（已发未确认）段数
 	rxDupPct   float64 // 接收侧收到的重复段占比：重传的包是否真的穿过了链路
 	rxReordPct float64 // 接收侧收到的乱序段占比：多物理连接打乱 SN 顺序的程度
@@ -188,15 +183,14 @@ type linkMetrics struct {
 }
 
 // runShapedDownload 在"发送端推入瓶颈 → 瓶颈限速 → 接收端"的链路上跑 warmup+measure：
-// warmup 用于自动调窗收敛，指标只统计后 measure 段。
-// auto=true 时用库的自动调窗（SetAutoWindow(snd 作为上限, rcv)），否则固定窗口。
-func runShapedDownload(t *testing.T, label string, snd, rcv int, auto bool,
+// warmup 用于让重传/窗口进入稳态，指标只统计后 measure 段。
+func runShapedDownload(t *testing.T, label string, snd, rcv int,
 	rateBps float64, queueDelay, rtt, warmup, measure time.Duration) linkMetrics {
-	return runShapedDownloadND(t, label, snd, rcv, auto, []int{1, 10, 32, 1},
+	return runShapedDownloadND(t, label, snd, rcv, []int{1, 10, 32, 1},
 		rateBps, queueDelay, rtt, warmup, measure, 4, 0)
 }
 
-func runShapedDownloadND(t *testing.T, label string, snd, rcv int, auto bool, noDelay []int,
+func runShapedDownloadND(t *testing.T, label string, snd, rcv int, noDelay []int,
 	rateBps float64, queueDelay, rtt, warmup, measure time.Duration, nConn int, lossPct int) linkMetrics {
 	t.Helper()
 
@@ -222,11 +216,7 @@ func runShapedDownloadND(t *testing.T, label string, snd, rcv int, auto bool, no
 	cliTrunk := NewTrunkKCP(conv, nil, cliRws...)
 	svcTrunk := NewTrunkKCP(conv, nil, svcRws...)
 	for _, tr := range []*TrunkKCP{cliTrunk, svcTrunk} {
-		if auto {
-			tr.SetAutoWindow(snd, rcv)
-		} else {
-			tr.SetWindowSize(snd, rcv)
-		}
+		tr.SetWindowSize(snd, rcv)
 		tr.SetNoDelay(noDelay[0], noDelay[1], noDelay[2], noDelay[3])
 	}
 	ctx := context.Background()
@@ -274,7 +264,7 @@ func runShapedDownloadND(t *testing.T, label string, snd, rcv int, auto bool, no
 		}
 	}()
 
-	// 预热（自动调窗收敛），然后只统计 measure 段
+	// 预热（让窗口/重传进入稳态），然后只统计 measure 段
 	time.Sleep(warmup)
 	start := time.Now()
 	recv0 := received.Load()
@@ -283,13 +273,13 @@ func runShapedDownloadND(t *testing.T, label string, snd, rcv int, auto bool, no
 	st0 := svcTrunk.Stats()
 	cli0 := cliTrunk.Stats()
 
-	// -v 下每 500ms 采样一次发送端状态，便于观察自动调窗的收敛/振荡过程
+	// -v 下每 500ms 采样一次发送端状态，便于观察窗口/重传是否进入稳态
 	if testing.Verbose() {
 		for i := 0; i < int(measure/(500*time.Millisecond)); i++ {
 			time.Sleep(500 * time.Millisecond)
 			stx := svcTrunk.Stats()
-			t.Logf("  [%s] t=%dms snd=%d 在途=%d 放大=%.2f 重传=%.1f%% 积压=%d",
-				label, i*500, stx.SndWnd, stx.InFlight, stx.Amp, stx.RetransPct, stx.Backlog)
+			t.Logf("  [%s] t=%dms snd=%d 在途=%d 重传=%.1f%% 积压=%d",
+				label, i*500, stx.SndWnd, stx.InFlight, stx.RetransPct, stx.Backlog)
 		}
 	} else {
 		time.Sleep(measure)
@@ -315,10 +305,6 @@ func runShapedDownloadND(t *testing.T, label string, snd, rcv int, auto bool, no
 		amp:         float64(offered) / float64(max(useful, 1)),
 		linkUsePct:  100 * float64(passed) / (rateBps * elapsed.Seconds()),
 		dropPct:     100 * float64(drops) / float64(max(fwd+drops, 1)),
-		sndWnd:      st1.SndWnd,
-		backlog:     st1.Backlog,
-		ampE:        st1.Amp,
-		ampHigh:     st1.AmpHigh,
 		srtt:        st1.SRTT,
 		minRtt:      st1.MinRTT,
 		inFlight:    st1.InFlight,
@@ -362,7 +348,7 @@ func TestRateLimitedLinkKCP(t *testing.T) {
 	}
 	results := make(map[string]linkMetrics, len(scenarios))
 	for _, s := range scenarios {
-		results[s.label] = runShapedDownload(t, s.label, s.snd, 1024, false,
+		results[s.label] = runShapedDownload(t, s.label, s.snd, 1024,
 			rate, queueDelay, rtt, 500*time.Millisecond, measure)
 	}
 
@@ -431,7 +417,7 @@ func TestWindowOvershootSpuriousRTO(t *testing.T) {
 	}
 	res := make(map[string]linkMetrics, len(scenarios))
 	for _, s := range scenarios {
-		res[s.label] = runShapedDownloadND(t, s.label, s.snd, 1024, false,
+		res[s.label] = runShapedDownloadND(t, s.label, s.snd, 1024,
 			[]int{0, 10, s.resend, s.nc}, rate, queueDelay, rtt, warmup, measure, 4, 0)
 	}
 	bdp, bigRTO, cwnd := res["snd32_≈BDP_fast_nc1"],
@@ -498,7 +484,7 @@ func TestTrunkConnCountReorderingCausesRetransmit(t *testing.T) {
 	res := make(map[int]linkMetrics)
 	for _, n := range []int{1, 2, 4, 8} {
 		label := fmt.Sprintf("snd32_nc1_RTO_conn%d", n)
-		res[n] = runShapedDownloadND(t, label, 32, 1024, false, []int{0, 10, 32, 1},
+		res[n] = runShapedDownloadND(t, label, 32, 1024, []int{0, 10, 32, 1},
 			rate, queueDelay, rtt, warmup, measure, n, 0)
 	}
 	one, many := res[1], res[4]
@@ -571,7 +557,7 @@ func TestLossyPathTuning(t *testing.T) {
 	}
 	res := make(map[string]linkMetrics, len(scenarios))
 	for _, s := range scenarios {
-		res[s.label] = runShapedDownloadND(t, s.label, s.snd, 1024, false,
+		res[s.label] = runShapedDownloadND(t, s.label, s.snd, 1024,
 			[]int{s.nodelay, 10, s.resend, 1}, rate, queueDelay, rtt, warmup, measure, 4, lossPct)
 	}
 	rtoOnly := res["snd96_resend32_minRTO100"]
@@ -596,47 +582,9 @@ func TestLossyPathTuning(t *testing.T) {
 		small.goodputMBps, rtoOnly.goodputMBps, big.goodputMBps, big.amp)
 }
 
-// TestAutoWindowAdapts 自动调窗：同一套默认值在不同 RTT 的链路上都应吃满链路、放大接近 1，
-// 并且收敛出的窗口随 BDP 变化（RTT 大 → 窗口大）。这就是"不写死窗口"的验证。
-func TestAutoWindowAdapts(t *testing.T) {
-	const (
-		rate       = 3.0 << 20
-		queueDelay = 50 * time.Millisecond
-		warmup     = 3 * time.Second
-		measure    = 2 * time.Second
-		rttLong    = 150 * time.Millisecond
-	)
-	short := runShapedDownload(t, "auto RTT40ms", 1024, 1024, true, rate, queueDelay, 40*time.Millisecond, warmup, measure)
-	long := runShapedDownloadND(t, "auto RTT150ms minRTO30", 1024, 1024, true, []int{1, 10, 32, 1}, rate, queueDelay, rttLong, warmup, measure, 4, 0)
-	long2 := runShapedDownloadND(t, "auto RTT150ms minRTO100", 1024, 1024, true, []int{0, 10, 32, 1}, rate, queueDelay, rttLong, warmup, measure, 4, 0)
-	if long2.linkUsePct > long.linkUsePct+10 {
-		t.Logf("长 RTT 上 minRTO=100ms 明显优于 30ms：利用 %.1f%% → %.1f%%（伪重传更少）",
-			long.linkUsePct, long2.linkUsePct)
-	}
-
-	// 40ms 无损限速链路：自动调窗应稳定收敛到"打满链路 + 放大接近 1"。
-	if short.linkUsePct < 85 {
-		t.Errorf("RTT40ms 自动调窗没吃满链路：利用 %.1f%%（预期 >85%%）", short.linkUsePct)
-	}
-	// 放大率这里只做"别失控"的上限断言：控制器在突发丢包场景会停在
-	// "高丢包+放大≈1.5~1.9"的平衡点（已知弱点，见 README：生产用固定窗口），
-	// 实测同一配置重跑在 1.46~1.9 之间波动，收紧会变成 flaky。
-	if short.amp > 2.0 {
-		t.Errorf("RTT40ms 自动调窗放大失控：%.2fx（预期 <2.0）", short.amp)
-	}
-	// 长 RTT：控制器目前仍会振荡（放大偏高/利用偏低），只记录不判定——
-	// 生产上先用固定 kcp_sndwnd 按 BDP 设，见 README。等控制器稳定后再收紧断言。
-	if long.linkUsePct < 85 || long.amp > 1.8 {
-		t.Logf("已知问题：长 RTT(%v) 下自动调窗仍不稳定（利用 %.1f%%、放大 %.2fx），"+
-			"建议固定窗口按 BDP 设", rttLong, long.linkUsePct, long.amp)
-	}
-	t.Logf("自动调窗：RTT40ms → snd=%d 利用 %.1f%% 放大 %.2fx；RTT150ms → snd=%d 利用 %.1f%% 放大 %.2fx",
-		short.sndWnd, short.linkUsePct, short.amp, long.sndWnd, long.linkUsePct, long.amp)
-}
-
 // TestStatsAckAccounting 校验线路统计本身：每个发出去的 PUSH 段都应恰好被 ACK 一次。
 // 这条曾经出过错——KCP 一次 flush 会把多个段拼在一个缓冲里，只解析第一个段会把
-// "已确认段数"算成实际的 1/N，放大率随之虚高几十倍，自动调窗据此一路收缩（真机故障）。
+// "已确认段数"算成实际的 1/N，放大率随之虚高几十倍（真机据此误判过窗口）。
 func TestStatsAckAccounting(t *testing.T) {
 	const (
 		nConn = 2

@@ -88,7 +88,7 @@ func (p *SocksCli) dial(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	if p.Name != "" {
-		log.Ctx(ctx).Debug().Str("local", conn.LocalAddr().String()).
+		log.Ctx(ctx).Debug().Caller().Str("local", conn.LocalAddr().String()).
 			Str("remote", conn.RemoteAddr().String()).Msgf("%s faux_tcp connected", p.Name)
 	}
 	return conn, nil
@@ -139,7 +139,7 @@ func (p *SocksCli) RunConnLoop(ctx context.Context) {
 		}
 		peer, err := p.dialControlPeer(ctx)
 		if err != nil {
-			log.Ctx(ctx).Warn().Err(err).Msg("dial control conn failed")
+			log.Ctx(ctx).Warn().Caller().Err(err).Msg("dial control conn failed")
 			time.Sleep(time.Second)
 			continue
 		}
@@ -209,7 +209,7 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 		oldTrunk := p.trunk
 		p.trunk = nil
 		p.mu.Unlock()
-		log.Ctx(ctx).Info().Msg("closing old client trunk before creating new one")
+		log.Ctx(ctx).Info().Caller().Msg("closing old client trunk before creating new one")
 		_ = oldTrunk.Close()
 	} else {
 		p.mu.Unlock()
@@ -256,7 +256,7 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 	trunk.SetIdleTimeout(60*time.Second, func(connID int) io.ReadWriteCloser {
 		conns, err := p.TrunkConn(ctx, conv, 1)
 		if err != nil {
-			log.Ctx(ctx).Warn().Err(err).Msg("failed to create replacement conn for idle detection")
+			log.Ctx(ctx).Warn().Caller().Err(err).Msg("failed to create replacement conn for idle detection")
 			return nil
 		}
 		return conns[0]
@@ -266,7 +266,7 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 	trunk.SetSlowConnDetection(0.1, 30*time.Minute, func(connID int) io.ReadWriteCloser {
 		conns, err := p.TrunkConn(ctx, conv, 1)
 		if err != nil {
-			log.Ctx(ctx).Warn().Err(err).Msg("failed to create replacement conn for slow connection detection")
+			log.Ctx(ctx).Warn().Caller().Err(err).Msg("failed to create replacement conn for slow connection detection")
 			return nil
 		}
 		return conns[0]
@@ -279,7 +279,7 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 
 	go func() {
 		trunk.Run(ctx)
-		log.Ctx(ctx).Warn().Msg("trunk stopped, will attempt to reconnect")
+		log.Ctx(ctx).Warn().Caller().Msg("trunk stopped, will attempt to reconnect")
 
 		p.mu.Lock()
 		if p.trunk == trunk {
@@ -296,11 +296,11 @@ func (p *SocksCli) InitTrunk(ctx context.Context) error {
 		p.mu.Unlock()
 
 		time.Sleep(3 * time.Second)
-		log.Ctx(ctx).Info().Msg("attempting to reconnect trunk")
+		log.Ctx(ctx).Info().Caller().Msg("attempting to reconnect trunk")
 		if err := p.InitTrunk(ctx); err != nil {
-			log.Ctx(ctx).Error().Err(err).Msg("failed to reconnect trunk")
+			log.Ctx(ctx).Error().Caller().Err(err).Msg("failed to reconnect trunk")
 		} else {
-			log.Ctx(ctx).Info().Msg("trunk reconnected successfully")
+			log.Ctx(ctx).Info().Caller().Msg("trunk reconnected successfully")
 		}
 	}()
 
@@ -365,9 +365,9 @@ func (p *SocksCli) MaintainTrunk(ctx context.Context) {
 				continue
 			}
 			add := target - cur
-			log.Ctx(ctx).Info().Int("current", cur).Int("target", target).Int("add", add).Msg("trunk conn missing, adding")
+			log.Ctx(ctx).Info().Caller().Int("current", cur).Int("target", target).Int("add", add).Msg("trunk conn missing, adding")
 			if err := p.AddTrunkConn(ctx, add); err != nil {
-				log.Ctx(ctx).Warn().Err(err).Msg("add trunk conn failed")
+				log.Ctx(ctx).Warn().Caller().Err(err).Msg("add trunk conn failed")
 			}
 		}
 	}
@@ -428,7 +428,7 @@ func (p *SocksCli) RunSocks(ctx context.Context, addr string) error {
 		return err
 	}
 	defer l.Close()
-	log.Ctx(ctx).Info().Str("addr", addr).Msg("SOCKS5 listening")
+	log.Ctx(ctx).Info().Caller().Str("addr", addr).Msg("SOCKS5 listening")
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -445,11 +445,11 @@ func (p *SocksCli) handleSocks(ctx context.Context, rc net.Conn) {
 	}
 	addr, err := socks.Handshake(rc)
 	if err != nil {
-		log.Ctx(ctx).Debug().Err(err).Msg("socks handshake failed")
+		log.Ctx(ctx).Debug().Caller().Err(err).Msg("socks handshake failed")
 		return
 	}
 	if err := p.openProxy(ctx, rc, addr.String(), nil); err != nil {
-		log.Ctx(ctx).Warn().Err(err).Str("addr", addr.String()).Msg("open SOCKS proxy failed")
+		log.Ctx(ctx).Warn().Caller().Err(err).Str("addr", addr.String()).Msg("open SOCKS proxy failed")
 	}
 }
 
@@ -460,7 +460,7 @@ func (p *SocksCli) RunHTTPProxy(ctx context.Context, addr string) error {
 		return err
 	}
 	defer l.Close()
-	log.Ctx(ctx).Info().Str("addr", addr).Msg("HTTP proxy listening")
+	log.Ctx(ctx).Info().Caller().Str("addr", addr).Msg("HTTP proxy listening")
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -484,7 +484,7 @@ func (p *SocksCli) handleHTTP(ctx context.Context, inConn net.Conn) {
 		return
 	}
 	if err := p.openProxy(ctx, inConn, req.Host, nil); err != nil {
-		log.Ctx(ctx).Warn().Err(err).Str("addr", req.Host).Msg("open HTTP proxy failed")
+		log.Ctx(ctx).Warn().Caller().Err(err).Str("addr", req.Host).Msg("open HTTP proxy failed")
 	}
 }
 

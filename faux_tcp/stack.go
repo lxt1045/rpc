@@ -328,7 +328,7 @@ func (c *fconn) recordSendErr(err error) {
 	c.sendErr = err
 	c.sendErrMu.Unlock()
 	if n <= 3 {
-		log.Ctx(context.Background()).Debug().
+		log.Ctx(context.Background()).Debug().Caller().
 			Msgf("faux_tcp: 发包失败(%d) %s -> %s: %v", n, c.local, c.remote, err)
 	}
 }
@@ -377,7 +377,7 @@ func (c *fconn) notePeerMSS(peerMSS uint16) {
 	}
 	c.peerMSS = peerMSS
 	if int(peerMSS) < c.cfg.MSS {
-		log.Ctx(context.Background()).Warn().
+		log.Ctx(context.Background()).Warn().Caller().
 			Msgf("faux_tcp: 对端/路径通告 MSS=%d < 本端 MSS=%d（路径 MTU 受限）："+
 				"请把 faux_tcp.mss 调到 ≤%d，并把 KCP MTU(kcp_mtu) 调到 ≤ faux_tcp.mss，"+
 				"否则大于路径 MTU 的报文会被丢弃", peerMSS, c.cfg.MSS, peerMSS)
@@ -568,7 +568,7 @@ func (c *fconn) onTick() {
 		// 半开连接超时回收：SYNACK 发出多次仍收不到最后一个 ACK，通常是
 		// 回程被 NAT/防火墙/容器网络丢弃（客户端会表现为"握手超时、收到 0 个报文"）
 		if idle > c.cfg.handshakeWindow() {
-			log.Ctx(context.Background()).Debug().
+			log.Ctx(context.Background()).Debug().Caller().
 				Msgf("faux_tcp: 半开连接超时回收 peer=%s（已发 %d 个报文未收到 ACK；"+
 					"若对端报握手超时，请检查回程：NAT/安全组/容器网络是否放行本端发出的 SYN+ACK）",
 					c.remote, c.SentPackets.Load())

@@ -159,7 +159,7 @@ func (p *SocksSvc) Auth(ctx context.Context, req *pb.AuthReq) (*pb.AuthRsp, erro
 		return &pb.AuthRsp{Status: pb.AuthRsp_Fail, Err: &pb.Err{Msg: "server security not configured"}}, nil
 	}
 	if subtle.ConstantTimeCompare([]byte(expected), []byte(req.Name)) != 1 {
-		log.Ctx(ctx).Warn().Str("remote", p.RemoteAddr).Msg("auth failed")
+		log.Ctx(ctx).Warn().Caller().Str("remote", p.RemoteAddr).Msg("auth failed")
 		return &pb.AuthRsp{Status: pb.AuthRsp_Fail, Err: &pb.Err{Msg: "invalid token"}}, nil
 	}
 
@@ -232,11 +232,11 @@ func (p *SocksSvc) TrunkUpgrade(ctx context.Context, req *pb.TrunkUpgradeReq) (*
 	}
 	id, err := trunk.AddConn(upgrade)
 	if err != nil {
-		log.Ctx(ctx).Warn().Err(err).Msg("AddConn to trunk failed")
+		log.Ctx(ctx).Warn().Caller().Err(err).Msg("AddConn to trunk failed")
 		upgrade.Close()
 		return nil, err
 	}
-	log.Ctx(ctx).Info().Int("conn_id", id).Uint32("trunk_id", req.TrunkId).Msg("physical conn upgraded into trunk")
+	log.Ctx(ctx).Info().Caller().Int("conn_id", id).Uint32("trunk_id", req.TrunkId).Msg("physical conn upgraded into trunk")
 	return &pb.TrunkUpgradeRsp{}, nil
 }
 
@@ -285,7 +285,7 @@ func (p *SocksSvc) TrunkStart(ctx context.Context, req *pb.TrunkStartReq) (*pb.T
 		oldTrunk := sess.trunk
 		sess.trunk = nil
 		sess.mu.Unlock()
-		log.Ctx(ctx).Info().Msg("closing old trunk before creating new one")
+		log.Ctx(ctx).Info().Caller().Msg("closing old trunk before creating new one")
 		_ = oldTrunk.Close()
 		sess.mu.Lock()
 	}
@@ -357,7 +357,7 @@ func (p *SocksSvc) serveVirtualConn(ctx context.Context, vconn *trunk_kcp.Virtua
 	if cfg := serverTLSConfig(); cfg != nil {
 		tlsConn, err := wrapTLSServer(ctx, vconn, nil, nil, cfg, 10*time.Second)
 		if err != nil {
-			log.Ctx(ctx).Debug().Err(err).Msg("virtual conn tls handshake failed")
+			log.Ctx(ctx).Debug().Caller().Err(err).Msg("virtual conn tls handshake failed")
 			return
 		}
 		rwc = tlsConn
@@ -366,19 +366,19 @@ func (p *SocksSvc) serveVirtualConn(ctx context.Context, vconn *trunk_kcp.Virtua
 	msg, err := ReadOpenHeader(rwc)
 	if err != nil {
 		if err != io.EOF {
-			log.Ctx(ctx).Debug().Err(err).Msg("virtual conn closed before open")
+			log.Ctx(ctx).Debug().Caller().Err(err).Msg("virtual conn closed before open")
 		}
 		return
 	}
 	if !CheckACL(msg.Addr) {
-		log.Ctx(ctx).Warn().Str("addr", msg.Addr).Msg("acl deny")
+		log.Ctx(ctx).Warn().Caller().Str("addr", msg.Addr).Msg("acl deny")
 		_ = rwc.Close()
 		return
 	}
 	d := net.Dialer{Timeout: 30 * time.Second}
 	rc, err := d.Dial("tcp", msg.Addr)
 	if err != nil {
-		log.Ctx(ctx).Warn().Err(err).Str("addr", msg.Addr).Msg("dial target failed")
+		log.Ctx(ctx).Warn().Caller().Err(err).Str("addr", msg.Addr).Msg("dial target failed")
 		_ = rwc.Close()
 		return
 	}
@@ -389,7 +389,7 @@ func (p *SocksSvc) serveVirtualConn(ctx context.Context, vconn *trunk_kcp.Virtua
 			return
 		}
 	}
-	log.Ctx(ctx).Info().Str("addr", msg.Addr).Msg("proxy connected")
+	log.Ctx(ctx).Info().Caller().Str("addr", msg.Addr).Msg("proxy connected")
 	relay(ctx, rwc, rc)
 }
 

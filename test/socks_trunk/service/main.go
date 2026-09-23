@@ -109,7 +109,7 @@ func main() {
 				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 				_, _ = w.Write([]byte("ok"))
 			})
-			log.Ctx(ctx).Info().Str("addr", conf.MetricsAddr).Msg("metrics server listening")
+			log.Ctx(ctx).Info().Caller().Str("addr", conf.MetricsAddr).Msg("metrics server listening")
 			if err := http.ListenAndServe(conf.MetricsAddr, mux); err != nil && err != http.ErrServerClosed {
 				log.Ctx(ctx).Warn().Caller().Err(err).Msg("metrics server stopped")
 			}

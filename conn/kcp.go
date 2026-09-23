@@ -166,7 +166,7 @@ func kcpUpdata(ctx context.Context, conf KcpConfig) {
 		case conn := <-updataAddCh:
 			conn.Lock()
 			if conn.listE != nil {
-				log.Ctx(ctx).Error().Msgf("conn.listE is not nil, remove before PushBack, conn:%v", conn)
+				log.Ctx(ctx).Error().Caller().Msgf("conn.listE is not nil, remove before PushBack, conn:%v", conn)
 				updataList.Remove(conn.listE)
 			}
 			conn.listE = updataList.PushBack(conn)
@@ -184,7 +184,7 @@ func KcpOutoput(ctx context.Context, ln *net.UDPConn, addr *net.UDPAddr) (f func
 		//发送数据成熟时的异步回调函数，成熟数据为：buf[:size]，在这里把数据通过UDP发送出去
 		n, err := ln.WriteToUDP(buf[:size+1], addr)
 		if err != nil || n != size+1 {
-			log.Ctx(ctx).Error().Err(err).Msgf("error during kcp send:%v,n:%d\n", err, n)
+			log.Ctx(ctx).Error().Caller().Err(err).Msgf("error during kcp send:%v,n:%d\n", err, n)
 		}
 	}
 	return
@@ -278,7 +278,7 @@ func KcpOutoputByConn(ctx context.Context, conn net.Conn) (f func([]byte, int)) 
 		//func copy(dst, src []Type) int //The source and destination may overlap.
 		n, err := conn.Write(buf[:size+1])
 		if err != nil || n != size+1 {
-			log.Ctx(ctx).Error().Err(err).Caller().Msgf("error during kcp send:%v,n:%d\n", err, n)
+			log.Ctx(ctx).Error().Caller().Err(err).Caller().Msgf("error during kcp send:%v,n:%d\n", err, n)
 		}
 	}
 	return

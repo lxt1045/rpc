@@ -91,7 +91,7 @@ func main() {
 		return
 	}
 	defer listener.Close()
-	log.Ctx(ctx).Info().Str("addr", conf.Conn.Addr).Msg("server started")
+	log.Ctx(ctx).Info().Caller().Str("addr", conf.Conn.Addr).Msg("server started")
 
 	if conf.MetricsAddr != "" {
 		go func() {
@@ -170,7 +170,7 @@ func main() {
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	select {
 	case s := <-done:
-		log.Ctx(ctx).Info().Str("signal", s.String()).Msg("shutdown")
+		log.Ctx(ctx).Info().Caller().Str("signal", s.String()).Msg("shutdown")
 	case <-ctx.Done():
 	}
 	cancel()

@@ -1,5 +1,18 @@
 # Changelog - socks_trunk_kcp
 
+## 2026-09-23 - 配置清理：删除实测无效的 KCP 旋钮与自动调窗
+
+与 `trunk_kcp` 同步：只保留实测有效的配置项，删掉调参阶段加的实验性开关。
+
+- 删除 `kcp_resend` / `kcp_interval`（`NoDelay` 第 2、3 参）：窗口设对后 `resend=2` 与
+  `resend=32` 的重传率几乎相同，对吞吐没有可测影响；库侧 `SetNoDelay` 仍接受完整四元组
+  （示例对未配置项传 -1 = 保持库默认）。
+- 删除 `kcp_auto_wnd`（`trunk_kcp.SetAutoWindow`）：真机上把窗口缩到下限、吞吐掉到 1/4，
+  且会覆盖 yml 里的 `kcp_sndwnd`。窗口改回"按 BDP 显式设定"。
+- 删除 `trunk_kcp.SetAckNoDelay` 与死代码 `wIdx`；`autownd.go` 收敛为 `stats.go`
+  （只留统计与自诊断），`Stats()` 去掉 `AutoWnd/Amp/AmpHigh`。
+- 配置项最终为：`kcp_mtu`、`kcp_sndwnd`、`kcp_rcvwnd`、`kcp_nodelay`、`kcp_nc`。
+
 ## 2026-09-20 - KCP NoDelay 参数配置化 + 线上流量放大问题结论
 
 ### 背景

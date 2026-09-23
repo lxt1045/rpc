@@ -115,7 +115,7 @@ func main() {
 				}
 			}()
 		}
-		log.Ctx(ctx).Info().Str("socks", socksAddr).Str("http", httpAddr).Msg("client started")
+		log.Ctx(ctx).Info().Caller().Str("socks", socksAddr).Str("http", httpAddr).Msg("client started")
 	}()
 
 	done := make(chan os.Signal, 1)

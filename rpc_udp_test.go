@@ -74,7 +74,7 @@ func testUdpService(ctx context.Context, cancel context.CancelFunc, t *testing.T
 			return
 		}
 		if err != nil || n <= 0 {
-			log.Ctx(ctx).Error().Err(err).Msgf("error during read:%v, n:%d", err, n)
+			log.Ctx(ctx).Error().Caller().Err(err).Msgf("error during read:%v, n:%d", err, n)
 			continue
 			//break
 		}
