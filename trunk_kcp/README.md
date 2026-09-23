@@ -220,6 +220,12 @@ func main() {
 
 关闭 TrunkKCP，包括所有虚拟连接和物理连接。
 
+#### `SetMtu(mtu int)` / `SetNoDelay(nodelay, interval, resend, nc int)` / `SetWindowSize(sndwnd, rcvwnd int)`
+
+在线调整 KCP 的 MTU、时序参数与收发窗口（负值/0 表示保持当前值）。**必须在跑流量前调用，
+且两端配置一致**；`SetWindowSize` 的取法见下方「性能调优 → KCP 参数」——窗口是限速链路上
+唯一的流控手段，设错会把带宽全变成重传。
+
 #### `SetIdleTimeout(idleTimeout time.Duration, onIdleConn OnIdleConnFunc)`
 
 配置空闲连接检测。当某条物理连接在指定时间内没有收到任何数据时，会调用回调函数获取新连接进行替换。
@@ -360,28 +366,55 @@ trunk.SetSlowConnDetection(0.1, 30*time.Minute, func(connID int) io.ReadWriteClo
 
 ### KCP 参数 / KCP Parameters
 
-trunk_kcp 默认使用快速模式：
+**窗口（`WndSize`）必须按带宽时延积 BDP 设**——限速链路上最关键、也最容易踩的一项：
 
-```go
-kcp.NoDelay(1, 10, 2, 1)
-kcp.WndSize(1024, 1024)
+```
+sndwnd ≈ 链路速率(B/s) × RTT(s) / (mtu-24)      # 再留 20%~50% 余量；两端一致
 ```
 
-可以根据网络环境调整：
+KCP 的窗口就是"在途数据上限"，而关闭拥塞控制（`nc=1`，默认）时它是**唯一**的流控手段。
+两种踩法都实测过：
+
+| 配置 | 现象 |
+| --- | --- |
+| 窗口 1024 段（库默认，≈8×BDP） | 每轮把限速/整形队列灌爆 → 丢包 → 重传占满链路：**放大 3.2~3.8x、重传 68%**，有效吞吐只有链路的 60% |
+| 窗口 128 段（远小于长 RTT 链路的 BDP） | 发送端被自己饿死：真机只占 **7Mbps**、下载 **300kB/s**（链路 30Mbps） |
+
+实测（`ratelimit_test.go`：24Mbps、RTT 40ms、排队上限 50ms、4 条物理连接共享出口）：
+
+| 发送窗口（段） | 线上放大 | 重传段占比 | 瓶颈丢包 | 有效吞吐 | 链路利用 |
+| --- | --- | --- | --- | --- | --- |
+| 1024（库默认） | 3.23~3.86x | 68% | 62~65% | 2.3 MB/s | 101% |
+| 512 | 2.24~2.36x | 50% | 43% | 2.4 MB/s | 101% |
+| 256 | 1.38~1.65x | 25~34% | 12~19% | 2.3 MB/s | 94~101% |
+| **128（≈BDP）** | **1.17~1.26x** | 11~17% | ~0% | **2.4~2.6 MB/s** | **98~101%** |
+| 64 | 1.12x | 8~9% | 0% | 1.7~2.0 MB/s | 65~73% |
+| 32 | 1.05~1.07x | 2~6% | 0% | 0.9~1.0 MB/s | 32~36% |
+| 1024 + 开拥塞控制（`nc=0`） | 1.05x | 2% | 0% | 0.1~0.2 MB/s | **5~8%** |
+
+结论：
+
+1. **按 BDP 设 `sndwnd`**，两端一致（生效值取较小者）；不要用"历史最高速率"或 RTT
+   去自动猜——发送端一次 flush 会把整窗突发出去，突发自身的串行化时间会被算进后几个
+   包的 RTT，把窗口一路估小。取法就是上面的公式（`ping` 出 RTT）。
+2. **`rcvwnd` 不要跟着调小**：它是接收缓冲而不是限速，调小后应用（下游 TCP/浏览器）
+   稍有停顿就关窗，把发送端饿死。默认 1024 通常不用动。
+3. **`nc=0`（kcp-go 自带拥塞控制）不是解**：cwnd 爬升太慢，实测只用 5~8% 链路。
+4. **长 RTT 链路用 `nodelay=0`**（minRTO 100ms）：30ms 的 minRTO 会把还在路上的包判成
+   丢包（伪重传）；实测 150ms RTT 场景下 100ms minRTO 明显更优。短 RTT/不可靠底层用
+   默认 `nodelay=1` 即可。
 
 ```go
-// 普通模式（延迟较高，CPU 开销低）
-kcp.NoDelay(0, 10, 0, 1)
-kcp.WndSize(1024, 1024)
-
-// 快速模式（默认，平衡延迟和 CPU）
-kcp.NoDelay(1, 10, 2, 1)
-kcp.WndSize(1024, 1024)
-
-// 超快模式（最低延迟，CPU 开销高）
-kcp.NoDelay(1, 5, 2, 1)
-kcp.WndSize(256, 256)
+t.SetWindowSize(128, 1024)   // 例：30Mbps × 40ms ≈ 150KB ≈ 128 段（mtu 1200）
+t.SetNoDelay(0, 10, 32, 1)   // 长 RTT：minRTO 100ms，减少伪重传
 ```
+
+**实验性自动调窗**：`SetAutoWindow(maxWnd, rcvWnd)` 会按"线上放大率"（线上字节/对端
+累计确认字节）做 AIMD：放大 ≤1.5 加性增、>1.5 乘性减，因此不需要知道 RTT 与链路速率。
+40ms 无损限速链路上实测收敛良好（利用 ~100%、放大 ~1.2~1.5）；长 RTT/有损链路上仍会
+振荡，**生产先用固定窗口按 BDP 设**。`Stats()` 暴露 `SndWnd/RcvWnd/Backlog/Push/Acked/
+Retrans/WireBytes/SRTT/Amp` 等指标，`TrunkKCP` 每 3s 会打一行 debug 自诊断，可直接看到
+"窗口该多大"的依据。
 
 ### 通道大小 / Channel Size
 

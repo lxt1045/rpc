@@ -4,6 +4,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/lxt1045/errors"
 )
@@ -50,6 +51,14 @@ func (vc *VirtualConn) Write(p []byte) (n int, err error) {
 	// 对于大数据需要分块发送
 	const maxChunkSize = 8*1024 - HeaderSize //math.MaxUint16 - HeaderSize
 	totalWritten := 0
+
+	// 背压：kcp-go 的 Send 只拒绝"单次 >255 段"，**不限制发送队列长度**。
+	// 不在这里限流的话，窗口被卡住时应用会把数据无限堆进 snd_queue（内存涨、
+	// 而且上层误以为发送成功、看不到真实速率）。这里把积压控制在软上限内，
+	// 让阻塞沿 relay 传回上游（等价于 TCP 的发送窗口背压）。
+	if err := vc.waitSendBacklog(); err != nil {
+		return 0, err
+	}
 
 	for totalWritten < len(p) {
 		chunkSize := len(p) - totalWritten
@@ -117,6 +126,33 @@ func (vc *VirtualConn) Read(p []byte) (n int, err error) {
 		case <-vc.readDone:
 			return 0, io.EOF
 		}
+	}
+}
+
+// sendBacklogSoftLimit 发送队列积压软上限（段）。取 2×自动调窗上限，留一个窗口的
+// 应用缓冲；超过就等（背压），避免无限缓冲。单段载荷 ≈ mtu-24 字节。
+const sendBacklogSoftLimit = 2048
+
+// sendBacklogWait 背压等待超时（防止对端彻底无响应时永久阻塞）
+const sendBacklogWait = 60 * time.Second
+
+// waitSendBacklog 等发送队列积压降到软上限以下；连接关闭/超时返回错误。
+func (vc *VirtualConn) waitSendBacklog() error {
+	deadline := time.Now().Add(sendBacklogWait)
+	for {
+		vc.TrunkKCP.kcpLock.Lock()
+		backlog := vc.TrunkKCP.kcp.WaitSnd()
+		vc.TrunkKCP.kcpLock.Unlock()
+		if backlog < sendBacklogSoftLimit {
+			return nil
+		}
+		if vc.closed.Load() || vc.TrunkKCP.closed.Load() {
+			return io.ErrClosedPipe
+		}
+		if time.Now().After(deadline) {
+			return errors.Errorf("kcp send backlog full: %d segs", backlog)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 

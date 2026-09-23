@@ -76,6 +76,28 @@ type TrunkKCP struct {
 	kcpLock sync.Mutex
 	mtu     int // KCP 线上包 MTU（含 KCP 头；0 表示用默认 KcpMtu）
 
+	// 发送窗口自动调节与线路统计（见 autownd.go）
+	stats        *trunkStats
+	ctrlMu       sync.Mutex
+	autoWnd      bool                     // true = 发送窗口自动调节（默认开启）
+	sndWnd       int                      // 当前发送窗口（段）
+	rcvWnd       int                      // 接收窗口（段，只做缓冲）
+	wndMax       int                      // 自动调节上限（段）
+	lastCtrlAt   time.Time                // 上次调节时间
+	ampEWMA      float64                  // 线上放大率（线上字节/已确认字节）的平滑值
+	ampHighTicks int                      // 放大率连续超标的周期数
+	ampHistWire  [autoWindowAmpSpan]int64 // 放大率滑动窗口：线上字节
+	ampHistAcked [autoWindowAmpSpan]int64 // 放大率滑动窗口：已确认段数
+	ampHistIdx   int
+	ampHistCnt   int
+	// 说明：ampEWMA/ampHighTicks 的读取在 Stats 里经 ctrlMu 保护
+	lastTickWire  int64     // 上一控制周期的线上字节
+	lastTickAcked int64     // 上一控制周期被 ACK 确认的段数
+	lastLogAcked  int64     // 上次日志时被 ACK 确认的段数
+	lastLogAt     time.Time // 上次自诊断日志时间
+	lastLogWire   int64     // 上次日志时的线上字节
+	lastLogDeliv  int64     // 上次日志时的交付字节
+
 	// 数据通道
 	sendChan chan []byte // KCP 输出 -> 网络发送
 	recvChan chan []byte // 网络接收 -> KCP 输入
@@ -115,6 +137,11 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 		done:        make(chan struct{}),
 		onNewConnFn: onNewConn,
 		idleTimeout: 0, // 默认禁用空闲检测
+		stats:       newTrunkStats(),
+		autoWnd:     false, // 固定窗口为默认；自动调窗需显式 SetAutoWindow（见 autownd.go）
+		sndWnd:      autoWindowDefaultMax,
+		rcvWnd:      autoWindowDefaultRcv,
+		wndMax:      autoWindowDefaultMax,
 	}
 
 	// 创建 KCP 实例，output 回调写入 sendChan
@@ -126,8 +153,11 @@ func NewTrunkKCP(conv uint32, onNewConn OnNewConnFunc, rws ...io.ReadWriteCloser
 		case <-t.done:
 		}
 	})
-	// 增大窗口以提高吞吐量：发送窗口 1024，接收窗口 1024
-	t.kcp.WndSize(1024, 1024)
+	// 默认：发送窗口 1024 段、接收窗口 1024 段（保持既有行为）。
+	// 发送窗口是"在途数据上限"，限速链路上必须按 BDP 设——用 SetWindowSize 或
+	// SetAutoWindow（见 autownd.go 与 README「KCP 参数」）。接收窗口只做缓冲，
+	// 不要跟着调小：调小会在应用稍有停顿时把对端饿死（真机踩过）。
+	t.kcp.WndSize(autoWindowDefaultMax, autoWindowDefaultRcv)
 	// 设置 MTU 为 1400（典型以太网 MTU 1500 - IP/UDP 头部）
 	// MSS = MTU - KCP头部(24) = 1376，更大的 MSS 减少分片
 	t.mtu = KcpMtu
@@ -167,7 +197,9 @@ func (t *TrunkKCP) SetMtu(mtu int) {
 	if mtu <= kcpHeaderSize || mtu > KcpMtu {
 		return
 	}
+	t.ctrlMu.Lock()
 	t.mtu = mtu
+	t.ctrlMu.Unlock()
 	t.kcp.SetMtu(mtu)
 }
 
@@ -175,6 +207,43 @@ func (t *TrunkKCP) SetNoDelay(nodelay, interval, resend, nc int) {
 	t.kcpLock.Lock()
 	defer t.kcpLock.Unlock()
 	t.kcp.NoDelay(nodelay, interval, resend, nc)
+}
+
+// SetWindowSize 设置 KCP 发送/接收窗口（单位：KCP 段，一段载荷 = mtu-24 字节）。
+//
+// 为什么重要：KCP 的窗口就是"在途数据上限"。若窗口远大于链路 BDP 而瓶颈又有限速/
+// 排队上限（云主机出口整形、路由器限速、VPN 网关），每个窗口都会把瓶颈队列灌爆：
+// 丢包 → RTO 重传 → 重传再占带宽，稳态表现为"网卡打满、有效吞吐只剩零头"。
+// 实测（ratelimit_test.go，24 Mbps + 40ms RTT + 50ms 排队上限）：
+//
+//	窗口 1024（≈8×BDP）：线上放大 3.23x、重传 68%、goodput 2.51 MB/s
+//	窗口 128 （≈BDP）  ：线上放大 1.17x、重传 11%、goodput 2.62 MB/s（链路利用 101%）
+//	窗口 64  （<BDP）   ：线上放大 1.12x、但链路只利用 65%
+//
+// 取值方法（两端必须一致，实际生效值取两端较小者）：
+//
+//	sndwnd ≈ 链路速率(B/s) × RTT(s) / (mtu-24)
+//
+// 再留 20%~50% 余量覆盖瓶颈排队抖动即可；盲目调大只会退化成上面的第一行。
+// 关闭拥塞控制（NoDelay 的 nc=1，本包默认）时窗口是**唯一**的流控手段，必须设对。
+//
+// 传 0 表示该项保持当前值。**调用本方法会关闭发送窗口自动调节**（显式固定值优先）；
+// 想让库自动调窗（默认）请用 SetAutoWindow，或什么都不调用。
+func (t *TrunkKCP) SetWindowSize(sndwnd, rcvwnd int) {
+	t.ctrlMu.Lock()
+	t.autoWnd = false
+	if sndwnd > 0 {
+		t.sndWnd = sndwnd
+	}
+	if rcvwnd > 0 {
+		t.rcvWnd = rcvwnd
+	}
+	snd, rcv := t.sndWnd, t.rcvWnd
+	t.ctrlMu.Unlock()
+
+	t.kcpLock.Lock()
+	defer t.kcpLock.Unlock()
+	t.kcp.WndSize(snd, rcv)
 }
 
 // SetIdleTimeout 设置连接空闲超时时间和回调函数
@@ -257,6 +326,7 @@ func (t *TrunkKCP) sendLoop(ctx context.Context, ac *activeConn) {
 		case <-ac.stop:
 			return
 		case packet := <-t.sendChan:
+			t.stats.recordSend(packet) // 线上统计（含重传判定与 RTT 起点）
 			n, err := ac.writeFull(packet)
 			if err == nil && n != len(packet) {
 				err = io.ErrShortWrite
@@ -350,6 +420,7 @@ func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 		case <-t.done:
 			return nil
 		case packet := <-t.recvChan:
+			t.stats.recordRecvPacket(packet, time.Now()) // ACK → RTT 估计
 			t.kcpLock.Lock()
 			if ret := t.kcp.Input(packet, true, false); ret < 0 {
 				t.kcpLock.Unlock()
@@ -361,6 +432,7 @@ func (t *TrunkKCP) kcpInputLoop(ctx context.Context) error {
 				if n < 0 {
 					break
 				}
+				t.stats.delivered.Add(int64(n))
 				pending = append(pending, buf[:n]...)
 			}
 			t.kcpLock.Unlock()
@@ -435,6 +507,9 @@ func (t *TrunkKCP) kcpUpdateLoop(ctx context.Context) error {
 			t.kcpLock.Lock()
 			t.kcp.Update()
 			t.kcpLock.Unlock()
+			now := time.Now()
+			t.autoWindowStep(ctx, now)
+			t.statsTick(ctx, now)
 		}
 	}
 }

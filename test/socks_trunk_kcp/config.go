@@ -25,6 +25,16 @@ type TrunkKCPConfig struct {
 	KCPInterval *int `yaml:"kcp_interval" mapstructure:"kcp_interval"`
 	KCPResend   *int `yaml:"kcp_resend" mapstructure:"kcp_resend"`
 	KCPNc       *int `yaml:"kcp_nc" mapstructure:"kcp_nc"`
+
+	// KCPSndWnd / KCPRcvWnd KCP 发送/接收窗口（段；一段载荷 = 1400-24 = 1376B）。
+	// **必须按 BDP 设**：sndwnd ≈ 链路速率(B/s) × RTT(s) / 1376。
+	// 库默认 1024 段（≈1.4MB）在限速出口上会把瓶颈队列灌爆、带宽被重传吃掉；
+	// 实测（trunk_kcp/ratelimit_test.go，24Mbps/RTT40ms）：1024 段放大 3.2~3.8x、
+	// 128 段（≈BDP）放大 1.2x 且链路打满。两端必须一致，0 表示不覆盖。
+	KCPSndWnd int `yaml:"kcp_sndwnd" mapstructure:"kcp_sndwnd"`
+	KCPRcvWnd int `yaml:"kcp_rcvwnd" mapstructure:"kcp_rcvwnd"`
+	// KCPAutoWnd 实验性：发送窗口按线上放大率自动伸缩（见 trunk_kcp/autownd.go）。
+	KCPAutoWnd *bool `yaml:"kcp_auto_wnd" mapstructure:"kcp_auto_wnd"`
 }
 
 // NoDelayParam 返回配置的 KCP NoDelay 四元组；未配置项为 -1（保持库当前值）。
@@ -48,10 +58,15 @@ func (c *TrunkKCPConfig) NoDelayParam() (nodelay, interval, resend, nc int) {
 	return
 }
 
-// ApplyKCPParam 将配置的 KCP NoDelay 参数应用到 trunk（未配置项保持库默认）。
+// ApplyKCPParam 将配置的 KCP NoDelay/窗口参数应用到 trunk（未配置项保持库默认）。
 func (c *TrunkKCPConfig) ApplyKCPParam(t *trunk_kcp.TrunkKCP) {
 	if c == nil || t == nil {
 		return
+	}
+	if c.KCPAutoWnd != nil && *c.KCPAutoWnd {
+		t.SetAutoWindow(c.KCPSndWnd, c.KCPRcvWnd)
+	} else if c.KCPSndWnd > 0 || c.KCPRcvWnd > 0 {
+		t.SetWindowSize(c.KCPSndWnd, c.KCPRcvWnd)
 	}
 	nodelay, interval, resend, nc := c.NoDelayParam()
 	if nodelay < 0 && interval < 0 && resend < 0 && nc < 0 {
@@ -94,6 +109,8 @@ func (c *TrunkKCPConfig) defaults() {
 	if c.MaxVirtualConn <= 0 {
 		c.MaxVirtualConn = 256
 	}
+	// 窗口默认不覆盖库值（1024/1024）。限速出口上应按 BDP 显式设置 kcp_sndwnd，
+	// 或打开实验性的 kcp_auto_wnd；接收窗口只做缓冲，不要跟着一起调小。
 }
 
 // NormalizeTrunkKCPConfig 补全 trunk_kcp 默认值。

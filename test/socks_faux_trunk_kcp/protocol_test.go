@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"testing"
 	"time"
+
+	"github.com/lxt1045/rpc/trunk_kcp"
 )
 
 func TestWriteReadOpenHeader(t *testing.T) {
@@ -92,6 +94,42 @@ func TestNoDelayParam(t *testing.T) {
 	n, i, r, nc = cfg.NoDelayParam()
 	if n != 0 || i != 20 || r != -1 || nc != -1 {
 		t.Fatalf("partial config mapping wrong, got %d %d %d %d", n, i, r, nc)
+	}
+}
+
+// TestKCPWindowConfig 钉住窗口配置语义：
+//   - 默认**不覆盖**库窗口（保持 1024/1024），限速链路上由使用者按 BDP 显式设置；
+//   - 显式 kcp_sndwnd/kcp_rcvwnd → 固定窗口（关闭自动调窗）；
+//   - kcp_auto_wnd: true → 走 trunk_kcp 的自动调窗。
+//
+// 背景（真机）：库默认 1024 段在 30Mbps 限速出口上相当于 8×BDP，带宽被重传吃掉
+// （实测放大 3.2~3.8x）；但把收发窗口一起写死成 128 段又把长 RTT 链路饿死
+// （实测只占 7Mbps、下载 300kB/s）——所以不能写死，要么按 BDP 设，要么自动调。
+func TestKCPWindowConfig(t *testing.T) {
+	var zero TrunkKCPConfig
+	NormalizeTrunkKCPConfig(&zero)
+	if zero.KCPSndWnd != 0 || zero.KCPRcvWnd != 0 {
+		t.Fatalf("默认不应覆盖库窗口，得到 snd=%d rcv=%d", zero.KCPSndWnd, zero.KCPRcvWnd)
+	}
+	cfg := TrunkKCPConfig{KCPSndWnd: 256, KCPRcvWnd: 1024}
+	NormalizeTrunkKCPConfig(&cfg)
+	if cfg.KCPSndWnd != 256 || cfg.KCPRcvWnd != 1024 {
+		t.Fatalf("显式窗口被覆盖: snd=%d rcv=%d", cfg.KCPSndWnd, cfg.KCPRcvWnd)
+	}
+	cfg.ApplyKCPParam(nil) // must not panic
+
+	// 固定窗口：默认（未开 auto）保持关闭自动调窗
+	tr := trunk_kcp.NewTrunkKCP(0x5a0b0009, nil)
+	(&TrunkKCPConfig{KCPSndWnd: 256, KCPRcvWnd: 1024}).ApplyKCPParam(tr)
+	if st := tr.Stats(); st.AutoWnd || st.SndWnd != 256 || st.RcvWnd != 1024 {
+		t.Fatalf("固定窗口未生效: auto=%v snd=%d rcv=%d", st.AutoWnd, st.SndWnd, st.RcvWnd)
+	}
+	// 自动调窗：显式打开
+	yes := true
+	tr2 := trunk_kcp.NewTrunkKCP(0x5a0b000a, nil)
+	(&TrunkKCPConfig{KCPAutoWnd: &yes}).ApplyKCPParam(tr2)
+	if st := tr2.Stats(); !st.AutoWnd {
+		t.Fatal("kcp_auto_wnd=true 未打开自动调窗")
 	}
 }
 

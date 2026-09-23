@@ -30,13 +30,42 @@ type TrunkKCPConfig struct {
 	// 客户端与服务端必须配置成相同的值。
 	//
 	// 注意：本示例的物理连接是 faux_tcp（**不可靠**、语义等价 UDP 的数据报），
-	// 丢包是真实链路丢包，所以适合库默认的快速模式 (1,10,32,1)；
+	// 丢包是真实链路丢包，所以 30ms 的 minRTO 是合理的；
 	// socks_trunk_kcp 里"KCP over TCP/TLS 伪重传"那套保守参数（nodelay=0,
 	// interval=20~40, resend=0）不适用于本示例。
 	KCPNoDelay  *int `yaml:"kcp_nodelay"`
 	KCPInterval *int `yaml:"kcp_interval"`
 	KCPResend   *int `yaml:"kcp_resend"`
 	KCPNc       *int `yaml:"kcp_nc"`
+
+	// KCPSndWnd / KCPRcvWnd KCP 发送/接收窗口（单位：段；一段载荷 = kcp_mtu-24 字节）。
+	//
+	// **必须按 BDP 设，这是限速链路上最大的一个坑**：
+	//
+	//	sndwnd ≈ 链路速率(B/s) × RTT(s) / (kcp_mtu-24)
+	//
+	// KCP 的窗口就是"在途数据上限"。库默认 1024 段（≈1.2MB）在 30Mbps 出口上相当于
+	// 8×BDP：每一轮都把出口整形/限速队列灌爆 → 丢包 + RTO 重传 → 重传占满链路，
+	// 表现就是"服务端 30Mbps 打满、浏览器只有 1MB/s"。实测（trunk_kcp/ratelimit_test.go，
+	// 24Mbps、RTT 40ms、排队上限 50ms）：
+	//
+	//	1024 段：线上放大 3.23~3.84x、重传 68%、goodput 2.3 MB/s（链路利用 101%）
+	//	 128 段：线上放大 1.17~1.26x、重传 11~17%、goodput 2.4 MB/s（链路利用 98~101%）
+	//	  32 段：链路只利用 32%（窗口太小，白白浪费）
+	//
+	// **取法**：`ping` 出真实 RTT 后 `sndwnd ≈ 速率 × RTT / (kcp_mtu-24)`，再留 20%~50%
+	// 余量。例：30Mbps + RTT 40ms ≈ 128 段；RTT 150ms ≈ 480 段；RTT 200ms ≈ 640 段。
+	// 传 0 = 不覆盖库默认（1024 段）。两端必须一致，实际生效取两端较小值。
+	KCPSndWnd int `yaml:"kcp_sndwnd"`
+	// KCPRcvWnd 接收窗口（段）。**只做缓冲，不要跟着 KCPRcvWnd/snd 一起调小**：
+	// 它是"应用来不及读时的缓冲垫"，调小会在应用（下游 TCP/浏览器）稍有停顿时
+	// 关闭通告窗口、把对端饿死。真机把收发都设成 128 段后，出口只占 7Mbps、
+	// 下载掉到 300kB/s。传 0 = 库默认 1024。
+	KCPRcvWnd int `yaml:"kcp_rcvwnd"`
+	// KCPAutoWnd 实验性开关：发送窗口按"线上放大率"自动伸缩（见 trunk_kcp/autownd.go）。
+	// 40ms RTT 的无损链路上实测能收敛到"吃满链路且几乎不重传"；长 RTT/有损链路上
+	// 仍在调优（会振荡），生产建议先用固定 kcp_sndwnd 按 BDP 设，再用它做对照。
+	KCPAutoWnd *bool `yaml:"kcp_auto_wnd"`
 }
 
 // NoDelayParam 返回配置的 KCP NoDelay 四元组；未配置项为 -1（保持库当前值）。
@@ -60,13 +89,18 @@ func (c *TrunkKCPConfig) NoDelayParam() (nodelay, interval, resend, nc int) {
 	return
 }
 
-// ApplyKCPParam 将配置的 KCP NoDelay 参数应用到 trunk（未配置项保持库默认）。
+// ApplyKCPParam 将配置的 KCP NoDelay/窗口参数应用到 trunk（未配置项保持库默认）。
 func (c *TrunkKCPConfig) ApplyKCPParam(t *trunk_kcp.TrunkKCP) {
 	if c == nil || t == nil {
 		return
 	}
 	if c.KCPMtu > 0 {
 		t.SetMtu(c.KCPMtu)
+	}
+	if c.KCPAutoWnd != nil && *c.KCPAutoWnd {
+		t.SetAutoWindow(c.KCPSndWnd, c.KCPRcvWnd)
+	} else if c.KCPSndWnd > 0 || c.KCPRcvWnd > 0 {
+		t.SetWindowSize(c.KCPSndWnd, c.KCPRcvWnd)
 	}
 	nodelay, interval, resend, nc := c.NoDelayParam()
 	if nodelay < 0 && interval < 0 && resend < 0 && nc < 0 {
@@ -240,6 +274,10 @@ func (c *TrunkKCPConfig) defaults() {
 	if c.MaxVirtualConn <= 0 {
 		c.MaxVirtualConn = 256
 	}
+	// 窗口默认不覆盖库值（1024/1024，保持既有行为）。**限速链路上应按 BDP 显式设置
+	// kcp_sndwnd**（见字段注释与 README），或打开实验性的 kcp_auto_wnd 自动调窗。
+	// 注意：接收窗口只做缓冲，不要跟着 snd 一起调小——真机把两者都设成 128 后，
+	// 应用一停顿就关窗，发送端被饿死（7Mbps 占用 / 300kB/s）。
 }
 
 // NormalizeTrunkKCPConfig 补全 trunk_kcp 默认值。
